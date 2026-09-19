@@ -1,5 +1,8 @@
 # CI for git.diigoo.com (GitLab CE). Blueprint Part 8: verify fast, prove tenant isolation, build once.
-stages: [verify, integration, build]
+# Security (red team on every change): secrets, dependency CVEs, code rules for
+# the tenancy invariants, then the attack suite and a DAST baseline against the
+# built app. Scanner versions are pinned; bump them deliberately.
+stages: [verify, integration, build, attack]
 
 default:
   image: node:22-bookworm
@@ -19,6 +22,7 @@ unit:
   stage: verify
   script:
     - pnpm --filter @jenai/authz test
+    - pnpm --filter @jenai/voice test
 
 secrets:
   stage: verify
@@ -26,6 +30,23 @@ secrets:
   before_script: []
   script:
     - gitleaks detect --source . --no-banner --redact
+
+dependencies:
+  stage: verify
+  image: ghcr.io/google/osv-scanner:v2.6.0
+  before_script: []
+  script:
+    - osv-scanner scan source --lockfile pnpm-lock.yaml
+
+code-rules:
+  stage: verify
+  image: debian:bookworm-slim
+  before_script: []
+  script:
+    - apt-get update -qq && apt-get install -y -qq curl ca-certificates git >/dev/null
+    - curl -fsSL -o /usr/local/bin/opengrep https://github.com/opengrep/opengrep/releases/download/v1.30.0/opengrep_manylinux_x86
+    - chmod +x /usr/local/bin/opengrep
+    - opengrep scan --error --config security/opengrep/jenai.yml apps packages
 
 isolation:
   stage: integration
@@ -39,11 +60,13 @@ isolation:
     DATABASE_URL: postgres://jenai_app:ci_app@postgres:5432/jenai_platform
     DATABASE_PLATFORM_URL: postgres://jenai_platform:ci_platform@postgres:5432/jenai_platform
     SEED_PASSWORD: ci-only-password-1
+    JENAI_DATA_KEY: 0000000000000000000000000000000000000000000000000000000000000001
   script:
     - pnpm db:setup
     - pnpm db:migrate
     - pnpm db:seed
     - pnpm --filter @jenai/db test
+    - pnpm --filter @jenai/engine test
 
 build:
   stage: build
@@ -52,3 +75,44 @@ build:
   artifacts:
     expire_in: 1 day
     paths: [apps/web/.next]
+
+# Red team against the real app: start it on the CI database, then attack it.
+attack:
+  stage: attack
+  services:
+    - name: postgres:17
+      alias: postgres
+  variables:
+    POSTGRES_PASSWORD: ci
+    DATABASE_ADMIN_URL: postgres://postgres:ci@postgres:5432/postgres
+    DATABASE_OWNER_URL: postgres://jenai_owner:ci_owner@postgres:5432/jenai_platform
+    DATABASE_URL: postgres://jenai_app:ci_app@postgres:5432/jenai_platform
+    DATABASE_PLATFORM_URL: postgres://jenai_platform:ci_platform@postgres:5432/jenai_platform
+    SEED_PASSWORD: ci-only-password-1
+    JENAI_DATA_KEY: 0000000000000000000000000000000000000000000000000000000000000001
+    BETTER_AUTH_SECRET: ci-only-secret-at-least-32-characters-long
+    BETTER_AUTH_URL: http://localhost:3100
+  needs: [build]
+  script:
+    - pnpm db:setup && pnpm db:migrate && pnpm db:seed
+    - (pnpm --filter @jenai/web exec next start -p 3100 > web.log 2>&1 &)
+    - timeout 60 sh -c 'until curl -sf http://localhost:3100/login >/dev/null; do sleep 2; done'
+    - pnpm --filter @jenai/security attack
+  artifacts:
+    when: on_failure
+    paths: [web.log]
+
+# Passive DAST scan of staging (OWASP ZAP baseline). Report-only until tuned.
+dast-baseline:
+  stage: attack
+  image: zaproxy/zap-stable:2.17.0
+  needs: []
+  allow_failure: true
+  rules:
+    - if: $STAGING_URL
+  before_script: []
+  script:
+    - mkdir -p /zap/wrk && zap-baseline.py -t "$STAGING_URL" -r zap-report.html -I && cp /zap/wrk/zap-report.html .
+  artifacts:
+    when: always
+    paths: [zap-report.html]

@@ -1,0 +1,49 @@
+# JENAI invariants as code rules (Opengrep). A finding fails CI.
+# These protect every client at once: one slip here would be a cross-tenant leak.
+rules:
+  - id: jenai-bypass-pool-in-workspace-code
+    message: >-
+      Workspace code must read and write through withTenant() (row-level security).
+      platformDb() bypasses tenant isolation and is for the Diigoo console and worker only.
+    severity: ERROR
+    languages: [typescript]
+    paths:
+      include:
+        - apps/web/src/app/w/
+        - apps/web/src/app/api/w/
+        - apps/web/src/server/queries/
+        - apps/web/src/server/actions/modules.ts
+        - apps/web/src/server/actions/workspace.ts
+        - apps/web/src/server/access.ts
+    pattern: platformDb()
+
+  - id: jenai-trust-forwarded-for
+    message: >-
+      X-Forwarded-For can be forged by any client (it reset the sign-in rate limit, 2026-09-19).
+      Read the client address only from CLIENT_IP_HEADER, which the edge proxy overwrites.
+    severity: ERROR
+    languages: [typescript]
+    pattern-regex: (?i)get\(\s*["']x-forwarded-for["']
+
+  - id: jenai-raw-sql-from-variable
+    message: sql.raw() with a non-literal is SQL injection waiting to happen. Use sql`...${value}` parameters.
+    severity: ERROR
+    languages: [typescript]
+    patterns:
+      - pattern: sql.raw($X)
+      - pattern-not: sql.raw("...")
+
+  - id: jenai-inner-html
+    message: dangerouslySetInnerHTML bypasses React escaping; caller and client text must never reach it.
+    severity: ERROR
+    languages: [typescript]
+    pattern: <$T dangerouslySetInnerHTML={...} />
+
+  - id: jenai-secret-in-log
+    message: Never log credentials, tokens or decrypted secrets.
+    severity: ERROR
+    languages: [typescript]
+    pattern-either:
+      - pattern: console.$F(..., $X.password, ...)
+      - pattern: console.$F(..., $X.apiKey, ...)
+      - pattern: console.$F(..., $X.token, ...)
