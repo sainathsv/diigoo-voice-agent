@@ -299,3 +299,418 @@ export type Role = typeof roles.$inferSelect;
 export type Membership = typeof memberships.$inferSelect;
 export type SupportGrant = typeof supportGrants.$inferSelect;
 export type AuditEvent = typeof auditEvents.$inferSelect;
+
+// ---------------------------------------------------------------- plans (0002)
+export const billingModel = pgEnum("billing_model", ["prepaid", "postpaid_invoice", "contract"]);
+
+export const plans = pgTable("plans", {
+  key: text("key").primaryKey(),
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  billingModel: billingModel("billing_model").notNull(),
+  monthlyFeePaise: bigint("monthly_fee_paise", { mode: "number" }).notNull().default(0),
+  feeBasis: text("fee_basis").notNull().default("per_workspace"),
+  includedMinutes: integer("included_minutes").notNull().default(0),
+  overagePaisePerMin: bigint("overage_paise_per_min", { mode: "number" }),
+  limits: jsonb("limits").$type<PlanLimits>().notNull().default({}),
+  features: text("features").array().notNull(),
+  isPublic: boolean("is_public").notNull().default(true),
+  active: boolean("active").notNull().default(true),
+  sort: integer("sort").notNull().default(100),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+});
+
+export interface PlanLimits {
+  branches?: number;
+  phone_numbers?: number;
+  concurrent_calls?: number;
+  agents?: number;
+  users?: number;
+  campaigns_per_month?: number;
+}
+
+export const subscriptions = pgTable("subscriptions", {
+  tenantId: uuid("tenant_id").primaryKey(),
+  planKey: text("plan_key").notNull(),
+  billingModel: billingModel("billing_model").notNull(),
+  startsOn: text("starts_on").notNull(),
+  endsOn: text("ends_on"),
+  billingDay: integer("billing_day").notNull().default(1),
+  contractFeePaise: bigint("contract_fee_paise", { mode: "number" }),
+  contractRatePaisePerMin: bigint("contract_rate_paise_per_min", { mode: "number" }),
+  committedMinutes: integer("committed_minutes"),
+  limitOverrides: jsonb("limit_overrides").$type<PlanLimits>().notNull().default({}),
+  extraFeatures: text("extra_features").array().notNull(),
+  poNumber: text("po_number"),
+  poValidUntil: text("po_valid_until"),
+  invoiceToName: text("invoice_to_name"),
+  invoiceToDepartment: text("invoice_to_department"),
+  invoiceToAddress: text("invoice_to_address"),
+  invoiceToGstin: text("invoice_to_gstin"),
+  invoiceEmail: text("invoice_email"),
+  paymentTermsDays: integer("payment_terms_days").notNull().default(30),
+  notes: text("notes"),
+  updatedBy: text("updated_by"),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+});
+
+// ---------------------------------------------------------------- voice + agents (0003)
+export const agentTemplates = pgTable(
+  "agent_templates",
+  {
+    key: text("key").notNull(),
+    version: integer("version").notNull(),
+    name: text("name").notNull(),
+    basePrompt: text("base_prompt").notNull(),
+    endPrompt: text("end_prompt").notNull(),
+    extraction: jsonb("extraction").$type<ExtractionVar[]>().notNull(),
+    extractionPrompt: text("extraction_prompt").notNull(),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.key, t.version] })],
+);
+export interface ExtractionVar {
+  name: string;
+  type: string;
+  prompt: string;
+}
+
+export const voiceMode = pgEnum("voice_mode", ["read_only", "managed"]);
+
+export const voiceConnections = pgTable("voice_connections", {
+  tenantId: uuid("tenant_id").primaryKey(),
+  provider: text("provider").notNull().default("dograh"),
+  baseUrl: text("base_url").notNull(),
+  externalOrgId: integer("external_org_id"),
+  authKind: text("auth_kind").notNull(),
+  credentialCiphertext: text("credential_ciphertext").notNull(),
+  mode: voiceMode("mode").notNull().default("read_only"),
+  status: text("status").notNull().default("unverified"),
+  lastError: text("last_error"),
+  lastVerifiedAt: ts("last_verified_at"),
+  lastSyncAt: ts("last_sync_at"),
+  createdBy: text("created_by"),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+});
+
+export const agentPurpose = pgEnum("agent_purpose", ["receptionist", "outbound_sales", "reminders", "grievance", "other"]);
+
+export const agents = pgTable(
+  "agents",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    branchId: uuid("branch_id"),
+    name: text("name").notNull(),
+    purpose: agentPurpose("purpose").notNull().default("receptionist"),
+    templateKey: text("template_key").notNull(),
+    templateVersion: integer("template_version").notNull(),
+    domain: text("domain").notNull().default("clinic"),
+    inboundWorkflowId: integer("inbound_workflow_id"),
+    outboundWorkflowId: integer("outbound_workflow_id"),
+    outboundWorkflowUuid: text("outbound_workflow_uuid"),
+    liveVersionId: uuid("live_version_id"),
+    status: text("status").notNull().default("active"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const versionState = pgEnum("version_state", ["draft", "pending_approval", "publishing", "live", "superseded", "failed", "imported"]);
+
+export const agentVersions = pgTable(
+  "agent_versions",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    agentId: uuid("agent_id").notNull(),
+    number: integer("number").notNull(),
+    state: versionState("state").notNull().default("draft"),
+    personaName: text("persona_name"),
+    greeting: text("greeting").notNull(),
+    facts: text("facts").notNull(),
+    outboundOpening: text("outbound_opening"),
+    inboundPrompt: text("inbound_prompt"),
+    outboundPrompt: text("outbound_prompt"),
+    promptHash: text("prompt_hash"),
+    changeNote: text("change_note"),
+    createdBy: text("created_by"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    approvedBy: text("approved_by"),
+    publishedBy: text("published_by"),
+    publishedAt: ts("published_at"),
+    publishResult: jsonb("publish_result"),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+// ---------------------------------------------------------------- calls, contacts, leads (0004)
+export const contacts = pgTable(
+  "contacts",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    branchId: uuid("branch_id"),
+    phoneE164: text("phone_e164").notNull(),
+    name: text("name"),
+    email: text("email"),
+    source: text("source").notNull().default("call"),
+    tags: text("tags").array().notNull(),
+    attrs: jsonb("attrs").$type<Record<string, unknown>>().notNull().default({}),
+    ownerMembershipId: uuid("owner_membership_id"),
+    firstSeenAt: ts("first_seen_at").notNull().defaultNow(),
+    lastCallAt: ts("last_call_at"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const callDirection = pgEnum("call_direction", ["inbound", "outbound"]);
+export const callStatus = pgEnum("call_status", ["queued", "ringing", "in_progress", "completed", "no_answer", "busy", "failed", "unknown"]);
+
+export const calls = pgTable(
+  "calls",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    branchId: uuid("branch_id"),
+    agentId: uuid("agent_id"),
+    agentVersionId: uuid("agent_version_id"),
+    contactId: uuid("contact_id"),
+    campaignId: uuid("campaign_id"),
+    targetId: uuid("target_id"),
+    direction: callDirection("direction").notNull(),
+    status: callStatus("status").notNull().default("unknown"),
+    provider: text("provider").notNull().default("dograh"),
+    externalRunId: text("external_run_id").notNull(),
+    externalWorkflowId: integer("external_workflow_id"),
+    fromE164: text("from_e164"),
+    toE164: text("to_e164"),
+    startedAt: ts("started_at").notNull(),
+    durationS: integer("duration_s"),
+    disposition: text("disposition"),
+    summary: text("summary"),
+    transcript: text("transcript"),
+    extracted: jsonb("extracted").$type<Record<string, unknown>>().notNull().default({}),
+    recordingRef: text("recording_ref"),
+    transcriptRef: text("transcript_ref"),
+    costPaise: bigint("cost_paise", { mode: "number" }),
+    syncedAt: ts("synced_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const leadStage = pgEnum("lead_stage", ["new", "contacted", "callback", "booked", "won", "lost"]);
+
+export const leads = pgTable(
+  "leads",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    contactId: uuid("contact_id").notNull(),
+    branchId: uuid("branch_id"),
+    source: text("source").notNull().default("call"),
+    firstCallId: uuid("first_call_id"),
+    lastCallId: uuid("last_call_id"),
+    stage: leadStage("stage").notNull().default("new"),
+    interest: text("interest"),
+    preferredTimeText: text("preferred_time_text"),
+    preferredAt: ts("preferred_at"),
+    temperature: text("temperature"),
+    ownerMembershipId: uuid("owner_membership_id"),
+    nextFollowUpAt: ts("next_follow_up_at"),
+    lostReason: text("lost_reason"),
+    notes: text("notes"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+// ---------------------------------------------------------------- telephony (0005)
+export const carrierMode = pgEnum("carrier_mode", ["managed_subaccount", "client_account", "forwarding"]);
+export const kycStatus = pgEnum("kyc_status", ["not_started", "link_sent", "submitted", "verified", "rejected"]);
+
+export const carrierAccounts = pgTable(
+  "carrier_accounts",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    provider: text("provider").notNull(),
+    mode: carrierMode("mode").notNull(),
+    displayName: text("display_name").notNull(),
+    externalAccountId: text("external_account_id"),
+    credentialCiphertext: text("credential_ciphertext"),
+    kycStatus: kycStatus("kyc_status").notNull().default("not_started"),
+    kycReference: text("kyc_reference"),
+    voiceConfigId: integer("voice_config_id"),
+    status: text("status").notNull().default("active"),
+    createdBy: text("created_by"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const numberSeries = pgEnum("number_series", ["landline", "mobile", "series_140", "series_1600", "toll_free"]);
+export const numberPurpose = pgEnum("number_purpose", ["inbound", "outbound_service", "outbound_promotional", "both"]);
+
+export const phoneNumbers = pgTable(
+  "phone_numbers",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    carrierAccountId: uuid("carrier_account_id").notNull(),
+    branchId: uuid("branch_id"),
+    e164: text("e164").notNull(),
+    label: text("label"),
+    series: numberSeries("series").notNull(),
+    purpose: numberPurpose("purpose").notNull().default("inbound"),
+    inboundAgentId: uuid("inbound_agent_id"),
+    isDefaultCallerId: boolean("is_default_caller_id").notNull().default(false),
+    a2pDeclaredAt: ts("a2p_declared_at"),
+    a2pReference: text("a2p_reference"),
+    dltHeader: text("dlt_header"),
+    maxConcurrency: integer("max_concurrency").notNull().default(10),
+    voiceNumberId: integer("voice_number_id"),
+    status: text("status").notNull().default("active"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+// ---------------------------------------------------------------- dialer (0006)
+export const consentPurpose = pgEnum("consent_purpose", ["service", "transactional", "promotional"]);
+export const consentStatus = pgEnum("consent_status", ["granted", "revoked"]);
+
+export const consents = pgTable(
+  "consents",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    phoneE164: text("phone_e164").notNull(),
+    contactId: uuid("contact_id"),
+    purpose: consentPurpose("purpose").notNull(),
+    channel: text("channel").notNull().default("voice"),
+    status: consentStatus("status").notNull().default("granted"),
+    source: text("source").notNull(),
+    evidence: text("evidence"),
+    capturedAt: ts("captured_at").notNull().defaultNow(),
+    expiresAt: ts("expires_at"),
+    revokedAt: ts("revoked_at"),
+    createdBy: text("created_by"),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const suppressionReason = pgEnum("suppression_reason", ["opt_out", "dnd_registry", "complaint", "legal", "wrong_number"]);
+
+export const suppressions = pgTable("suppressions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id"),
+  phoneE164: text("phone_e164").notNull(),
+  reason: suppressionReason("reason").notNull(),
+  scope: consentPurpose("scope"),
+  source: text("source"),
+  createdBy: text("created_by"),
+  createdAt: ts("created_at").notNull().defaultNow(),
+  expiresAt: ts("expires_at"),
+});
+
+export const campaignStatus = pgEnum("campaign_status", ["draft", "pending_approval", "approved", "running", "paused", "completed", "cancelled"]);
+
+export interface CallingWindows {
+  days: number[]; // 0 = Sunday
+  start: string; // "HH:MM" local
+  end: string;
+}
+
+export const campaigns = pgTable(
+  "campaigns",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    branchId: uuid("branch_id"),
+    agentId: uuid("agent_id").notNull(),
+    callerNumberId: uuid("caller_number_id").notNull(),
+    name: text("name").notNull(),
+    purpose: consentPurpose("purpose").notNull(),
+    status: campaignStatus("status").notNull().default("draft"),
+    callPurposeText: text("call_purpose_text"),
+    timezone: text("timezone").notNull().default("Asia/Kolkata"),
+    windows: jsonb("windows").$type<CallingWindows>().notNull(),
+    maxConcurrency: integer("max_concurrency").notNull().default(2),
+    maxAttempts: integer("max_attempts").notNull().default(3),
+    dailyCapPerContact: integer("daily_cap_per_contact").notNull().default(2),
+    consentAttested: boolean("consent_attested").notNull().default(false),
+    createdBy: text("created_by"),
+    approvedBy: text("approved_by"),
+    approvedAt: ts("approved_at"),
+    launchedAt: ts("launched_at"),
+    completedAt: ts("completed_at"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const targetState = pgEnum("target_state", ["queued", "scheduled", "dialing", "completed", "skipped", "failed", "cancelled"]);
+
+export const campaignTargets = pgTable(
+  "campaign_targets",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    campaignId: uuid("campaign_id").notNull(),
+    contactId: uuid("contact_id"),
+    phoneE164: text("phone_e164").notNull(),
+    name: text("name"),
+    context: jsonb("context").$type<Record<string, unknown>>().notNull().default({}),
+    state: targetState("state").notNull().default("queued"),
+    attemptNo: integer("attempt_no").notNull().default(0),
+    nextAttemptAt: ts("next_attempt_at").notNull().defaultNow(),
+    lastOutcome: text("last_outcome"),
+    lastCallId: uuid("last_call_id"),
+    skipReason: text("skip_reason"),
+    externalRunId: text("external_run_id"),
+    leaseUntil: ts("lease_until"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const dialAttempts = pgTable(
+  "dial_attempts",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: bigint("id", { mode: "number" }).notNull().generatedAlwaysAsIdentity(),
+    targetId: uuid("target_id").notNull(),
+    campaignId: uuid("campaign_id").notNull(),
+    phoneE164: text("phone_e164").notNull(),
+    decision: text("decision").notNull(),
+    reason: text("reason").notNull(),
+    gateway: text("gateway"),
+    externalRunId: text("external_run_id"),
+    outcome: text("outcome"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export type Plan = typeof plans.$inferSelect;
+export type Subscription = typeof subscriptions.$inferSelect;
+export type Agent = typeof agents.$inferSelect;
+export type AgentVersion = typeof agentVersions.$inferSelect;
+export type AgentTemplate = typeof agentTemplates.$inferSelect;
+export type VoiceConnection = typeof voiceConnections.$inferSelect;
+export type Call = typeof calls.$inferSelect;
+export type Contact = typeof contacts.$inferSelect;
+export type Lead = typeof leads.$inferSelect;
+export type CarrierAccount = typeof carrierAccounts.$inferSelect;
+export type PhoneNumber = typeof phoneNumbers.$inferSelect;
+export type Campaign = typeof campaigns.$inferSelect;
+export type CampaignTarget = typeof campaignTargets.$inferSelect;
