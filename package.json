@@ -1,0 +1,15 @@
+{
+  "name": "jenai-platform",
+  "private": true,
+  "packageManager": "pnpm@10.18.0",
+  "scripts": {
+    "dev": "pnpm --filter @jenai/web dev",
+    "build": "pnpm --filter @jenai/web build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "db:setup": "pnpm --filter @jenai/db run setup",
+    "db:migrate": "pnpm --filter @jenai/db run migrate",
+    "db:seed": "pnpm --filter @jenai/db run seed",
+    "db:reset": "pnpm --filter @jenai/db run reset"
+  }
+}

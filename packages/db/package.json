@@ -1,0 +1,33 @@
+{
+  "name": "@jenai/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema": "./src/schema.ts"
+  },
+  "scripts": {
+    "setup": "tsx src/scripts/setup.ts",
+    "migrate": "tsx src/scripts/migrate.ts",
+    "seed": "tsx src/scripts/seed.ts",
+    "reset": "tsx src/scripts/setup.ts --drop && tsx src/scripts/migrate.ts && tsx src/scripts/seed.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@jenai/authz": "workspace:*",
+    "better-auth": "1.7.5",
+    "dotenv": "17.4.2",
+    "drizzle-orm": "0.45.2",
+    "postgres": "3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}

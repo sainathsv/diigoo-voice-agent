@@ -1,0 +1,791 @@
+<title>JENAI Platform Blueprint</title>
+<style>
+:root{
+  --paper:#FFFDF9; --surface:#FFFFFF; --band:#F3ECE1; --ink:#211C1A; --ink2:#4A443F; --muted:#8A8178;
+  --line:#E7DFD3; --copper:#C96A3C; --copper-ink:#A9542C; --soft:#E7A277; --peach:#FFF4EE;
+  --head-bg:#211C1A; --head-ink:#FBF7F1;
+  --ok:#2F7D4F; --ok-bg:#E9F4EC; --warnc:#9A6412; --warn-bg:#FBF1DC; --crit:#B42318; --crit-bg:#FDECEA;
+  --focus:#C96A3C;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#161211; --surface:#1F1A18; --band:#29211D; --ink:#F2EBE3; --ink2:#CFC5BB; --muted:#9D9288;
+    --line:#3A312B; --copper:#E3885A; --copper-ink:#F0A27A; --soft:#B8694A; --peach:#2E211B;
+    --head-bg:#352B26; --head-ink:#F7F1EA;
+    --ok:#7CC49A; --ok-bg:#1C2B22; --warnc:#E6B35E; --warn-bg:#2F2616; --crit:#F2877C; --crit-bg:#34201D;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#161211; --surface:#1F1A18; --band:#29211D; --ink:#F2EBE3; --ink2:#CFC5BB; --muted:#9D9288;
+  --line:#3A312B; --copper:#E3885A; --copper-ink:#F0A27A; --soft:#B8694A; --peach:#2E211B;
+  --head-bg:#352B26; --head-ink:#F7F1EA;
+  --ok:#7CC49A; --ok-bg:#1C2B22; --warnc:#E6B35E; --warn-bg:#2F2616; --crit:#F2877C; --crit-bg:#34201D;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+body{background:var(--paper);color:var(--ink);font-family:-apple-system,"Helvetica Neue",Arial,sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--copper-ink);text-underline-offset:2px}
+a:focus-visible,summary:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:3px}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:20px;padding-block:28px 72px}
+code,.mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.86em}
+code{background:var(--band);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+
+/* masthead */
+.mast{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;border-bottom:2px solid var(--ink);padding-bottom:14px}
+.brand .wm{font-weight:800;font-size:30px;letter-spacing:-.03em;line-height:1}
+.brand .wm span{color:var(--copper)}
+.brand .co{font-size:10.5px;letter-spacing:.14em;color:var(--muted);margin-top:6px;font-weight:600}
+.mast .t{text-align:right}
+.mast h1{font-size:26px;line-height:1.15;margin:0;text-wrap:balance}
+.mast .meta{color:var(--muted);font-size:13px;margin-top:4px}
+
+.intro{background:var(--band);border-radius:6px;padding:16px 18px;margin-top:20px;display:grid;gap:10px}
+.intro p{margin:0;max-width:78ch}
+
+/* layout */
+.layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:44px;margin-top:28px}
+.toc{position:sticky;top:calc(env(safe-area-inset-top,0px) + 16px);align-self:start;font-size:13px;max-height:calc(100vh - 32px);overflow:auto;padding-right:4px}
+.toc b{display:block;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.toc ol{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+.toc a{display:block;color:var(--ink2);text-decoration:none;padding:4px 8px;border-radius:4px;border-left:2px solid transparent}
+.toc a:hover{background:var(--band);border-left-color:var(--copper);color:var(--ink)}
+@media (max-width:920px){
+  .layout{grid-template-columns:1fr;gap:12px}
+  .toc{position:static;max-height:none}
+  .toc ol{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}
+}
+main{min-width:0}
+
+/* headings */
+h2{font-size:20px;line-height:1.3;margin:58px 0 12px;border-left:3px solid var(--copper);padding-left:10px;text-wrap:balance;scroll-margin-top:16px}
+h2:first-child{margin-top:4px}
+h3{font-size:12.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--copper-ink);margin:28px 0 8px}
+p{margin:0 0 12px;max-width:80ch}
+.lead{font-size:16px;color:var(--ink2)}
+ul.list{margin:0 0 14px;padding-left:20px;display:grid;gap:4px;max-width:84ch}
+
+/* tables */
+.tbl{overflow-x:auto;margin:10px 0 18px;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;line-height:1.45}
+thead th{background:var(--head-bg);color:var(--head-ink);text-align:left;font-weight:600;padding:9px 11px;white-space:nowrap;font-size:12.5px}
+tbody td{padding:8px 11px;border-top:1px solid var(--line);vertical-align:top}
+tbody tr:first-child td{border-top:0}
+td.k{font-weight:600;white-space:nowrap}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tbl.wide table{min-width:760px}
+
+/* chips */
+.chip{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.04em;padding:1px 8px;border-radius:999px;white-space:nowrap;vertical-align:1px}
+.now{background:var(--copper);color:#fff}
+.next{border:1px solid var(--copper);color:var(--copper-ink)}
+.later{border:1px solid var(--line);color:var(--muted)}
+.crit{background:var(--crit-bg);color:var(--crit)}
+.hi{background:var(--warn-bg);color:var(--warnc)}
+.ok{background:var(--ok-bg);color:var(--ok)}
+.done{background:var(--ok-bg);color:var(--ok)}
+
+/* callouts */
+.warn{background:var(--peach);border:1px solid var(--soft);border-radius:6px;padding:12px 14px;margin:12px 0 18px}
+.warn p:last-child,.note p:last-child{margin-bottom:0}
+.note{border-left:3px solid var(--line);padding:4px 0 4px 12px;color:var(--ink2);margin:10px 0 16px}
+
+/* numbered flows (real sequences only) */
+ol.flow{counter-reset:s;list-style:none;padding:0;margin:8px 0 18px;display:grid;gap:10px;max-width:86ch}
+ol.flow>li{counter-increment:s;display:grid;grid-template-columns:26px 1fr;gap:10px;align-items:start}
+ol.flow>li::before{content:counter(s);width:24px;height:24px;border-radius:50%;background:var(--copper);color:#fff;font-weight:700;font-size:12px;display:grid;place-items:center;margin-top:1px}
+
+/* two sides */
+.sides{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin:12px 0 18px}
+.side{border:1px solid var(--line);border-radius:8px;padding:14px 16px;background:var(--surface)}
+.side h4{margin:0 0 6px;font-size:15px}
+.side p{font-size:13.5px;color:var(--ink2);margin-bottom:8px}
+.side ul{margin:0;padding-left:18px;font-size:13.5px;display:grid;gap:2px}
+
+/* hierarchy diagram */
+.tree{display:grid;gap:0;margin:14px 0 20px;max-width:640px}
+.tree .lv{display:grid;grid-template-columns:150px 1fr;gap:12px;align-items:center;position:relative;padding:6px 0}
+.tree .lv .box{border:1.5px solid var(--ink);border-radius:6px;padding:7px 10px;font-weight:700;font-size:13.5px;background:var(--surface);text-align:center}
+.tree .lv.plat .box{background:var(--head-bg);color:var(--head-ink);border-color:var(--head-bg)}
+.tree .lv.opt .box{border-style:dashed;color:var(--ink2)}
+.tree .lv.ten .box{border-color:var(--copper);box-shadow:0 0 0 3px color-mix(in srgb,var(--copper) 18%,transparent)}
+.tree .lv .d{font-size:13px;color:var(--ink2)}
+.tree .lv+.lv::before{content:"";position:absolute;left:74px;top:-6px;height:12px;border-left:1.5px solid var(--muted)}
+
+/* architecture diagram */
+.arch{display:grid;gap:8px;margin:14px 0 20px;font-size:13px}
+.arch .row{display:grid;grid-template-columns:120px 1fr;gap:10px;align-items:stretch}
+.arch .lab{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:700;padding-top:8px}
+.arch .cells{display:flex;flex-wrap:wrap;gap:6px;border-radius:8px;padding:8px;background:var(--band)}
+.arch .row.ctrl .cells{background:color-mix(in srgb,var(--copper) 12%,var(--surface));border:1.5px solid var(--copper)}
+.arch .row.voice .cells{background:var(--head-bg)}
+.arch .row.voice .cell{background:color-mix(in srgb,var(--head-ink) 10%,var(--head-bg));color:var(--head-ink);border-color:color-mix(in srgb,var(--head-ink) 22%,transparent)}
+.arch .cell{background:var(--surface);border:1px solid var(--line);border-radius:5px;padding:4px 8px;white-space:nowrap}
+.arch .rule{grid-column:2;font-size:12.5px;color:var(--copper-ink);font-weight:600;padding-left:2px}
+@media (max-width:560px){.arch .row{grid-template-columns:1fr}.arch .lab{padding-top:0}.arch .rule{grid-column:1}.tree .lv{grid-template-columns:120px 1fr}.tree .lv+.lv::before{left:59px}}
+
+/* phase cards */
+.phases{display:grid;gap:12px;margin:12px 0 18px}
+.phase{border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:14px 16px;display:grid;grid-template-columns:130px 1fr;gap:14px}
+.phase.first{border-color:var(--copper);border-width:1.5px}
+.phase .when b{display:block;font-size:15px}
+.phase .when span{font-size:12.5px;color:var(--muted)}
+.phase ul{margin:0 0 8px;padding-left:18px;display:grid;gap:3px;font-size:13.5px}
+.phase .safe{font-size:12.5px;color:var(--ink2);border-top:1px dashed var(--line);padding-top:6px;margin-top:4px}
+@media (max-width:640px){.phase{grid-template-columns:1fr;gap:6px}}
+
+/* stat strip, used once where numbers are the point */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden;margin:12px 0 18px}
+.stats div{background:var(--surface);padding:12px 14px}
+.stats b{display:block;font-size:20px;font-variant-numeric:tabular-nums;line-height:1.2}
+.stats span{font-size:12.5px;color:var(--ink2)}
+
+details{border:1px solid var(--line);border-radius:6px;padding:10px 14px;margin:10px 0;background:var(--surface)}
+details summary{cursor:pointer;font-weight:600}
+details[open] summary{margin-bottom:8px}
+.foot{margin-top:56px;border-top:1px solid var(--line);padding-top:10px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="brand">
+      <div class="wm">jen<span>ai</span><span>.</span></div>
+      <div class="co">DIIGOO TECH PRIVATE LIMITED</div>
+    </div>
+    <div class="t">
+      <h1>JENAI Platform Blueprint</h1>
+      <div class="meta">Version 1 for founder approval · 19 Sep 2026 · Internal</div>
+    </div>
+  </header>
+
+  <section class="intro" aria-label="How to read this blueprint">
+    <p><b>What this is.</b> The plan for turning JENAI from a thin panel around a voice engine into a proper multi-tenant platform: an ERP for Indian businesses whose core function is AI calling, with full teams on both sides (Diigoo's own staff and every client's staff).</p>
+    <p><b>How it was made.</b> Twelve research tracks ran in parallel: organisation and roles, the competitor market, telephony and integrations, target architecture, how large SaaS companies run reliability, engineering process, security and compliance, AI agent quality, the customer lifecycle, scale and unit economics, plus two audits of what JENAI runs today (the code, and the live servers). Each claim below comes from those reports; items that could not be verified are marked as such.</p>
+    <p><b>An honest limit.</b> No SaaS, including the largest, runs with "no problems at all". What they do, and what this plan does, is catch problems before release, keep any failure contained to one client, and recover quickly and visibly. That is the standard used throughout.</p>
+  </section>
+
+  <div class="layout">
+    <nav class="toc" aria-label="Contents">
+      <b>Contents</b>
+      <ol>
+        <li><a href="#p1">1. Where JENAI stands today</a></li>
+        <li><a href="#p2">2. What JENAI is</a></li>
+        <li><a href="#p3">3. Teams, roles and access</a></li>
+        <li><a href="#p4">4. The module map</a></li>
+        <li><a href="#p5">5. Numbers, integrations, compliance</a></li>
+        <li><a href="#p6">6. Target architecture</a></li>
+        <li><a href="#p7">7. Reliability standard</a></li>
+        <li><a href="#p8">8. Engineering standard</a></li>
+        <li><a href="#p9">9. AI agent quality</a></li>
+        <li><a href="#p10">10. Security and compliance</a></li>
+        <li><a href="#p11">11. Customers and pricing</a></li>
+        <li><a href="#p12">12. Scale and unit economics</a></li>
+        <li><a href="#p13">13. The build plan</a></li>
+        <li><a href="#p14">14. Decisions needed</a></li>
+        <li><a href="#p15">15. Sources and open items</a></li>
+      </ol>
+    </nav>
+
+    <main>
+      <!-- PART 1 -->
+      <h2 id="p1">Part 1. Where JENAI stands today</h2>
+      <p class="lead">The product works for real clients (Zennara, LBR, GHMC, JEN sales), but everything runs on one small server, one shared login per client, one shared carrier account and one shared AI key. Growth on this base would multiply risk, not revenue.</p>
+
+      <div class="stats" role="list">
+        <div role="listitem"><b>1 server</b><span>t3.large, 30 GB disk at 86%, one availability zone</span></div>
+        <div role="listitem"><b>0 user accounts</b><span>one shared password per client company</span></div>
+        <div role="listitem"><b>~144 calls/h</b><span>dialer ceiling, in memory, lost on restart</span></div>
+        <div role="listitem"><b>28</b><span>security or data risks verified in code</span></div>
+        <div role="listitem"><b>~₹85,500/mo</b><span>AWS spend; 92% is one GPU box</span></div>
+      </div>
+
+      <h3>Audit scorecard</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Area</th><th>Today</th><th>Risk</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Data store</td><td>All tenants, leads, billing and audit live in one JSON file (<code>panel.json</code>); a corrupt file re-seeds with Zennara only.</td><td><span class="chip crit">Critical</span></td></tr>
+          <tr><td class="k">Identity</td><td>Roles are only "super" and "tenant". No individual users, no MFA, sessions cannot be revoked, a password-only login path accepts any tenant's password.</td><td><span class="chip crit">Critical</span></td></tr>
+          <tr><td class="k">Agent edits</td><td>Edits save a draft but never publish, so inbound calls keep an old persona; knowledge base reaches outbound only.</td><td><span class="chip crit">Critical</span></td></tr>
+          <tr><td class="k">Telephony</td><td>All clients share one Vobiz account and application; numbers are hand-configured with raw SQL; caller ID is chosen at random from the pool.</td><td><span class="chip crit">Critical</span></td></tr>
+          <tr><td class="k">Dialer</td><td>One global in-memory queue, 25 s pacing, no calling windows, DND, retries or fairness between tenants.</td><td><span class="chip crit">Critical</span></td></tr>
+          <tr><td class="k">AI quota</td><td>One Gemini key and project for every tenant; a 429 silently stopped lead capture for days.</td><td><span class="chip hi">High</span></td></tr>
+          <tr><td class="k">Billing</td><td>Usage counted from the latest 500 runs of the UTC month; no invoices, GST, wallet or payments.</td><td><span class="chip hi">High</span></td></tr>
+          <tr><td class="k">Recordings</td><td>A never-expiring public recording URL reaches the browser; storage still has an anonymous bucket policy and default credentials.</td><td><span class="chip hi">High</span></td></tr>
+          <tr><td class="k">Delivery</td><td>No git, CI or staging. Code is rsynced and built on the production box; patches exist only on the server.</td><td><span class="chip hi">High</span></td></tr>
+          <tr><td class="k">Backups</td><td>Nothing backed up since 28 Jun; unencrypted disk deleted on terminate; a July bulk stop left prod down 16 days unnoticed.</td><td><span class="chip done">Fixed today</span></td></tr>
+          <tr><td class="k">Alerting</td><td>No alarms or uptime checks on any JENAI host.</td><td><span class="chip done">Fixed today</span></td></tr>
+          <tr><td class="k">HTTPS</td><td>Certificates expire 25 Oct; renewal is failing and nginx serves stale copies.</td><td><span class="chip hi">Fix scheduled tonight</span></td></tr>
+          <tr><td class="k">Cost</td><td>The GPU box (g5.xlarge, ~₹79,000/mo) runs a helper model (gemma3:12b) used by all four live orgs; not idle, but far too expensive for its job.</td><td><span class="chip hi">High</span></td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Already done on 19 Sep (approved)</h3>
+      <ul class="list">
+        <li>Full disk snapshot of prod; daily snapshots at 02:00 IST (14 kept in Mumbai, 7-day encrypted copy in Hyderabad).</li>
+        <li>Prod can no longer be stopped or terminated by accident, and its disk survives termination.</li>
+        <li>Email alerts: voice, panel and site health checks every 30 s from three regions; hardware failure auto-recovery; OS and CPU alarms.</li>
+        <li>Certificate renewal moved to a zero-downtime DNS method, scheduled for tonight after 22:00 IST.</li>
+      </ul>
+
+      <h3>What is worth keeping</h3>
+      <p>The audit found real assets: the Dograh know-how (publish order, inbound route rules), the connector contract for integrations, the demo mode and shared BASE persona, the admin console screens, and the unused "Vaani" rewrite whose Postgres schema (organisations, users, memberships, scoped API keys, campaigns, call records with run IDs) is the right starting shape. The panel's store, auth, dialer and raw-SQL helpers should be replaced.</p>
+
+      <!-- PART 2 -->
+      <h2 id="p2">Part 2. What JENAI is</h2>
+      <p class="lead">An AI-calling ERP: JENAI owns the thin system of record a front office runs on (calls, contacts, calendar, inbox, campaigns, payments) and connects to the heavy systems clients already have (Practo, Eka Care, Petpooja, hospital software) instead of rebuilding them.</p>
+      <p>This is the pattern proven by Weave, Podium, NexHealth, Zenoti and GoHighLevel: the phone and the AI sit in front, the business records sit behind, and every team works in one place. The Indian voice-AI vendors (Bolna, Ringg, Smallest, Sarvam) mostly stop at the agent and a dashboard, which is the gap JENAI fills.</p>
+
+      <div class="sides">
+        <div class="side">
+          <h4>Diigoo side: the platform company</h4>
+          <p>Runs the business of selling and operating JENAI.</p>
+          <ul>
+            <li>Super admin and platform operations</li>
+            <li>Marketing team and the marketing funnel</li>
+            <li>BD / sales pipeline and demos</li>
+            <li>Onboarding and customer success</li>
+            <li>Support desk, finance and billing</li>
+            <li>Voice ops and engineering</li>
+            <li>Partners and resellers (later)</li>
+          </ul>
+        </div>
+        <div class="side">
+          <h4>Client side: each business</h4>
+          <p>Runs their front office on JENAI.</p>
+          <ul>
+            <li>Owner and admins</li>
+            <li>Branch managers across locations</li>
+            <li>Front desk and receptionists</li>
+            <li>Marketing team and campaigns</li>
+            <li>Supervisors and call QA</li>
+            <li>Doctors or practitioners</li>
+            <li>Their own systems and phone numbers, connected</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>Organisation hierarchy</h3>
+      <div class="tree" role="img" aria-label="Hierarchy: Platform, optional partner, client organisation, branch, team, user">
+        <div class="lv plat"><div class="box">Platform</div><div class="d">Diigoo / JENAI itself, modelled as an organisation so staff use the same role system</div></div>
+        <div class="lv opt"><div class="box">Partner</div><div class="d">Optional reseller or agency layer; the column exists now, screens come later</div></div>
+        <div class="lv ten"><div class="box">Client organisation</div><div class="d">The tenant: billing entity, data-isolation key, compliance unit, white-label domain</div></div>
+        <div class="lv"><div class="box">Branch</div><div class="d">Clinic, centre or ward; numbers, agents, hours and languages attach here</div></div>
+        <div class="lv"><div class="box">Team</div><div class="d">Front desk, marketing, doctors; for routing and bulk role grants, not a security wall</div></div>
+        <div class="lv"><div class="box">User</div><div class="d">One global login; a membership per organisation, so one person can hold different roles in different clients</div></div>
+      </div>
+
+      <!-- PART 3 -->
+      <h2 id="p3">Part 3. Teams, roles and access</h2>
+      <p>Two ideas from Salesforce, Freshdesk and Zenoti carry the design: <b>role</b> decides what a person can do, <b>scope</b> decides which records they see (whole organisation, certain branches, or only their own). A person's rights are the union of their roles. Clients get these templates and can clone and edit them in a module-by-level grid (NexHealth's pattern).</p>
+
+      <h3>Client roles (default templates)</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Role</th><th>Calls and recordings</th><th>Leads and contacts</th><th>Campaigns and agents</th><th>Numbers, integrations, billing, users</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Owner</td><td>Everything</td><td>Everything, incl. export</td><td>Everything</td><td>Everything, incl. transferring ownership</td></tr>
+          <tr><td class="k">Admin</td><td>Everything</td><td>Everything, incl. export</td><td>Create, approve, publish agents</td><td>Manages numbers and integrations; views billing; manages users below Owner</td></tr>
+          <tr><td class="k">Branch manager</td><td>Own branches; plays recordings</td><td>Edit, full phone numbers, own branches</td><td>Proposes campaigns and agent changes; edits hours and knowledge</td><td>Invites staff up to own level</td></tr>
+          <tr><td class="k">Front desk</td><td>Own branches, callback queue, summaries</td><td>Edit, full phone numbers</td><td>Edits holidays and availability</td><td>None</td></tr>
+          <tr><td class="k">Marketing</td><td>Aggregates only</td><td>Masked phones; tags, segments, consented imports</td><td>Creates campaigns; launch needs approval</td><td>None</td></tr>
+          <tr><td class="k">Supervisor / QA</td><td>Plays recordings and raw transcripts; scores calls</td><td>Masked</td><td>Drafts and test calls; publish needs approval</td><td>None</td></tr>
+          <tr><td class="k">Doctor / practitioner</td><td>Summaries of own patients' calls</td><td>Own patients</td><td>None</td><td>None</td></tr>
+          <tr><td class="k">Analyst (read-only)</td><td>Aggregates, masked</td><td>Masked, no export</td><td>View only</td><td>None</td></tr>
+          <tr><td class="k">Billing contact</td><td>None</td><td>None</td><td>None</td><td>Invoices and usage</td></tr>
+        </tbody>
+      </table></div>
+      <p class="note">Maker-checker: whoever creates a campaign, export or agent publish cannot approve it. Every "reveal phone number" and every recording play is audit-logged. Phone numbers show as the last four digits unless the role allows otherwise (Zenoti's masking pattern).</p>
+
+      <h3>Diigoo roles</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Role</th><th>Client accounts</th><th>Client call data</th><th>Diigoo CRM and funnel</th><th>Money and platform</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Super admin (2-3 founders, passkey)</td><td>Manage</td><td>Break-glass only</td><td>Manage</td><td>Everything</td></tr>
+          <tr><td class="k">Platform ops</td><td>Create, suspend, change plan</td><td>Approves access grants</td><td>View</td><td>Templates, models, number pool</td></tr>
+          <tr><td class="k">Sales / BD</td><td>Create trial accounts; see own accounts' usage</td><td>None</td><td>Own pipeline</td><td>Discounts need Finance approval</td></tr>
+          <tr><td class="k">Marketing</td><td>Anonymised aggregates</td><td>None</td><td>Campaigns and leads</td><td>None</td></tr>
+          <tr><td class="k">Customer success</td><td>Setup for assigned accounts</td><td>Time-boxed grant with client consent</td><td>View</td><td>View billing</td></tr>
+          <tr><td class="k">Support L1 / L2</td><td>Metadata and error logs</td><td>L1 read-only grant; L2 write grant plus approver</td><td>None</td><td>View</td></tr>
+          <tr><td class="k">Finance</td><td>Billing profile</td><td>None</td><td>None</td><td>Plans, invoices, credits; large refunds need approval</td></tr>
+          <tr><td class="k">Engineering / voice ops</td><td>View</td><td>Grant or break-glass only; logs redacted</td><td>None</td><td>Models, voices, telephony, secrets manager</td></tr>
+          <tr><td class="k">Auditor (read-only)</td><td>View</td><td>None</td><td>None</td><td>View everything incl. all access grants</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>How Diigoo staff reach client data</h3>
+      <ol class="flow">
+        <li><div><b>No standing access.</b> Staff see settings, usage and masked call metadata by role. Personal data needs a grant.</div></li>
+        <li><div><b>Read-only support session.</b> Ticket number, reason and client consent (clients can pre-allow "JENAI support for N days", like Salesforce). 30 to 60 minutes; writes are refused on the server.</div></li>
+        <li><div><b>Write session.</b> Client consent plus a second approver; 30 minutes; never touches owners, billing, API keys, numbers, exports or deletes.</div></li>
+        <li><div><b>Break-glass.</b> Super admin only, for live incidents or legal holds; the client owner is alerted at once; reviewed within 48 hours.</div></li>
+        <li><div><b>Audit.</b> Every action records both the staff member and the impersonated user (GoHighLevel logs only the latter, a known gap). Clients see their own support-access log; logs kept at least a year.</div></li>
+      </ol>
+      <p><b>Login system:</b> Better Auth (MIT, runs in JENAI's own Postgres, India-resident) with its organisation, admin, SSO, SCIM and passkey plugins. Auth.js is now in maintenance mode under the same team. Clerk limits custom roles per app, not per client; WorkOS and Keycloak were the alternatives considered.</p>
+
+      <!-- PART 4 -->
+      <h2 id="p4">Part 4. The module map</h2>
+      <p><span class="chip now">Now</span> means before scaling paid clients, <span class="chip next">Next</span> within 6 to 12 months, <span class="chip later">Later</span> after that. The competitor column is the product that proves the module matters.</p>
+
+      <h3>Shared engines</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Engine</th><th>Contents</th><th>When</th><th>Proven by</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Agent studio</td><td>Behaviour base plus client facts, tools, per-language voices, Telugu pronunciation list, versions, rollback</td><td><span class="chip now">Now</span></td><td>Vapi, Retell, PolyAI</td></tr>
+          <tr><td class="k">Test and eval harness</td><td>Simulated callers (noisy, angry, code-switching), rubrics, must pass before publish</td><td><span class="chip now">Now</span></td><td>Vapi Simulations, Retell, ElevenLabs</td></tr>
+          <tr><td class="k">Telephony and numbers</td><td>Per-client accounts, own numbers, 140/1600 series, forwarding, warm transfer, concurrency pools</td><td><span class="chip now">Now</span></td><td>Retell, Exotel, Ringg</td></tr>
+          <tr><td class="k">Campaigns and dialer</td><td>Calling windows, retries, pacing, DND and consent gate, script A/B tests</td><td><span class="chip now">Now</span></td><td>SquadStack, ElevenLabs batch calling</td></tr>
+          <tr><td class="k">Conversations inbox</td><td>Calls, WhatsApp, SMS in one thread; recordings, summaries, human takeover, tasks</td><td><span class="chip now">Now</span></td><td>Weave, Podium, Birdeye</td></tr>
+          <tr><td class="k">Contacts and CRM</td><td>Customer 360, custom fields, pipelines, dedupe, consent flags, branch ownership</td><td><span class="chip now">Now</span></td><td>Podium, GoHighLevel</td></tr>
+          <tr><td class="k">Scheduling</td><td>Doctors, chairs, rooms; slots per branch; waitlist; reminders; write-back to clinic systems</td><td><span class="chip now">Now</span></td><td>NexHealth, Zenoti, Assort</td></tr>
+          <tr><td class="k">Knowledge base</td><td>Documents, FAQs, prices per branch, "questions it could not answer" report</td><td><span class="chip now">Now</span></td><td>ElevenLabs, Chatwoot Captain</td></tr>
+          <tr><td class="k">Automations</td><td>Triggers (call outcome, missed call, no-show) to WhatsApp, tasks, CRM, webhooks</td><td><span class="chip now">Basic now</span> <span class="chip next">Builder next</span></td><td>GoHighLevel workflows</td></tr>
+          <tr><td class="k">Analytics and QA</td><td>Outcomes, "unbooked opportunity" detection, scorecards, sampled then full AI QA</td><td><span class="chip now">Now</span></td><td>Weave Call Intelligence, Vapi Boards</td></tr>
+          <tr><td class="k">Integrations</td><td>Public API, webhooks, calendar, clinic systems, CRMs, MCP server</td><td><span class="chip now">Now</span></td><td>Assort, Petpooja marketplace</td></tr>
+          <tr><td class="k">Metering and billing</td><td>Usage events, INR wallet, plans, add-ons, GST invoices</td><td><span class="chip now">Now</span></td><td>Exotel prepaid, Lago wallets</td></tr>
+          <tr><td class="k">Compliance</td><td>Consent ledger, DND, A2P declarations, disclosure, redaction, retention, DPDP requests</td><td><span class="chip now">Now</span></td><td>Retell retention controls</td></tr>
+          <tr><td class="k">Identity and tenancy</td><td>Hierarchy, roles, SSO, audited impersonation</td><td><span class="chip now">Now</span></td><td>GoHighLevel, Birdeye</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Client workspace, by role</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Role</th><th>What their screen gives them</th><th>When</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Owner</td><td>Branch rollup: calls answered by AI vs missed, bookings, revenue recovered in rupees, no-show rate, wallet runway</td><td><span class="chip now">Now</span></td></tr>
+          <tr><td class="k">Admin</td><td>Business profile, hours and holidays per branch, services and prices, staff, numbers, guarded persona edits, knowledge, integrations, retention</td><td><span class="chip now">Now</span></td></tr>
+          <tr><td class="k">Front desk</td><td>Live console (caller pop-up with AI summary, live transcript, take over, transfer), inbox, callback queue, today's appointment board, payment links</td><td><span class="chip now">Now</span></td></tr>
+          <tr><td class="k">Marketing</td><td>AI call and WhatsApp campaigns, segments, recall and reactivation, lead capture with source tracking</td><td><span class="chip now">Now</span></td></tr>
+          <tr><td class="k">Branch manager</td><td>Branch dashboard, QA review queue, escalations with timers, staff leaderboard</td><td><span class="chip next">Next</span></td></tr>
+          <tr><td class="k">Practitioner</td><td>"My day" with an AI summary before each visit, follow-up tasks, mobile</td><td><span class="chip next">Next</span></td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Vertical packs</h3>
+      <p>Each pack is a template (agent, workflows, dashboard, integrations), like GoHighLevel snapshots: <b>Dental and derma</b> (recalls, treatment follow-up, ABHA capture, Practo/Eka/HealthPlix sync) <span class="chip now">Now</span>; <b>Municipal</b> (grievance intake with ward routing, ticket ID by WhatsApp, escalation timers, property-tax dues with payment link, 1600 series, India hosting) <span class="chip now">Now</span>; <b>Spa, salon, gym</b> (packages, memberships, one number across branches) <span class="chip next">Next</span>; <b>Hospitals</b> (department routing, OPD tokens, lab-report status) <span class="chip next">Next</span>; <b>Restaurants and home services</b> <span class="chip later">Later</span>.</p>
+
+      <h3>Diigoo back office</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Module</th><th>When</th><th>Build or buy</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Super admin console: tenants, plans, flags, audited impersonation, kill switch, vertical templates</td><td><span class="chip now">Now</span></td><td>Build</td></tr>
+          <tr><td class="k">Provider routing and margin analytics (cost per minute by carrier and model, margin per tenant)</td><td><span class="chip now">Now</span></td><td>Build</td></tr>
+          <tr><td class="k">Wallet, metering, GST invoices</td><td><span class="chip now">Now</span></td><td>Build the wallet; buy payments (Razorpay) and GST books (Zoho Books or Tally)</td></tr>
+          <tr><td class="k">Marketing funnel: "call our AI now" demo line per vertical and language, lead capture, free credits, attribution</td><td><span class="chip now">Now</span></td><td>Build on JENAI's own engine, PostHog for analytics</td></tr>
+          <tr><td class="k">Sales CRM and pilot tracker</td><td><span class="chip now">Now</span></td><td>Buy: Twenty (open source, self-hosted) or Zoho CRM</td></tr>
+          <tr><td class="k">Onboarding with a go-live gate</td><td><span class="chip now">Now</span></td><td>Build (the core problem, see Part 11)</td></tr>
+          <tr><td class="k">Support desk, help centre, status page</td><td><span class="chip now">Now</span></td><td>Buy: Chatwoot self-hosted (WhatsApp-first)</td></tr>
+          <tr><td class="k">Compliance operations (DLT registry, consent audits, DPDP queue, DPAs)</td><td><span class="chip now">Now</span></td><td>Build</td></tr>
+          <tr><td class="k">Customer success: health scores, renewal alerts, review packs</td><td><span class="chip next">Next</span></td><td>Build</td></tr>
+          <tr><td class="k">Partners, resellers, white-label</td><td><span class="chip later">Later</span></td><td>Build on the tenant hierarchy</td></tr>
+        </tbody>
+      </table></div>
+
+      <!-- PART 5 -->
+      <h2 id="p5">Part 5. Numbers, integrations and compliance</h2>
+      <div class="warn">
+        <p><b>New rule, 18 Sep 2026.</b> TRAI's third amendment to the telemarketing regulations treats any call placed by software, including AI voice, as an "A2P call". The business must declare A2P use and its caller-ID numbers to the telecom operator in advance; undeclared calls count as spam. A2P calls outside the 140 and 1600 series can carry a termination charge of up to ₹0.05 per minute, and operators must run AI/ML spam detection. The effective date was not in the coverage found. JENAI's live outbound numbers should be declared with Vobiz now.</p>
+      </div>
+
+      <h3>Three ways a client's phone number connects</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Mode</th><th>Who it fits</th><th>How it works</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Managed (default)</td><td>Clinics, spas, gyms, restaurants</td><td>One Vobiz sub-account per client, KYC'd in the client's own name through Vobiz's hosted KYC and Partner API. Calling stays blocked until KYC completes. Replaces today's single shared account.</td></tr>
+          <tr><td class="k">Client's own provider</td><td>Hospitals, GHMC, anyone already on Exotel, Tata or Ozonetel</td><td>JENAI stores their API credentials in the vault and points their call flow or Voicebot applet at a JENAI WebSocket.</td></tr>
+          <tr><td class="k">Forwarding or own carrier</td><td>Businesses keeping their public number</td><td>The existing number forwards (busy, no answer or always) to the JENAI number; SIP through Vobiz only where the client has an IP-PBX.</td></tr>
+        </tbody>
+      </table></div>
+      <p>Twilio cannot carry domestic India calls. Telnyx launched India numbers on 17 Sep 2026 in four cities only: watch, don't depend. Provider shortlist: Vobiz primary, Exotel for bring-your-own and as second carrier, Plivo for redundancy, Tata Smartflo for hospitals and government.</p>
+
+      <h3>Onboarding a client's number (managed mode)</h3>
+      <ol class="flow">
+        <li><div>Create the client's Vobiz sub-account by API; credentials go into the vault; calling blocked.</div></li>
+        <li><div>Send the hosted KYC link (PAN, GST, CIN or DigiLocker); collect the data processing agreement and a use declaration: inbound only, outbound service, or outbound promotional.</div></li>
+        <li><div>Choose the number: local landline for inbound and service, 140-series for promotional (needs DLT entity), 1600 for financial or government clients, or forwarding from the existing number.</div></li>
+        <li><div>File the A2P declaration per caller ID with a timestamped record; for promotional use, add DLT headers and templates and link JENAI as telemarketer.</div></li>
+        <li><div>Create a Vobiz application inside the client's sub-account with a signed, client-specific answer URL.</div></li>
+        <li><div>Map number to agent; set disclosure, recording, hours, transfer number and concurrency limits.</div></li>
+        <li><div>Automatic test calls in and out, confirm transcript and CRM write-back, top up the wallet, go live.</div></li>
+      </ol>
+
+      <h3>The gate every outbound call passes</h3>
+      <p>Before any dial: campaign active; inside the branch's calling window and the platform's promotional window; not on DND/NCPR or the client's opt-out list; valid consent for this purpose (enquiry consent lasts 7 days); frequency caps per contact; caller ID declared for A2P and the right series for the purpose; wallet balance reserved. A spoken "don't call me" is detected and suppressed immediately across the client.</p>
+
+      <h3>Integrations architecture</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Component</th><th>Choice</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Connector registry</td><td>Code-defined connectors with a manifest (auth type, actions, triggers, region)</td><td>Reuses the panel's connector contract</td></tr>
+          <tr><td class="k">Credential vault</td><td>Postgres with envelope encryption, per-client keys wrapped by AWS KMS; token refresh jobs</td><td>Credentials never reach the UI; deleting a key shreds a tenant's secrets</td></tr>
+          <tr><td class="k">Inbound events</td><td>Signed per-client webhook URLs for Meta Lead Ads, Google Ads forms, website forms, IndiaMART</td><td>Every lead becomes one normalised event that can trigger a call</td></tr>
+          <tr><td class="k">Outbound webhooks</td><td>Svix open-source server (MIT)</td><td>Signing, retries and delivery logs included</td></tr>
+          <tr><td class="k">Tools during live calls</td><td>One tool gateway: timeouts, cache, retries, circuit breaker, idempotency keys, redacted logs</td><td>Reads target p95 under 1.5 s (hard 3 s); writes 5 s with a spoken filler; on timeout, confirm on WhatsApp after the call</td></tr>
+          <tr><td class="k">Automation</td><td>Native "when X then Y" in JENAI; Activepieces internally for staff</td><td>n8n's licence forbids powering client features; Activepieces embedding is paid</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Integration catalogue</h3>
+      <p><span class="chip now">Tier 1</span> WhatsApp Cloud API with JENAI as a Meta Tech Provider (clients pay Meta directly, no reseller markup), Google and Microsoft calendars, website forms, Meta Lead Ads, Google Ads forms, Zoho CRM, LeadSquared, Razorpay payment links, Google Sheets, DLT SMS.<br>
+      <span class="chip next">Tier 2</span> Eka Care (slot and booking APIs plus an MCP server), HubSpot, Kylas, Bitrix24, Salesforce, IndiaMART, Cashfree, PhonePe, Google Business Profile reviews, clients' existing WhatsApp providers.<br>
+      <span class="chip later">Tier 3</span> Practo/Insta, HealthPlix, KareXpert (partner-only APIs), JustDial, ABDM, WhatsApp business calling, Consent Manager.</p>
+
+      <!-- PART 6 -->
+      <h2 id="p6">Part 6. Target architecture</h2>
+      <p class="lead">One TypeScript codebase split into business modules (a modular monolith), a separate Python voice plane, and shared managed data stores. Small teams at this stage should not run microservices; modules can be pulled out later without a rewrite.</p>
+
+      <div class="arch" role="img" aria-label="Architecture layers from users to carriers">
+        <div class="row"><div class="lab">People and systems</div><div class="cells"><span class="cell">Diigoo staff</span><span class="cell">Client teams</span><span class="cell">Client CRMs and lead forms</span><span class="cell">Public API users</span></div></div>
+        <div class="row"><div class="lab">Edge</div><div class="cells"><span class="cell">Load balancer</span><span class="cell">Caddy on-demand TLS (white-label domains)</span><span class="cell">WAF and rate limits</span></div></div>
+        <div class="row ctrl"><div class="lab">Control plane</div><div class="cells"><span class="cell">web: tenant app, back office, API</span><span class="cell">ingest: telephony and lead webhooks</span><span class="cell">dialer: pacer and admission</span><span class="cell">workers: post-call, sync, billing</span><span class="cell">realtime: live transcript and dashboards</span><span class="cell">relay: outbox to events and webhooks</span></div></div>
+        <div class="row"><div class="lab">Data</div><div class="cells"><span class="cell">Postgres Multi-AZ via PgBouncer (row-level security)</span><span class="cell">Redis / Valkey: leases, limits, pub/sub</span><span class="cell">S3 + KMS: recordings, transcripts</span><span class="cell">ClickHouse + Langfuse (later)</span></div></div>
+        <div class="row voice"><div class="lab">Voice plane</div><div class="cells"><span class="cell">Pipecat voice workers</span><span class="cell">Gemini Live or STT-LLM-TTS pipeline</span><span class="cell">Dograh behind an adapter until replaced</span><span class="cell">Optional GPU pool</span></div></div>
+        <div class="row"><div class="lab">Carriers and models</div><div class="cells"><span class="cell">Vobiz</span><span class="cell">Exotel</span><span class="cell">Plivo</span><span class="cell">Gemini Live</span><span class="cell">Bedrock Mumbai</span><span class="cell">Sarvam</span></div></div>
+        <div class="row"><div class="lab"></div><div class="rule">The one rule: the voice plane never reads the main database. Each call gets a frozen snapshot of the agent version and a call-scoped token; everything else flows back as events.</div></div>
+      </div>
+
+      <h3>Technology choices</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Concern</th><th>Pick</th><th>Why</th><th>Rejected</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Code shape</td><td>Modular monolith, pnpm + Turborepo monorepo, lint-enforced module boundaries</td><td>Speed now, separable later</td><td>Microservices</td></tr>
+          <tr><td class="k">Starting point</td><td>Vaani's schema and capability matrix, extended</td><td>Already the right shape</td><td>Growing the <code>panel.json</code> app</td></tr>
+          <tr><td class="k">Tenant isolation</td><td>Shared schema, <code>tenant_id</code> first in every key, Postgres row-level security as a second guard</td><td>Scales to thousands of tenants with one migration path</td><td>Schema or database per tenant (kept for an enterprise tier)</td></tr>
+          <tr><td class="k">Connection pooling</td><td>PgBouncer, transaction mode</td><td>Keeps per-transaction tenant settings working</td><td>RDS Proxy (pins sessions)</td></tr>
+          <tr><td class="k">Durable jobs</td><td>Hatchet, self-hosted (MIT)</td><td>Per-tenant round-robin fairness, TS and Python SDKs, Postgres only</td><td>Inngest (SSPL, fairness enterprise-only), BullMQ (fairness needs Pro)</td></tr>
+          <tr><td class="k">Dialer</td><td>Custom: Postgres call targets plus atomic Redis leases</td><td>Needs six capacity limits at once; no engine offers that</td><td>Engine-level pacing</td></tr>
+          <tr><td class="k">Events</td><td>Transactional outbox plus polling relay</td><td>Atomic with the business write</td><td>Postgres LISTEN/NOTIFY as a bus (caused outages at Recall.ai), Kafka (overkill)</td></tr>
+          <tr><td class="k">Billing</td><td>In-house wallet ledger and rating, Razorpay (subscriptions, UPI AutoPay, top-ups), GST invoices</td><td>Per-minute pricing needs no engine yet</td><td>Stripe Billing (poor India fit), Lago (AGPL)</td></tr>
+          <tr><td class="k">Voice runtime</td><td>Own Pipecat workers, porting Dograh code (BSD-2)</td><td>Same framework the Telugu agent already runs on</td><td>Rewriting on another framework</td></tr>
+          <tr><td class="k">Compute</td><td>ECS: Fargate for web services, EC2 with scale-in protection for voice</td><td>Fargate's 120 s stop limit is too short to drain calls</td><td>Kubernetes now; docker compose on one box</td></tr>
+          <tr><td class="k">Observability</td><td>OpenTelemetry to Grafana, Loki, Tempo; Langfuse for voice traces; Sentry</td><td>Open source and consistent</td><td>Paid APM</td></tr>
+          <tr><td class="k">Secrets</td><td>AWS Secrets Manager; per-tenant data keys wrapped by KMS</td><td>Cryptographic separation, provable erasure</td><td>Plain JSON credentials (today)</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Dialer design</h3>
+      <p>Progressive dialing only: a voice-worker slot is reserved before the number is dialled, so every answered call has an agent and there are no silent calls (silent calls drive spam complaints, and under the new rules a few complaints can trigger action on a number). Each tick picks the next tenant by weighted round robin, runs the compliance gate, reserves wallet balance, then atomically acquires all capacity leases (global model sessions, carrier channels, per-number concurrency and calls-per-second, tenant and campaign limits, a per-phone lock, and 20% held back for inbound). Inbound always wins; when inbound surges, outbound backs off.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>Outcome</th><th>Next step</th></tr></thead>
+        <tbody>
+          <tr><td class="k">No answer</td><td>Retry at +2 h, +4 h, then next day (max 3 a day)</td></tr>
+          <tr><td class="k">Busy</td><td>Retry at +20 min</td></tr>
+          <tr><td class="k">Switched off / not reachable</td><td>Retry at +3 h</td></tr>
+          <tr><td class="k">Asked for a callback</td><td>Time extracted, high-priority target created</td></tr>
+          <tr><td class="k">Spoken opt-out</td><td>Suppressed immediately across the client</td></tr>
+          <tr><td class="k">Voicemail or carrier announcement</td><td>One retry next day; detected before the AI starts speaking</td></tr>
+        </tbody>
+      </table></div>
+
+      <!-- PART 7 -->
+      <h2 id="p7">Part 7. Reliability standard</h2>
+      <p>The pattern at Salesforce, Atlassian, Slack, Shopify and Stripe is the same: a tenant ID on every row and request, multi-AZ by default, gradual rollouts of both code and config, restores that are actually tested, per-tenant limits, and SLOs with a formal incident process. Cells, sharding and multi-region come later, when scale demands them. Notion ran on one Postgres for five years before sharding.</p>
+
+      <h3>What JENAI can honestly promise</h3>
+      <div class="tbl"><table>
+        <thead><tr><th>Uptime</th><th class="num">Downtime a month</th><th>What it takes</th></tr></thead>
+        <tbody>
+          <tr><td class="k">99.5%</td><td class="num">3.6 h</td><td>The ceiling today (AWS commits 99.5% for a single instance)</td></tr>
+          <tr><td class="k">99.9%</td><td class="num">43.8 min</td><td>Two AZs, managed Multi-AZ database, zero-downtime deploys, 24x7 alerting, tested restores</td></tr>
+          <tr><td class="k">99.95%</td><td class="num">21.9 min</td><td>Plus automatic failover everywhere, spare capacity per AZ, canary deploys, second carrier and second AI path</td></tr>
+          <tr><td class="k">99.99%</td><td class="num">4.4 min</td><td>Not realistic: the AI providers themselves offer no uptime guarantee</td></tr>
+        </tbody>
+      </table></div>
+      <p>Recommendation: contract 99.5% now, excluding carrier and AI-model outages as Twilio and Zoho do; move to 99.9% after multi-AZ plus three months of measured data; measure quarterly and cap credits (Slack paid $8.2M in SLA credits in 2019 before changing its terms).</p>
+
+      <h3>Internal targets</h3>
+      <div class="tbl"><table>
+        <thead><tr><th>Measure</th><th>Stage 1</th><th>Later</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Dashboard and API availability</td><td>99.9%</td><td>99.95%</td></tr>
+          <tr><td class="k">Call setup success</td><td>99.5%</td><td>99.9%</td></tr>
+          <tr><td class="k">Platform-caused mid-call drops</td><td>under 0.5%</td><td>under 0.1%</td></tr>
+          <tr><td class="k">Voice turn latency, p95</td><td>under 1.5 s</td><td>under 1.0 s</td></tr>
+          <tr><td class="k">Scheduled outbound dialled within 5 min</td><td>99%</td><td>99.5%</td></tr>
+        </tbody>
+      </table></div>
+      <p>When a month's error budget is spent, releases freeze except for critical and security fixes.</p>
+
+      <h3>Incidents</h3>
+      <p><b>SEV1</b>: no client (or GHMC) can make or receive calls, a breach, or data loss. <b>SEV2</b>: a major feature down for many clients or one enterprise client fully down. <b>SEV3</b>: partial degradation. SEV1 is acknowledged within 15 minutes, the status page updated within 30, and every SEV1 and SEV2 gets a blameless review within five working days. India adds a hard clock: cyber incidents go to CERT-In within <b>6 hours</b>.</p>
+
+      <h3>Deploying without dropping live calls</h3>
+      <ol class="flow">
+        <li><div>Voice workers run as their own fleet, each advertising its free call slots.</div></li>
+        <li><div>A deploy marks a worker "not ready" (no new calls), waits for active calls to finish up to the maximum call length, then exits.</div></li>
+        <li><div>New versions take 1 to 5% of new calls first; call setup, latency and drop rate are compared before going further.</div></li>
+        <li><div>Under load, shed in this order: outbound campaigns, then analytics and learning jobs. Never inbound.</div></li>
+        <li><div>The carrier's fallback URL points at a degraded mode (message plus callback queue), so a caller never hears dead air.</div></li>
+      </ol>
+
+      <h3>Disaster recovery</h3>
+      <p>Stage 1: database failover in 60 to 120 seconds with point-in-time recovery (RPO 5 min); region loss restored from Hyderabad backups within 24 h. Stage 2: a pilot-light copy in Hyderabad (RPO 15 min, RTO 4 h). Restore drills monthly; a full game day twice a year. Atlassian's April 2022 outage (775 customers, up to 14 days) is the lesson: soft deletes and a tested single-tenant restore.</p>
+
+      <!-- PART 8 -->
+      <h2 id="p8">Part 8. Engineering standard</h2>
+      <p>DORA's 2025 research found AI coding amplifies whatever process a team already has: faster delivery, but more instability without discipline. Stripe merges over 1,000 agent-written changes a week, each reviewed by a human, with agents on isolated machines that never see production. That is the model.</p>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Area</th><th>Standard</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Repositories</td><td>On git.diigoo.com: <code>jenai/platform</code> (monorepo: apps, packages, infra, docs, ADRs, runbooks) and <code>jenai/voice-engine</code> (the Dograh fork). The panel and Vaani are archived read-only once replaced. Never two live codebases.</td></tr>
+          <tr><td class="k">Upstream fork</td><td>A pure upstream mirror branch plus <code>jenai/main</code> built from an upstream release and local patches, each tagged <code>UPSTREAM: &lt;carry&gt;</code>, <code>&lt;PR#&gt;</code> or <code>&lt;drop&gt;</code> (OpenShift's method), with a <code>PATCHES.md</code> ledger. Rebased per upstream release, gated by voice evals.</td></tr>
+          <tr><td class="k">Branching</td><td>Trunk-based: <code>main</code> always deployable, branches live under 2 days, merge requests of about 200 reviewed lines.</td></tr>
+          <tr><td class="k">Review</td><td>GitLab's free edition cannot enforce approvals, so: nobody pushes to <code>main</code>, only named maintainers merge, pipelines and all threads must pass. An AI review runs first in a fresh context; a human merges. Risky paths (migrations, auth, tenant isolation, billing, telephony, infra, agent config) need a second human or a 24-hour cool-off.</td></tr>
+          <tr><td class="k">CI stages</td><td>Verify under 10 min (types, lint, unit tests, secret scan, dependency audit, migration lint, API breaking-change check); integration tests that prove tenant A cannot read tenant B; images tagged by commit; a preview app per merge request; nightly load and security scans.</td></tr>
+          <tr><td class="k">Environments</td><td>Local, preview per change, staging (own database, keys and test number), production. No more rsync: production pulls signed images through CI only, with a one-command rollback.</td></tr>
+          <tr><td class="k">Database changes</td><td>Generated migrations only; expand and contract across two deploys; indexes built concurrently; backfills as jobs; a point-in-time backup before each migration.</td></tr>
+          <tr><td class="k">Rollouts</td><td>Feature flags with owners and expiry; rings: JENAI's own tenant, then pilot clients, then everyone.</td></tr>
+          <tr><td class="k">AI-written code</td><td>One short <code>AGENTS.md</code> imported by <code>CLAUDE.md</code> (Claude on Bedrock does not read <code>AGENTS.md</code> on its own). Hooks and CI enforce, instructions only guide. No production credentials or real customer data anywhere an agent runs. Tests in the same change; bug fixes start with a failing test. At most two CI rounds per agent run, then a human takes over.</td></tr>
+        </tbody>
+      </table></div>
+
+      <!-- PART 9 -->
+      <h2 id="p9">Part 9. AI agent quality</h2>
+      <p>Sierra, Decagon, ElevenLabs, Retell and PolyAI all use one release model: every version is an immutable snapshot, a named pointer decides which version is live, simulated-caller tests gate each release, a small share of traffic gets it first, and rollback moves the pointer back. JENAI's past incidents map directly onto it.</p>
+      <div class="tbl wide"><table>
+        <thead><tr><th>What went wrong in production</th><th>Prevented by</th><th>Caught by</th></tr></thead>
+        <tbody>
+          <tr><td>Persona edit reached outbound but not inbound</td><td>One live pointer per client for both directions; publish only from CI</td><td>Staging check that both directions answer with the new release ID</td></tr>
+          <tr><td>Client prompts drifted after hand-patching</td><td>One shared behaviour base plus client facts in git; production UI read-only for persona text</td><td>Alert when the deployed prompt differs from git</td></tr>
+          <tr><td>A quota error killed lead extraction for days</td><td>Separate model quota per client or tier (Gemini limits are per Google Cloud project, not per key); failover to a second path</td><td>Alerts on any 401/402/403/429, extraction coverage below 95%, failed-job queue</td></tr>
+          <tr><td>A date came back as a literal format string</td><td>Schema-constrained output; dates resolved in code from the caller's words (Telugu and Hindi supported)</td><td>Extraction contract tests; low-confidence cases to human review</td></tr>
+          <tr><td>Calls dropped at 1 second</td><td>End-reason taxonomy; pre-call health check; answering-machine tests</td><td>Short-call spike alert; synthetic test call to every number every 15 min</td></tr>
+          <tr><td>A worker hung after long calls</td><td>Gemini session resumption, stall watchdog, maximum call length, newer Pipecat with watchdogs</td><td>25-minute soak test; hung-worker alert</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Test gates before any agent release</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Gate</th><th>When</th><th>Checks</th><th>Pass rule</th></tr></thead>
+        <tbody>
+          <tr><td class="k">G0 Lint</td><td>Every change</td><td>Client facts match schema, no leftover placeholders, disclosure line present</td><td>Hard fail</td></tr>
+          <tr><td class="k">G1 Text scenarios</td><td>Every change</td><td>Simulated callers, tool calls and arguments</td><td>Safety 5 of 5 runs; tasks 3 of 3 in 95% of cases</td></tr>
+          <tr><td class="k">G2 Extraction</td><td>Every change</td><td>Golden transcripts to the extractor</td><td>100% schema-valid, dates 100% right</td></tr>
+          <tr><td class="k">G3 Audio</td><td>Nightly and pre-release</td><td>Telugu, Hindi, English synthetic voices with noise and barge-in</td><td>No drop over 5 points; latency within target</td></tr>
+          <tr><td class="k">G4 Soak and load</td><td>Weekly</td><td>20 to 30 minute calls, many concurrent</td><td>Zero hung workers</td></tr>
+          <tr><td class="k">G5 Staging smoke</td><td>After each deploy</td><td>One real inbound and outbound call per client</td><td>Both answer with the new release</td></tr>
+        </tbody>
+      </table></div>
+      <p>Voice agents are far less reliable than text agents (Sierra's voice benchmark: about 54% task completion in clean audio against 85% in text), so gates demand repeated passes, not one. Synthetic Telugu callers use Indic Parler-TTS; the common open voices (Kokoro) have Hindi but no Telugu.</p>
+
+      <!-- PART 10 -->
+      <h2 id="p10">Part 10. Security and compliance</h2>
+      <p>JENAI is a <b>data processor</b> for its clients' patients and citizens, and a <b>data fiduciary</b> for its own customer accounts and anything it reuses across clients (such as learning from call transcripts, which should default to "no training on customer data").</p>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Obligation</th><th>Status</th><th>What JENAI builds</th></tr></thead>
+        <tbody>
+          <tr><td class="k">CERT-In Directions (2022)</td><td><span class="chip crit">In force</span></td><td>Report incidents within 6 hours; keep logs 180 days in India (plan 1 year); synced clocks; registered point of contact</td></tr>
+          <tr><td class="k">IT Amendment Rules 2026 (synthetic media)</td><td><span class="chip crit">In force since 20 Feb 2026</span></td><td>An AI disclosure at call start that clients cannot switch off; an identifier in recording metadata; voice-cloning controls (whether JENAI is an "intermediary" needs counsel)</td></tr>
+          <tr><td class="k">TRAI telemarketing (2025, Sep 2026)</td><td><span class="chip crit">In force</span></td><td>The outbound gate in Part 5; A2P declarations; opt-out capture</td></tr>
+          <tr><td class="k">DPDP Act and Rules 2025</td><td><span class="chip hi">Full effect 13 May 2027</span></td><td>DPA template, sub-processor list, field encryption, access logs kept a year, breach support (Board report within 72 h), per-client retention and purge, access/erase requests by phone number</td></tr>
+          <tr><td class="k">Healthcare</td><td><span class="chip crit">In force</span></td><td>No diagnosis, prescribing or counselling by the AI; emergency path; retention configurable to medical-records rules</td></tr>
+          <tr><td class="k">Selling to government</td><td><span class="chip hi">Per tender</span></td><td>Data and backups in India, including AI processing where required; SBOM per release; annual audit by a CERT-In empanelled auditor; GeM listing</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Certification roadmap</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>When</th><th>What</th><th>Indicative cost</th></tr></thead>
+        <tbody>
+          <tr><td class="k">0 to 3 months</td><td>VAPT by a CERT-In empanelled auditor plus a DPDP gap assessment (hospitals and government ask first)</td><td>From about ₹50k per app</td></tr>
+          <tr><td class="k">3 to 9 months</td><td>ISO/IEC 27001:2022</td><td>About ₹2 to 8 lakh, 3 to 6 months</td></tr>
+          <tr><td class="k">When global buyers ask</td><td>SOC 2 Type I, then Type II</td><td>About ₹3 to 10 lakh with Indian auditors</td></tr>
+          <tr><td class="k">9 to 18 months</td><td>ISO 27701 (maps to DPDP), 27017/27018, ISO 42001 for AI</td><td>Incremental on 27001</td></tr>
+          <tr><td class="k">If pursuing government at scale</td><td>MeitY empanelment and STQC audit</td><td>Unverified, about ₹5 to 10 lakh</td></tr>
+        </tbody>
+      </table></div>
+      <p>Compliance tooling: Sprinto or Scrut (Indian, INR billing, DPDP support), or the open-source Probo (MIT) if the chosen auditor accepts it.</p>
+
+      <h3>Controls in the first 60 days</h3>
+      <ul class="list">
+        <li>Rotate every credential that has sat in plaintext; move secrets to a manager; argon2id for passwords; secret scanning in CI.</li>
+        <li>Staff SSO with passkeys on AWS, git, email and consoles; no public SSH (AWS Session Manager instead).</li>
+        <li>Encryption at rest everywhere; recordings only through short-lived signed links.</li>
+        <li>Row-level security plus an automated cross-tenant test suite on every endpoint.</li>
+        <li>Immutable audit log of every recording view, export and deletion.</li>
+        <li>Supply chain: 2026 saw the axios and LiteLLM compromises and a 444-package npm worm, so lockfiles, install scripts off, a 7-day minimum release age for new versions, pinned CI actions.</li>
+        <li>Caller speech is untrusted input: tool calls are authorised against the caller's verified identity, never against what the model says.</li>
+      </ul>
+
+      <!-- PART 11 -->
+      <h2 id="p11">Part 11. Customers and pricing</h2>
+      <p>The best-run companies mix three motions: self-serve with sales on demand for small businesses (Freshworks), sales-led for enterprise and government, and a partner channel on top (Zoho's local partners, GoHighLevel's agencies, Wati's affiliates).</p>
+
+      <h3>The customer lifecycle</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Stage</th><th>Owner</th><th>What happens</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Attract</td><td>Marketing</td><td>Vertical and city pages in Telugu, Hindi, English; a "call our AI now" number; each demo call becomes a lead automatically</td></tr>
+          <tr><td class="k">Qualify</td><td>Marketing, BD</td><td>Fit plus intent score; JEN calls back within 5 minutes; assigned to BD by territory</td></tr>
+          <tr><td class="k">Demo and trial</td><td>BD</td><td>Demo agent personalised from the prospect's site; small-business trial with sample data, no card; paid scoped pilot for enterprise</td></tr>
+          <tr><td class="k">Close</td><td>BD, Finance</td><td>Quote, online acceptance or Aadhaar e-sign, GSTIN and PAN checks, first payment plus mandate; "won" starts provisioning</td></tr>
+          <tr><td class="k">Provision</td><td>Onboarding</td><td>Draft, KYC verified, number assigned, configured, verified, live: <b>live stays blocked until every check passes</b></td></tr>
+          <tr><td class="k">Activate</td><td>Customer success</td><td>20 real calls answered and one booked outcome within 7 days; WhatsApp nudges on days 1, 3, 7</td></tr>
+          <tr><td class="k">Retain and expand</td><td>Customer success</td><td>Health score (usage, support, payment, NPS); alerts on low wallet, 3 silent days, failure spikes</td></tr>
+          <tr><td class="k">Collect and renew</td><td>Finance</td><td>Automatic retries and reminders; on non-payment outbound pauses first, inbound stays on, then suspension</td></tr>
+        </tbody>
+      </table></div>
+      <p class="note">The go-live gate directly fixes the onboarding misses seen on recent clients: an automatic inbound test call, an outbound test call to the owner, confirmed transcript and CRM write-back, and filed A2P and DLT declarations must all pass before a client can go live.</p>
+
+      <h3>Recommended pricing (excluding GST)</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Plan</th><th class="num">Price</th><th>Includes</th><th class="num">Overage</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Trial</td><td class="num">Free</td><td>₹1,000 credits, one agent, test calls</td><td class="num">None</td></tr>
+          <tr><td class="k">Front Desk (1 branch)</td><td class="num">₹2,999/mo</td><td>300 min, one number, AI receptionist, missed-call WhatsApp, booking, inbox, owner dashboard</td><td class="num">₹7/min</td></tr>
+          <tr><td class="k">Growth</td><td class="num">₹7,999/mo per branch</td><td>1,200 min, reminders and recalls, reviews, sampled AI QA, one integration</td><td class="num">₹6/min</td></tr>
+          <tr><td class="k">Business (up to 5 branches)</td><td class="num">₹19,999/mo</td><td>4,000 min, one number across branches, clinic integrations, API and webhooks, full AI QA</td><td class="num">₹5.5/min</td></tr>
+          <tr><td class="k">Enterprise / Government</td><td class="num">Annual</td><td>Committed minutes at ₹3.5 to 5/min all-in, India or private hosting, 1600 series, SLA, success manager</td><td class="num">Contract</td></tr>
+        </tbody>
+      </table></div>
+      <p>Market reference: Ringg ₹6 per connected minute including telephony; Bolna about ₹5.52 excluding telephony; Practo Ray Connect ₹1,499 to 2,499 a month. Wallet rules from RBI's 2026 e-mandate framework: automatic top-ups stay at or under ₹15,000 (no re-authentication) with 24-hour advance notice. GST is charged on a receipt voucher at top-up and invoiced on usage monthly; unused wallet balance is a liability, not revenue.</p>
+
+      <h3>Founder dashboard</h3>
+      <p>MRR split into committed subscription and recognised usage; net and gross revenue retention; acquisition cost by channel and payback; <b>gross margin per minute and per client</b>; funnel conversion by source; activation rate and days from contract to go-live; share of go-lives passing every check first time; usage and failure rates per client; health distribution and MRR at risk; collections and TDS receivable; KYC, DLT and A2P completion.</p>
+
+      <!-- PART 12 -->
+      <h2 id="p12">Part 12. Scale and unit economics</h2>
+      <p>At 100,000 calls a day, the cost is carriers, speech and models, not servers: worker compute is under 2% of cost per minute. The binding limits are vendor concurrency caps, which need enterprise contracts before the 50k-a-day stage.</p>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Calls a day</th><th class="num">10k</th><th class="num">50k</th><th class="num">100k</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Minutes a month</td><td class="num">0.75M</td><td class="num">3.75M</td><td class="num">7.5M</td></tr>
+          <tr><td class="k">Peak simultaneous AI sessions</td><td class="num">75</td><td class="num">375</td><td class="num">750</td></tr>
+          <tr><td class="k">AI capacity to provision</td><td class="num">100</td><td class="num">500</td><td class="num">1,000</td></tr>
+          <tr><td class="k">Worker nodes (8 vCPU, Gemini Live relay)</td><td class="num">3 + 1</td><td class="num">13 + 2</td><td class="num">25 + 3</td></tr>
+          <tr><td class="k">Carrier channels (two carriers)</td><td class="num">2 × 90</td><td class="num">2 × 400</td><td class="num">2 × 775</td></tr>
+        </tbody>
+      </table></div>
+      <p class="note">Assumes 150-second calls, 15% of daily calls in the peak hour, half inbound, 30% outbound pickup. Scheduling outbound into quiet hours removes about a quarter of peak capacity.</p>
+
+      <h3>Cost per minute</h3>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Voice stack</th><th class="num">Cost/min</th><th class="num">Margin at ₹4</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Gemini Live speech-to-speech (today)</td><td class="num">₹1.8 to 5.6</td><td class="num">55% to -40%</td></tr>
+          <tr><td class="k">Hosted pipeline: Sarvam STT, Bedrock Mumbai LLM, Sarvam TTS</td><td class="num">₹2.3 to 3.05</td><td class="num">43% to 24%</td></tr>
+          <tr><td class="k">Hybrid: self-hosted STT and LLM, Sarvam TTS</td><td class="num">about ₹1.9</td><td class="num">53%</td></tr>
+          <tr><td class="k">Fully self-hosted on Mumbai GPUs, at 100k/day</td><td class="num">₹0.87 to 1.2</td><td class="num">78% to 70%</td></tr>
+        </tbody>
+      </table></div>
+      <div class="warn">
+        <p><b>The biggest unknown is today's real cost.</b> Gemini Live's cost per minute is uncertain by about 4x, because long sessions may rebill context every turn. One week of logging usage per call on current traffic settles it. Until then no price should be published.</p>
+      </div>
+      <p>Recommendation: keep Gemini Live for launch (proven in Telugu, lowest latency) with context compression, capped call length and per-call cost metering; build the hosted pipeline now as an automatic fallback and a cheaper option per client; move high-volume clients to hybrid or self-hosted only when open Telugu TTS passes quality tests. Replace burstable t3 servers with steady c7i/c7a instances: burstable machines have been seen throttling calls into silence.</p>
+
+      <!-- PART 13 -->
+      <h2 id="p13">Part 13. The build plan</h2>
+      <p>A strangler migration: the new platform grows beside the live one and takes over one client and one number at a time. Outbound cutovers happen at night when promotional dialing is not allowed anyway; inbound moves one number at a time with instant rollback; every step is behind a per-client switch. Durations are estimates for a small team working with AI coding agents.</p>
+
+      <div class="phases">
+        <div class="phase first">
+          <div class="when"><b>Phase 0</b><span>Stabilise · 1 to 2 weeks</span></div>
+          <div>
+            <ul>
+              <li><span class="chip done">Done</span> Backups, protection, alerts. <span class="chip hi">Tonight</span> Certificate renewal fix.</li>
+              <li>Put all JENAI code in git on git.diigoo.com (needs the pending server launch); staging copy of production.</li>
+              <li>Publish on every agent edit so inbound gets changes; persist the dial queue; hash passwords; remove the password-only login.</li>
+              <li>Lock down recording storage; stop sending never-expiring recording links to the browser.</li>
+              <li>Containers restart on their own after a reboot; free disk space; find the CPU climb since 4 Sep.</li>
+              <li>Move the helper model off the GPU box, then stop it (saves about ₹79k a month).</li>
+              <li>Declare live outbound numbers as A2P with Vobiz; log per-call model usage for one week.</li>
+            </ul>
+            <div class="safe">Clients notice: nothing, except fixed inbound personas. Changes run at night or are config-only.</div>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="when"><b>Phase 1</b><span>Foundation · 3 to 4 weeks</span></div>
+          <div>
+            <ul>
+              <li>New monorepo from Vaani's schema; Postgres Multi-AZ with PgBouncer and row-level security; audit log; outbox.</li>
+              <li>Better Auth: individual logins, roles and branch scopes for both sides; audited support access.</li>
+              <li>CI with the cross-tenant test; infrastructure as code; ECS; staging and production accounts.</li>
+              <li>Import tenants from <code>panel.json</code>; the old panel reads config through the new API; the file is frozen as a rollback copy.</li>
+            </ul>
+            <div class="safe">Clients notice: each client's current login claims an Owner account once, then invites their team. One week's notice first.</div>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="when"><b>Phase 2</b><span>Dialer, numbers, agent releases · 4 to 6 weeks</span></div>
+          <div>
+            <ul>
+              <li>Dialer v2 with the compliance gate, leases, retries, callbacks; wallet reservation logged but not enforced.</li>
+              <li>Per-client Vobiz sub-accounts with KYC; numbers moved one at a time; A2P records.</li>
+              <li>Agent releases as immutable snapshots with one live pointer per client; gates G0 to G2 in CI; Hatchet for post-call work.</li>
+              <li>Separate model quota per client or tier; failover path.</li>
+            </ul>
+            <div class="safe">Clients notice: campaigns that respect calling hours and retry properly. Shadow mode for a week before each cutover.</div>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="when"><b>Phase 3</b><span>Front office and back office · 4 to 6 weeks</span></div>
+          <div>
+            <ul>
+              <li>Contacts, leads, inbox, WhatsApp, calendar booking, lead-source webhooks, CRM sync, outbound webhooks.</li>
+              <li>Role workspaces: owner, front desk, marketing, branch manager.</li>
+              <li>Plans, wallet enforcement, Razorpay, GST invoices; onboarding go-live gate.</li>
+              <li>Back office on JENAI's own tenant, with Twenty CRM, Chatwoot and PostHog.</li>
+            </ul>
+            <div class="safe">Clients notice: the new workspace. Zero balance pauses campaigns rather than failing calls, with alerts at 20% and 10%.</div>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="when"><b>Phase 4</b><span>Voice plane v2 · 5 to 8 weeks</span></div>
+          <div>
+            <ul>
+              <li>Own Pipecat workers with frozen agent snapshots, autoscaling on active calls, draining on deploy.</li>
+              <li>Session resumption, pre-connect voicemail detection, carrier adapters, traces in Langfuse, recordings in S3.</li>
+              <li>Audio gates G3 and G4; load test to 100k calls a day.</li>
+            </ul>
+            <div class="safe">Clients notice: nothing if it works. Canary per agent at 5%, 25%, 100%; Dograh kept read-only for 30 days.</div>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="when"><b>Phase 5</b><span>Scale and trust · ongoing</span></div>
+          <div>
+            <ul>
+              <li>Analytics on ClickHouse, AI insights over transcripts, custom domains, partners and white-label.</li>
+              <li>DPDP rights tooling before 13 May 2027; VAPT then ISO 27001; Hyderabad disaster-recovery drills.</li>
+              <li>Hybrid or self-hosted voice for high-volume clients once Telugu quality passes.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <h3>Monthly running cost as it grows (estimates)</h3>
+      <p>Today: about ₹85,500 (₹6,400 production plus ₹79,000 GPU). Stage 1 production-grade AWS (multi-AZ, managed database, staging): about $600 to 1,200 a month (₹53,000 to ₹1,06,000), which falls within today's spend once the GPU box is retired. Self-hosted GitLab adds about ₹25,000 (both git.diigoo.com and git.iblab.org). Usage costs (carriers, models) scale with minutes and are recovered in per-minute pricing.</p>
+
+      <!-- PART 14 -->
+      <h2 id="p14">Part 14. Decisions needed</h2>
+      <div class="tbl wide"><table>
+        <thead><tr><th>Decision</th><th>Recommendation</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Approve this blueprint and start Phase 0</td><td>Yes; Phase 0 items are low-risk and each is confirmed before touching production</td></tr>
+          <tr><td class="k">Replace the GPU helper model</td><td>Move gemma3:12b to a cheap hosted model (tested on JEN sales first), then stop the box</td></tr>
+          <tr><td class="k">Start the git servers</td><td>Run or allow the pending launch script and add the two GoDaddy NS records, so Phase 0 code has a home</td></tr>
+          <tr><td class="k">Starting codebase</td><td>New monorepo seeded from Vaani's schema and capability matrix, not the panel</td></tr>
+          <tr><td class="k">Hosting budget for Stage 1</td><td>About $600 to 1,200 a month, funded by retiring the GPU box</td></tr>
+          <tr><td class="k">Telephony model</td><td>Managed Vobiz sub-account per client with KYC; bring-your-own for hospitals and GHMC</td></tr>
+          <tr><td class="k">Legal counsel</td><td>One opinion covering TRAI (A2P, landline AI calls to existing patients), DPDP processor terms and the IT Rules 2026 disclosure duty</td></tr>
+          <tr><td class="k">Email and AI accounts</td><td>Request AWS SES production access (invites to 70 people); fix the AWS payment method if Claude on Bedrock is wanted</td></tr>
+        </tbody>
+      </table></div>
+
+      <!-- PART 15 -->
+      <h2 id="p15">Part 15. Sources and open items</h2>
+      <p>The twelve full research reports, with source links for every claim, are saved on the founder's Mac in <code>/Users/abcom/jenai-blueprint/research/</code> (organisation and roles; market and modules; telephony, integrations and compliance; target architecture; code audit; reliability; engineering process; security; agent quality; customer lifecycle; scale and cost; infrastructure audit).</p>
+      <details>
+        <summary>Items still to verify before relying on them</summary>
+        <ul class="list">
+          <li>Effective date and final text of TRAI's 18 Sep 2026 amendment; whether AI calls from a landline to existing patients need 1600.</li>
+          <li>Whether Gemini Live can process audio in an India region (matters for GHMC and hospitals).</li>
+          <li>Whether Gemini Live rebills context every turn, and its real cost per minute on JENAI traffic.</li>
+          <li>Vobiz billing pulse and default concurrency; Exotel's sub-account API.</li>
+          <li>Whether JENAI counts as an "intermediary" under the IT Rules 2026, and whether GHMC's tender requires MeitY empanelment.</li>
+          <li>Calls per GPU for self-hosted models and the speed of Indic Parler-TTS.</li>
+          <li>Several vendor price points marked unverified in the reports (STQC audit cost, some competitor seat prices).</li>
+        </ul>
+      </details>
+
+      <div class="foot"><span>Diigoo Tech Private Limited · Kavuri Hills, Madhapur, Hyderabad</span><span>jenai.in · platform blueprint v1</span></div>
+    </main>
+  </div>
+</div>
