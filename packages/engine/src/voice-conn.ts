@@ -7,6 +7,7 @@ const PURPOSE = "voice-connection";
 export interface ConnectionInput {
   baseUrl: string;
   externalOrgId?: number | null;
+  mediaBaseUrl?: string | null;
   auth: DograhAuth;
   mode?: "read_only" | "managed";
 }
@@ -18,6 +19,7 @@ export async function saveVoiceConnection(tx: Tx, tenantId: string, input: Conne
     provider: "dograh",
     baseUrl: input.baseUrl.replace(/\/+$/, ""),
     externalOrgId: input.externalOrgId ?? null,
+    mediaBaseUrl: input.mediaBaseUrl ?? null,
     authKind: input.auth.kind,
     credentialCiphertext: sealSecret(tenantId, PURPOSE, secret),
     mode: input.mode ?? "read_only",
@@ -41,7 +43,7 @@ export async function voiceClient(tx: Tx, tenantId: string): Promise<{ client: D
   const secret = openSecret(tenantId, PURPOSE, conn.credentialCiphertext);
   const auth: DograhAuth =
     conn.authKind === "api_key" ? { kind: "api_key", apiKey: secret } : { kind: "password", ...(JSON.parse(secret) as { email: string; password: string }) };
-  return { client: new DograhClient(conn.baseUrl, auth), conn };
+  return { client: new DograhClient(conn.baseUrl, auth, fetch, 20_000, conn.mediaBaseUrl), conn };
 }
 
 export async function markConnection(tx: Tx, tenantId: string, patch: Partial<Pick<VoiceConnection, "status" | "lastError" | "lastVerifiedAt" | "lastSyncAt" | "mode">>) {

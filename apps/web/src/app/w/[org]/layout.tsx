@@ -6,8 +6,14 @@ import { SignOutButton } from "@/components/sign-out";
 import { requireWorkspace } from "@/server/access";
 import { exitSupportAndReturn } from "@/server/actions/support-session";
 
-const NAV: Array<{ href: string; label: string; perm?: Permission }> = [
+const NAV: Array<{ href: string; label: string; perm?: Permission; group?: string }> = [
   { href: "", label: "Overview" },
+  { href: "/calls", label: "Calls", perm: "calls:view" },
+  { href: "/leads", label: "Leads", perm: "contacts:view" },
+  { href: "/campaigns", label: "Campaigns", perm: "campaigns:view" },
+  { href: "/agents", label: "AI agents", perm: "agents:view" },
+  { href: "/numbers", label: "Phone numbers", perm: "numbers:view" },
+  { href: "/plan", label: "Plan and usage", perm: "billing:view" },
   { href: "/team", label: "Team", perm: "users:view" },
   { href: "/roles", label: "Roles and access", perm: "users:view" },
   { href: "/branches", label: "Branches", perm: "users:view" },

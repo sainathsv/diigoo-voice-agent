@@ -9,6 +9,7 @@ const NAV: Array<{ href: string; label: string; perm?: PlatformPermission }> = [
   { href: "/console", label: "Clients", perm: "platform:clients.view" },
   { href: "/console/clients/new", label: "New client", perm: "platform:clients.manage" },
   { href: "/console/access", label: "Support access", perm: "platform:support.request" },
+  { href: "/console/plans", label: "Plans", perm: "platform:billing.view" },
   { href: "/console/staff", label: "Diigoo team", perm: "platform:staff.manage" },
   { href: "/console/activity", label: "Activity log", perm: "platform:audit.view" },
 ];

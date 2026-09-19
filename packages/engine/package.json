@@ -5,13 +5,25 @@
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
-  "exports": { ".": "./src/index.ts", "./dialer": "./src/dialer/index.ts" },
-  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "exports": {
+    ".": "./src/index.ts",
+    "./dialer": "./src/dialer/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
   "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "3.1136.0",
     "@jenai/authz": "workspace:*",
     "@jenai/db": "workspace:*",
     "@jenai/voice": "workspace:*",
-    "drizzle-orm": "0.45.2"
+    "drizzle-orm": "0.45.2",
+    "zod": "4.4.3"
   },
-  "devDependencies": { "@types/node": "22.20.4", "typescript": "5.9.3", "vitest": "4.1.11" }
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
 }

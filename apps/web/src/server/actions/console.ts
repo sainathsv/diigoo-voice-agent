@@ -11,8 +11,10 @@ import {
   branches,
   memberships,
   organizations,
+  plans,
   platformDb,
   provisioningSteps,
+  subscriptions,
   roleBindings,
   roles,
   supportGrants,
@@ -37,7 +39,7 @@ const newClient = z.object({
   slug: z.string().trim().toLowerCase().regex(/^[a-z0-9][a-z0-9-]{1,47}$/, "Use 2 to 48 lowercase letters, digits or hyphens"),
   vertical: z.enum(VERTICALS),
   city: z.string().trim().max(80).optional(),
-  plan: z.enum(["trial", "front_desk", "growth", "business", "enterprise"]),
+  plan: z.enum(["trial", "front_desk", "growth", "business", "enterprise", "government"]),
   branch: z.string().trim().min(2).max(80),
   ownerName: z.string().trim().min(2).max(120),
   ownerEmail: z.email(),
@@ -64,6 +66,8 @@ export async function createClient(_: ConsoleFormState, fd: FormData): Promise<C
   const link = await withTenant(org!.id, async (tx) => {
     const [b] = await tx.insert(branches).values({ tenantId: org!.id, name: d.branch, city: d.city || null, languages: ["te", "hi", "en"] }).returning({ id: branches.id });
     for (const s of PROVISIONING_STEPS) await tx.insert(provisioningSteps).values({ tenantId: org!.id, step: s.key });
+    const [planRow] = await tx.select().from(plans).where(eq(plans.key, d.plan));
+    await tx.insert(subscriptions).values({ tenantId: org!.id, planKey: d.plan, billingModel: planRow?.billingModel ?? "prepaid", startsOn: new Date().toISOString().slice(0, 10), extraFeatures: [] });
     const inv = await createInvitation(tx, { tenantId: org!.id, email: d.ownerEmail, name: d.ownerName, roleId: ownerRole.id, invitedBy: ctx.user.userId });
     await audit(tx, {
       tenantId: org!.id,

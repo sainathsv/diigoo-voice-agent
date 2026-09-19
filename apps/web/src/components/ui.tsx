@@ -105,3 +105,23 @@ export function Avatar({ name }: { name: string }) {
     </span>
   );
 }
+
+export function fmtDuration(s: number | null | undefined) {
+  if (s == null) return "";
+  const m = Math.floor(s / 60);
+  return m ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+}
+
+export function Pager({ page, total, perPage, href }: { page: number; total: number; perPage: number; href: (p: number) => string }) {
+  const pages = Math.max(1, Math.ceil(total / perPage));
+  if (pages <= 1) return null;
+  return (
+    <div className="flex items-center justify-between border-t border-line px-5 py-3 text-[13px] text-grey">
+      <span>Page {page} of {pages} · {total} total</span>
+      <div className="flex gap-2">
+        {page > 1 ? <Link className="btn btn-ghost btn-sm" href={href(page - 1)}>Newer</Link> : null}
+        {page < pages ? <Link className="btn btn-ghost btn-sm" href={href(page + 1)}>Older</Link> : null}
+      </div>
+    </div>
+  );
+}

@@ -12,6 +12,16 @@ It replaces the `panel.json` control panel step by step (Blueprint Part 13), wit
 - **Append-only activity log** on both sides, including every support action.
 - **Go-live gate.** New clients start in onboarding with a 10-step checklist (KYC, own telephony account, number, A2P declaration, agent, test calls, write-back, wallet, DPA); "Go live" stays disabled until all pass.
 
+## Block 2 (calls, leads, agents, numbers, dialer, plans)
+- **Calls and leads:** calls sync from the voice engine (read-only), filtered by each person's branches; phone numbers masked by role; recordings play through an authorised, audited proxy; the post-call analyzer (Bedrock, Mumbai) turns transcripts into leads, validated by schema.
+- **AI agents:** live agents are imported unchanged as version 1; new versions pass pre-publish checks (AI disclosure required), maker-checker approval, and one publish updates inbound AND outbound together with verification and rollback. A live check flags any drift.
+- **Phone numbers:** each client's own carrier account with KYC status; numbers carry series, purpose and the A2P (AI calling) declaration required by TRAI from 18 Sep 2026; one number belongs to one client platform-wide.
+- **Dialer:** every attempt passes the compliance gate (opt-out, DND for promotional, declared caller ID, 140-series for promotional, consent, 09:00-21:00 hours, daily cap); campaigns need approval by someone other than the creator; the simulated carrier is the default.
+- **Plans:** Trial, Front Desk, Growth, Business, Enterprise (contract) and Government (postpaid monthly invoice against a PO); limits enforced; monthly usage statement for raising the invoice. No payments yet.
+- **Safety:** the live engine stays read-only per client until Diigoo switches it to managed; real calls need `JENAI_REAL_DIALS=true` as well.
+
+Worker: `pnpm --filter @jenai/worker start` (see the switches in `.env.example`).
+
 ## Run it
 ```bash
 pnpm install

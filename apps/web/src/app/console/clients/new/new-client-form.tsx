@@ -66,7 +66,8 @@ export function NewClientForm() {
             <option value="front_desk">Front Desk (₹2,999/mo)</option>
             <option value="growth">Growth (₹7,999/mo per branch)</option>
             <option value="business">Business (₹19,999/mo)</option>
-            <option value="enterprise">Enterprise / Government</option>
+            <option value="enterprise">Enterprise (annual contract)</option>
+            <option value="government">Government (postpaid monthly invoice)</option>
           </select>
         </div>
         <div>

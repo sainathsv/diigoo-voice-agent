@@ -24,4 +24,11 @@ expect mkt /w/zennara/team 404;       expect mgr /w/zennara/team 200;       expe
 expect con /w/lbr-dental 200;         expect con /w/ghmc 404
 expect sup /w/zennara 404;            expect sup /console 200;              expect sup /console/staff 307
 expect lbr /w/zennara 404;            expect founder /console/staff 200;    expect founder /console/activity 200
+# Module pages (block 2)
+for p in calls leads campaigns campaigns/new agents numbers plan; do expect owner /w/zennara/$p 200; done
+expect fd /w/zennara/calls 200;       expect fd /w/zennara/leads 200;       expect fd /w/zennara/campaigns 404
+expect fd /w/zennara/plan 404;        expect mkt /w/zennara/campaigns 200;  expect mkt /w/zennara/campaigns/new 200
+expect mkt /w/zennara/numbers 404;    expect mgr /w/zennara/agents 200;     expect con /w/zennara/calls 200
+expect con /w/zennara/campaigns/new 404
+expect founder /console/plans 200;    expect sup /console/plans 307
 exit $fail

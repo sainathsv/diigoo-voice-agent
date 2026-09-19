@@ -1,0 +1,18 @@
+{
+  "name": "@jenai/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"worker: covered by engine tests\""
+  },
+  "dependencies": {
+    "@jenai/db": "workspace:*",
+    "@jenai/engine": "workspace:*",
+    "drizzle-orm": "0.45.2"
+  },
+  "devDependencies": { "@types/node": "22.20.4", "tsx": "4.23.13", "typescript": "5.9.3" }
+}

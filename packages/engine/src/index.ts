@@ -5,3 +5,4 @@ export * from "./sync";
 export * from "./leads";
 export * from "./telephony";
 export * from "./dialer/index";
+export * from "./analyze";

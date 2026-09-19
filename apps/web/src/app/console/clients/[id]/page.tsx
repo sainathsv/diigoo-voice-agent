@@ -6,6 +6,7 @@ import { ConfirmButton, SubmitButton } from "@/components/client";
 import { platformCan, requirePlatform } from "@/server/platform/context";
 import { clientDetail } from "@/server/platform/queries";
 import { goLive, requestSupport, setClientStatus, setStepStatus } from "@/server/actions/console";
+import { PlanSection, TelephonySection, VoiceSection } from "./modules";
 
 export const metadata: Metadata = { title: "Client" };
 
@@ -53,6 +54,16 @@ export default async function ClientPage({ params, searchParams }: { params: Pro
         }
       />
       <Flash {...flash} />
+
+      <div className="mb-6 grid gap-6 xl:grid-cols-2">
+        <VoiceSection orgId={org.id} canManage={manage} canProvision={provision} />
+        <div className="grid content-start gap-6">
+          <TelephonySection orgId={org.id} canManage={platformCan(ctx, "platform:telephony.manage")} />
+        </div>
+      </div>
+      <div className="mb-6">
+        <PlanSection orgId={org.id} canManage={manage && platformCan(ctx, "platform:billing.view")} />
+      </div>
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <Section

@@ -101,6 +101,8 @@ export class DograhClient {
     private readonly auth: DograhAuth,
     private readonly fetchImpl: Fetch = fetch,
     private readonly timeoutMs = 20_000,
+    /** Internal object-store address (e.g. http://minio:9000). Only reachable inside the engine's network. */
+    private readonly mediaBaseUrl: string | null = null,
   ) {
     this.api = `${baseUrl.replace(/\/+$/, "")}/api/v1`;
   }
@@ -212,8 +214,22 @@ export class DograhClient {
     )) as { status: string; workflow_run_id: number; workflow_run_name: string };
   }
 
-  /** Transcripts and recordings are served through Dograh's tokenised public download URLs. */
+  /**
+   * Transcripts and recordings: Dograh's tokenised download URL redirects to
+   * its object store (/voice-audio/...), which is blocked from the internet on
+   * purpose. When a media base URL is configured (platform running next to the
+   * engine), the redirect is followed to that internal address instead.
+   */
   async fetchArtifact(url: string, range?: string | null): Promise<Response> {
-    return this.fetchImpl(url, { headers: range ? { Range: range } : {}, cache: "no-store" });
+    const headers: Record<string, string> = range ? { Range: range } : {};
+    const first = await this.fetchImpl(url, { headers, redirect: "manual", cache: "no-store" });
+    if (first.status < 300 || first.status >= 400) return first;
+    const loc = first.headers.get("location");
+    if (!loc) return first;
+    const target = new URL(loc, url);
+    if (this.mediaBaseUrl && target.pathname.startsWith("/voice-audio/")) {
+      return this.fetchImpl(`${this.mediaBaseUrl.replace(/\/+$/, "")}${target.pathname}`, { headers, cache: "no-store" });
+    }
+    return this.fetchImpl(target.toString(), { headers, cache: "no-store" });
   }
 }

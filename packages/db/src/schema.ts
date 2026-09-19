@@ -382,6 +382,7 @@ export const voiceConnections = pgTable("voice_connections", {
   provider: text("provider").notNull().default("dograh"),
   baseUrl: text("base_url").notNull(),
   externalOrgId: integer("external_org_id"),
+  mediaBaseUrl: text("media_base_url"),
   authKind: text("auth_kind").notNull(),
   credentialCiphertext: text("credential_ciphertext").notNull(),
   mode: voiceMode("mode").notNull().default("read_only"),
@@ -498,6 +499,8 @@ export const calls = pgTable(
     transcriptRef: text("transcript_ref"),
     costPaise: bigint("cost_paise", { mode: "number" }),
     syncedAt: ts("synced_at").notNull().defaultNow(),
+    analyzedAt: ts("analyzed_at"),
+    analysisModel: text("analysis_model"),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
