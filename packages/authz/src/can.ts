@@ -120,3 +120,12 @@ export class ForbiddenError extends Error {
 export function assertCan(ctx: AccessContext, perm: Permission, target?: Target): void {
   if (!can(ctx, perm, target)) throw new ForbiddenError(perm);
 }
+
+/**
+ * Does the person hold `perm` for at least one scope? Used to decide whether a
+ * page or menu item is visible; actions still check the exact scope with can().
+ */
+export function holdsAnywhere(ctx: AccessContext, perm: Permission): boolean {
+  if (ctx.support) return can(ctx, perm);
+  return permissionSet(ctx).has(perm);
+}

@@ -6,8 +6,10 @@
 import "./scripts/env";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { appDb, platformDb, withTenant } from "./client";
-import { auditEvents, branches, memberships, organizations, supportGrants, user } from "./schema";
+import { auditEvents, branches, invitations, memberships, organizations, roleBindings, roles, supportGrants, user } from "./schema";
+import { and, isNull } from "drizzle-orm";
 
 let zennara = "";
 let lbr = "";
@@ -93,5 +95,46 @@ describe("row-level security (app role)", () => {
   it("does not let the app role bypass row-level security", async () => {
     const r = await appDb().execute(sql`select rolbypassrls from pg_roles where rolname = current_user`);
     expect((r as unknown as Array<{ rolbypassrls: boolean }>)[0]?.rolbypassrls).toBe(false);
+  });
+});
+
+
+describe("invitations (lookup.accept_invitation)", () => {
+  async function invite(email: string) {
+    const token = randomBytes(24).toString("base64url");
+    const hash = createHash("sha256").update(token).digest("hex");
+    const [frontDesk] = await platformDb().select().from(roles).where(and(eq(roles.key, "front_desk"), isNull(roles.tenantId)));
+    const [br] = await platformDb().select().from(branches).where(eq(branches.tenantId, zennara));
+    await withTenant(zennara, (tx) =>
+      tx.insert(invitations).values({ tenantId: zennara, email, roleId: frontDesk!.id, scopeType: "branch", branchId: br!.id, tokenHash: hash, expiresAt: new Date(Date.now() + 86_400_000) }),
+    );
+    return hash;
+  }
+  async function newUser(email: string) {
+    const id = randomUUID();
+    await platformDb().insert(user).values({ id, email, name: "Test Person" });
+    return id;
+  }
+  const accept = (hash: string, userId: string) => pgError(appDb().execute(sql`select lookup.accept_invitation(${hash}, ${userId})`));
+
+  it("refuses a user whose email does not match", async () => {
+    const hash = await invite(`fd-${randomUUID().slice(0, 8)}@zennara.test`);
+    const other = await newUser(`other-${randomUUID().slice(0, 8)}@example.test`);
+    expect(await accept(hash, other)).toMatch(/invitation_email_mismatch/);
+  });
+
+  it("joins the right tenant with the invited role and branch, once", async () => {
+    const email = `fd-${randomUUID().slice(0, 8)}@zennara.test`;
+    const hash = await invite(email);
+    const uid = await newUser(email);
+    expect(await accept(hash, uid)).toBe("no error");
+    const rows = await withTenant(zennara, (tx) =>
+      tx.select({ scope: roleBindings.scopeType, branchId: roleBindings.branchId }).from(roleBindings).innerJoin(memberships, eq(memberships.id, roleBindings.membershipId)).where(eq(memberships.userId, uid)),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.scope).toBe("branch");
+    expect(await accept(hash, uid)).toMatch(/invitation_not_pending/);
+    // Nothing leaked into another tenant.
+    expect(await withTenant(lbr, (tx) => tx.select().from(memberships).where(eq(memberships.userId, uid)))).toHaveLength(0);
   });
 });

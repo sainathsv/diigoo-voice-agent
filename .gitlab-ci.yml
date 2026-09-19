@@ -1,0 +1,54 @@
+# CI for git.diigoo.com (GitLab CE). Blueprint Part 8: verify fast, prove tenant isolation, build once.
+stages: [verify, integration, build]
+
+default:
+  image: node:22-bookworm
+  before_script:
+    - corepack enable
+    - pnpm install --frozen-lockfile
+
+variables:
+  PNPM_HOME: /pnpm
+
+typecheck:
+  stage: verify
+  script:
+    - pnpm typecheck
+
+unit:
+  stage: verify
+  script:
+    - pnpm --filter @jenai/authz test
+
+secrets:
+  stage: verify
+  image: zricethezav/gitleaks:v8.30.1
+  before_script: []
+  script:
+    - gitleaks detect --source . --no-banner --redact
+
+isolation:
+  stage: integration
+  services:
+    - name: postgres:17
+      alias: postgres
+  variables:
+    POSTGRES_PASSWORD: ci
+    DATABASE_ADMIN_URL: postgres://postgres:ci@postgres:5432/postgres
+    DATABASE_OWNER_URL: postgres://jenai_owner:ci_owner@postgres:5432/jenai_platform
+    DATABASE_URL: postgres://jenai_app:ci_app@postgres:5432/jenai_platform
+    DATABASE_PLATFORM_URL: postgres://jenai_platform:ci_platform@postgres:5432/jenai_platform
+    SEED_PASSWORD: ci-only-password-1
+  script:
+    - pnpm db:setup
+    - pnpm db:migrate
+    - pnpm db:seed
+    - pnpm --filter @jenai/db test
+
+build:
+  stage: build
+  script:
+    - pnpm --filter @jenai/web build
+  artifacts:
+    expire_in: 1 day
+    paths: [apps/web/.next]
