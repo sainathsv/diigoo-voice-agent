@@ -66,8 +66,13 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
     };
     const url = new URL(req.url ?? "/", "http://x");
     const p = url.pathname.replace(/^\/api\/v1/, "");
+    let m0: RegExpMatchArray | null;
     requests.push(`${req.method} ${p}`);
     try {
+      if (req.method === "GET" && (m0 = p.match(/^\/public\/download\/workflow\/([^/]+)\/(transcript|recording)$/))) {
+        res.writeHead(200, { "Content-Type": m0[2] === "transcript" ? "text/plain" : "audio/wav" });
+        return res.end(m0[2] === "transcript" ? `transcript for ${m0[1]}` : "RIFF");
+      }
       if (req.method === "POST" && p === "/auth/login") {
         const b = (await body(req)) as { email: string; password: string };
         return b.email === opts.email && b.password === opts.password ? send(200, { token: "session-token" }) : send(401, { detail: "bad credentials" });

@@ -103,6 +103,31 @@ importers:
         specifier: 4.1.11
         version: 4.1.11(@types/node@22.20.4)(vite@8.3.0(@types/node@22.20.4)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))
 
+  packages/engine:
+    dependencies:
+      '@jenai/authz':
+        specifier: workspace:*
+        version: link:../authz
+      '@jenai/db':
+        specifier: workspace:*
+        version: link:../db
+      '@jenai/voice':
+        specifier: workspace:*
+        version: link:../voice
+      drizzle-orm:
+        specifier: 0.45.2
+        version: 0.45.2(kysely@0.29.6)(postgres@3.4.9)
+    devDependencies:
+      '@types/node':
+        specifier: 22.20.4
+        version: 22.20.4
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: 4.1.11
+        version: 4.1.11(@types/node@22.20.4)(vite@8.3.0(@types/node@22.20.4)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13))
+
   packages/voice:
     devDependencies:
       '@types/node':

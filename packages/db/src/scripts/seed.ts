@@ -11,7 +11,14 @@ import { env } from "./env";
 import { platformDb } from "../client";
 import { audit } from "../audit";
 import { PROVISIONING_STEPS } from "../provisioning";
+import { PLAN_CATALOG } from "../catalog";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import {
+  agentTemplates,
+  plans,
+  subscriptions,
   account,
   branches,
   memberships,
@@ -116,10 +123,60 @@ const STAFF = [
   { email: "finance@diigoo.test", name: "Finance", role: "finance" },
 ];
 
+/** Idempotent: plan catalog, agent templates and a subscription for every client without one. */
+async function catalog() {
+  for (const p of PLAN_CATALOG) {
+    await db.insert(plans).values(p).onConflictDoUpdate({ target: plans.key, set: { ...p, updatedAt: new Date() } });
+  }
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const t = JSON.parse(readFileSync(path.resolve(here, "../../seed-data/template.clinic_receptionist.v1.json"), "utf8"));
+  await db
+    .insert(agentTemplates)
+    .values({ key: t.key, version: t.version, name: t.name, basePrompt: t.base_prompt, endPrompt: t.end_prompt, extraction: t.extraction, extractionPrompt: t.extraction_prompt })
+    .onConflictDoNothing();
+  const clients = await db.select().from(organizations).where(eq(organizations.kind, "client"));
+  const have = new Set((await db.select({ id: subscriptions.tenantId }).from(subscriptions)).map((r) => r.id));
+  for (const o of clients) {
+    if (have.has(o.id)) continue;
+    const key = SUBSCRIPTION_FOR[o.slug]?.planKey ?? (PLAN_CATALOG.some((p) => p.key === o.plan) ? o.plan : "trial");
+    const planRow = PLAN_CATALOG.find((p) => p.key === key)!;
+    await db.insert(subscriptions).values({
+      tenantId: o.id,
+      planKey: key,
+      billingModel: planRow.billingModel,
+      startsOn: "2026-09-01",
+      extraFeatures: [],
+      ...(SUBSCRIPTION_FOR[o.slug] ?? {}),
+    });
+    await db.update(organizations).set({ plan: key }).where(eq(organizations.id, o.id));
+  }
+  console.log(`seed: catalog ready (${PLAN_CATALOG.length} plans, template ${t.key} v${t.version})`);
+}
+
+/** Billing terms for the seeded clients. GHMC is billed postpaid by physical invoice against its work order. */
+const SUBSCRIPTION_FOR: Record<string, Partial<typeof subscriptions.$inferInsert> & { planKey: string }> = {
+  zennara: { planKey: "growth" },
+  "lbr-dental": { planKey: "growth" },
+  ghmc: {
+    planKey: "government",
+    billingModel: "postpaid_invoice",
+    contractRatePaisePerMin: 400,
+    committedMinutes: 10000,
+    poNumber: "WORK ORDER (enter number)",
+    invoiceToName: "Greater Hyderabad Municipal Corporation",
+    invoiceToDepartment: "IT Wing",
+    invoiceToAddress: "CC Complex, Tank Bund Road, Lower Tank Bund, Hyderabad, Telangana 500063",
+    paymentTermsDays: 45,
+    notes: "Sample terms for development. Replace with the actual work order values.",
+  },
+  "demo-clinic": { planKey: "trial" },
+};
+
 async function main() {
   const existing = await db.select().from(organizations).where(eq(organizations.kind, "platform"));
   if (existing.length) {
-    console.log("seed: already seeded (platform organization exists). Use pnpm db:reset to start over.");
+    console.log("seed: organizations already exist (use pnpm db:reset to start over)");
+    await catalog();
     return;
   }
   const hash = await hashPassword(password);
@@ -218,6 +275,7 @@ async function main() {
     durationMinutes: 60,
   });
 
+  await catalog();
   console.log(`seed: ${users.size} users, ${CLIENTS.length} clients, platform org "diigoo". Password for every login: SEED_PASSWORD from .env`);
 }
 

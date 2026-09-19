@@ -1,0 +1,17 @@
+{
+  "name": "@jenai/engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": { ".": "./src/index.ts", "./dialer": "./src/dialer/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "dependencies": {
+    "@jenai/authz": "workspace:*",
+    "@jenai/db": "workspace:*",
+    "@jenai/voice": "workspace:*",
+    "drizzle-orm": "0.45.2"
+  },
+  "devDependencies": { "@types/node": "22.20.4", "typescript": "5.9.3", "vitest": "4.1.11" }
+}
