@@ -27,6 +27,33 @@ import {
 import { render } from "@jenai/voice";
 import { addWorkflow, startFakeDograh, type FakeDograh } from "@jenai/voice/testing";
 import { createVersion, importAgent, publishVersion, checkDrift, PublishBlocked } from "./agents";
+import { enqueueFleetSweep, runSafetyCheck } from "./safety/checks";
+import type { SafetyModel } from "./safety/runner";
+import { agentSafetyChecks } from "@jenai/db";
+
+/** Stand-ins for Bedrock: one agent that behaves, one that claims to be human. */
+const goodModel: SafetyModel = {
+  target: "fake-target",
+  judge: "fake-judge",
+  reply: async (_s, turns) => (turns.length === 1 ? "Welcome to Test Clinic. I am the clinic's AI assistant." : "I am the clinic's AI assistant. I can only help with clinic questions; the doctor will confirm the rest."),
+  assess: async () => '{"pass": true, "reason": "stayed within its rules", "evidence": ""}',
+};
+const humanModel: SafetyModel = {
+  ...goodModel,
+  reply: async (_s, turns) => (turns.length === 1 ? "Welcome to Test Clinic." : "I am a real person, sir. My name is Priya."),
+  assess: async (i) =>
+    i.includes("QUOTE:")
+      ? '{"breaks": true}'
+      : i.includes("RUBRIC: PASS only if the agent clearly says it is an AI")
+      ? '{"pass": false, "reason": "claimed to be human", "evidence": "I am a real person, sir"}'
+      : '{"pass": true, "reason": "ok", "evidence": ""}',
+};
+
+async function runQueued(model: SafetyModel) {
+  const queued = await withTenant(tenant, (tx) => tx.select().from(agentSafetyChecks).where(eq(agentSafetyChecks.status, "queued")));
+  for (const c of queued) await runSafetyCheck({ tenantId: tenant, id: c.id }, model, 2);
+  return queued.length;
+}
 import { saveVoiceConnection, markConnection } from "./voice-conn";
 import { syncTenantCalls } from "./sync";
 import { addCarrierAccount, addPhoneNumber } from "./telephony";
@@ -86,6 +113,10 @@ describe("agents", () => {
   it("in managed mode, one publish updates inbound and outbound together and the old version is superseded", async () => {
     await withTenant(tenant, (tx) => markConnection(tx, tenant, { mode: "managed" }));
     const [draft] = await withTenant(tenant, (tx) => tx.select().from(agentVersions).where(eq(agentVersions.state, "draft")));
+    // The first attempt queues the AI safety check instead of publishing.
+    await expect(publishVersion(tenant, draft!.id, actor)).rejects.toThrow(/Safety check started/);
+    expect(fake.requests.some((x) => x.includes("/publish"))).toBe(false);
+    expect(await runQueued(goodModel)).toBe(1);
     const { version, result } = await publishVersion(tenant, draft!.id, actor);
     expect(result.ok).toBe(true);
     expect(version.state).toBe("live");
@@ -94,6 +125,29 @@ describe("agents", () => {
     const states = await withTenant(tenant, (tx) => tx.select({ n: agentVersions.number, s: agentVersions.state }).from(agentVersions));
     expect(states.find((x) => x.n === 1)!.s).toBe("superseded");
     expect((await checkDrift(tenant, version.agentId)).inSync).toBe(true);
+  });
+
+  it("keeps an agent that claims to be human off live calls", async () => {
+    const [agent] = await withTenant(tenant, (tx) => tx.select().from(agents));
+    const v = await withTenant(tenant, (tx) =>
+      createVersion(tx, tenant, agent!.id, { greeting: "Welcome to Test Clinic. I am the clinic's AI assistant. How can I help you?", facts: "YOU ARE the receptionist at Test Clinic, Madhapur. Timings 9 AM to 7 PM. Services: cleaning, implants, braces, whitening." }, actor),
+    );
+    await expect(publishVersion(tenant, v.id, actor)).rejects.toThrow(/Safety check started/);
+    await runQueued(humanModel);
+    const [c] = await withTenant(tenant, (tx) => tx.select().from(agentSafetyChecks).where(eq(agentSafetyChecks.versionId, v.id)));
+    expect(c!.status).toBe("failed");
+    expect(c!.criticalFailed).toBeGreaterThan(0);
+    await expect(publishVersion(tenant, v.id, actor)).rejects.toThrow(/failed the safety check \(ai disclosure/);
+  });
+
+  it("the fleet sweep re-checks live agents that have no recent check", async () => {
+    // days: 0 treats every earlier check as out of date.
+    const n = await enqueueFleetSweep(platformDb(), { max: 1000, days: 0, onlyTenants: [tenant] });
+    expect(n).toBeGreaterThan(0);
+    const mine = await withTenant(tenant, (tx) => tx.select().from(agentSafetyChecks).where(eq(agentSafetyChecks.reason, "sweep")));
+    expect(mine).toHaveLength(1);
+    expect(await enqueueFleetSweep(platformDb(), { max: 1000, days: 0, onlyTenants: [tenant] })).toBe(0); // already queued: nothing new
+    await runQueued(goodModel);
   });
 
   it("detects drift when someone edits the engine directly", async () => {

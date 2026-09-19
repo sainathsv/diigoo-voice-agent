@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import { can } from "@jenai/authz";
-import { withTenant } from "@jenai/db";
+import { desc, eq } from "drizzle-orm";
+import { agentSafetyChecks, withTenant } from "@jenai/db";
 import { checkDrift, getVoiceConnection } from "@jenai/engine";
 import { defaultOutboundOpening, lintVersion } from "@jenai/voice";
 import { Flash, PageHead, Section, StatusBadge, fmtDate } from "@/components/ui";
@@ -10,18 +10,20 @@ import { SubmitButton } from "@/components/client";
 import { requireWorkspace } from "@/server/access";
 import { loadAgent } from "@/server/queries/modules";
 import { approveAndPublish, saveAgentDraft, submitForApproval } from "@/server/actions/modules";
+import { deny } from "@/server/security-log";
+import { SafetyPanel } from "./safety";
 
 export const metadata: Metadata = { title: "AI agent" };
 
 export default async function AgentPage({ params, searchParams }: { params: Promise<{ org: string; id: string }>; searchParams: Promise<{ v?: string; ok?: string; error?: string }> }) {
   const { org: slug, id } = await params;
   const sp = await searchParams;
-  if (!/^[0-9a-f-]{36}$/i.test(id)) notFound();
   const ctx = await requireWorkspace(slug);
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return deny(ctx, { malformedId: id.slice(0, 80) });
   const d = await loadAgent(ctx.org.id, id);
-  if (!d) notFound();
+  if (!d) return deny(ctx, { missing: id });
   const scope = { branchId: d.a.branchId };
-  if (!can(ctx.access, "agents:view", scope)) notFound();
+  if (!can(ctx.access, "agents:view", scope)) return deny(ctx, { perm: "agents:view", id });
   const canEdit = can(ctx.access, "agents:edit", scope) || can(ctx.access, "knowledge:edit", scope);
   const canPublish = can(ctx.access, "agents:publish", scope);
   const conn = await withTenant(ctx.org.id, (tx) => getVoiceConnection(tx, ctx.org.id));
@@ -39,6 +41,11 @@ export default async function AgentPage({ params, searchParams }: { params: Prom
     }
   }
   const issues = selected ? lintVersion(selected) : [];
+  const [check] = selected
+    ? await withTenant(ctx.org.id, (tx) =>
+        tx.select().from(agentSafetyChecks).where(eq(agentSafetyChecks.versionId, selected.id)).orderBy(desc(agentSafetyChecks.createdAt)).limit(1),
+      )
+    : [];
 
   return (
     <>
@@ -96,6 +103,7 @@ export default async function AgentPage({ params, searchParams }: { params: Prom
                 ) : (
                   <div className="notice notice-ok">All pre-publish checks pass.</div>
                 )}
+                <SafetyPanel slug={slug} version={selected} check={check ?? null} canRun={canEdit || canPublish} />
                 <div><div className="eyebrow mb-1">Inbound greeting</div><p className="rounded-lg bg-ivory px-3 py-2">{selected.greeting || <span className="text-grey">Not set</span>}</p></div>
                 <div><div className="eyebrow mb-1">Outbound opening</div><p className="rounded-lg bg-ivory px-3 py-2">{selected.outboundOpening || defaultOutboundOpening(selected.greeting || "Welcome to your clinic.")}</p></div>
                 <div><div className="eyebrow mb-1">Business facts</div><pre className="max-h-[360px] overflow-auto whitespace-pre-wrap rounded-lg bg-ivory px-3 py-2 font-sans text-[13px]">{selected.facts}</pre></div>

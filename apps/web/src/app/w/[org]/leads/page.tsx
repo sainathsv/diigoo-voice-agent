@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import { can, holdsAnywhere, phoneFor } from "@jenai/authz";
 import { Empty, Flash, PageHead, Section, StatusBadge, fmtDate } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadLeads } from "@/server/queries/modules";
 import { updateLead } from "@/server/actions/modules";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Leads" };
 
@@ -22,7 +22,7 @@ export default async function LeadsPage({ params, searchParams }: { params: Prom
   const { org: slug } = await params;
   const sp = await searchParams;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "contacts:view")) notFound();
+  if (!holdsAnywhere(ctx.access, "contacts:view")) return deny(ctx, { perm: "contacts:view" });
   const { rows, counts, team } = await loadLeads(ctx.org.id, ctx.access, { stage: sp.stage, mine: sp.mine, membershipId: ctx.membershipId });
   const today = new Date().toISOString().slice(0, 10);
 

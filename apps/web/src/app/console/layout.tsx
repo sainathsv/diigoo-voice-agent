@@ -12,6 +12,8 @@ const NAV: Array<{ href: string; label: string; perm?: PlatformPermission }> = [
   { href: "/console/plans", label: "Plans", perm: "platform:billing.view" },
   { href: "/console/staff", label: "Diigoo team", perm: "platform:staff.manage" },
   { href: "/console/activity", label: "Activity log", perm: "platform:audit.view" },
+  { href: "/console/security", label: "Security", perm: "platform:security.view" },
+  { href: "/console/ai-safety", label: "AI safety", perm: "platform:templates.manage" },
 ];
 
 export default async function ConsoleLayout({ children }: { children: React.ReactNode }) {
@@ -40,6 +42,7 @@ export default async function ConsoleLayout({ children }: { children: React.Reac
         </div>
         <div className="mt-3 flex gap-2">
           <Link className="btn btn-ghost btn-sm" href="/orgs">Workspaces</Link>
+          <Link className="btn btn-ghost btn-sm" href="/account/security">Security</Link>
           <SignOutButton />
         </div>
       </aside>

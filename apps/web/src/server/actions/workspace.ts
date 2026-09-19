@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { and, eq, ne } from "drizzle-orm";
 import { z } from "zod";
-import { ALL_CLIENT_PERMISSIONS, can, type AccessContext, type Target } from "@jenai/authz";
+import { ALL_CLIENT_PERMISSIONS, can, type AccessContext, type Target, privilegedIn } from "@jenai/authz";
 import {
   audit,
   branches,
@@ -81,6 +81,7 @@ export async function inviteMember(_: FormState, fd: FormData): Promise<FormStat
         targetType: "invitation",
         targetId: inv.id,
         summary: `Invited ${email} as ${role.name}`,
+        diff: { roleKey: role.key, roleName: role.name, branchId, privileged: privilegedIn(role.permissions) },
       });
       return inv.url;
     });
@@ -121,7 +122,7 @@ export async function addRoleBinding(fd: FormData) {
       .insert(roleBindings)
       .values({ tenantId: ctx.org.id, membershipId, roleId, scopeType: branchId ? "branch" : "org", branchId, grantedBy: ctx.user.userId })
       .onConflictDoNothing();
-    await audit(tx, { ...(await meta(ctx)), action: "member.role_added", targetType: "membership", targetId: membershipId, summary: `Added role ${role.name}`, diff: { roleId, branchId } });
+    await audit(tx, { ...(await meta(ctx)), action: "member.role_added", targetType: "membership", targetId: membershipId, summary: `Added role ${role.name}`, diff: { roleId, roleKey: role.key, roleName: role.name, branchId, privileged: privilegedIn(role.permissions) } });
     return null;
   });
   back(slug, "team", err ? { error: err } : { ok: "Role added" });

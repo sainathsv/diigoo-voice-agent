@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import { can, phoneFor } from "@jenai/authz";
 import { Flash, PageHead, Section, StatusBadge, fmtDate, fmtDuration } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadCall } from "@/server/queries/modules";
 import { setDoNotCall } from "@/server/actions/modules";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Call" };
 
@@ -21,12 +21,12 @@ const LABELS: Record<string, string> = {
 export default async function CallPage({ params, searchParams }: { params: Promise<{ org: string; id: string }>; searchParams: Promise<{ ok?: string; error?: string }> }) {
   const { org: slug, id } = await params;
   const flash = await searchParams;
-  if (!/^[0-9a-f-]{36}$/i.test(id)) notFound();
   const ctx = await requireWorkspace(slug);
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return deny(ctx, { malformedId: id.slice(0, 80) });
   const d = await loadCall(ctx.org.id, id);
-  if (!d) notFound();
+  if (!d) return deny(ctx, { missing: id });
   const scope = { branchId: d.c.branchId };
-  if (!can(ctx.access, "calls:view", scope)) notFound();
+  if (!can(ctx.access, "calls:view", scope)) return deny(ctx, { perm: "calls:view", id });
   const reveal = can(ctx.access, "contacts:reveal_phone", scope);
   const play = can(ctx.access, "recordings:play", scope) && !!d.c.recordingRef;
   const raw = can(ctx.access, "transcripts:view_raw", scope);

@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { can } from "@jenai/authz";
 import { Empty, Flash, PageHead, Section, StatusBadge, fmtDate } from "@/components/ui";
 import { SubmitButton } from "@/components/client";
 import { requireWorkspace } from "@/server/access";
 import { decideSupportGrant, revokeSupportGrant, setStandingSupport, updateOrgProfile } from "@/server/actions/workspace";
 import { loadSupport } from "@/server/queries/workspace";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Settings" };
 
@@ -15,7 +15,7 @@ export default async function SettingsPage({ params, searchParams }: { params: P
   const ctx = await requireWorkspace(slug);
   const profile = can(ctx.access, "org:manage");
   const consent = can(ctx.access, "support_access:grant");
-  if (!profile && !consent) notFound();
+  if (!profile && !consent) return deny(ctx, { perm: "settings" });
   const grants = consent ? await loadSupport(ctx.org.id) : [];
   const now = new Date();
   const pending = grants.filter((x) => x.g.status === "requested");

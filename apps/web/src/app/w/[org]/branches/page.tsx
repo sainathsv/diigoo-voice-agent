@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { can, holdsAnywhere } from "@jenai/authz";
 import { Empty, Flash, PageHead, Section, StatusBadge } from "@/components/ui";
 import { SubmitButton } from "@/components/client";
 import { requireWorkspace } from "@/server/access";
 import { createBranch, setBranchStatus } from "@/server/actions/workspace";
 import { loadBranches } from "@/server/queries/workspace";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Branches" };
 
@@ -13,7 +13,7 @@ export default async function BranchesPage({ params, searchParams }: { params: P
   const { org: slug } = await params;
   const flash = await searchParams;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "users:view")) notFound();
+  if (!holdsAnywhere(ctx.access, "users:view")) return deny(ctx, { perm: "users:view" });
   const rows = await loadBranches(ctx.org.id);
   const manage = can(ctx.access, "branches:manage");
 

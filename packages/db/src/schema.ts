@@ -25,6 +25,7 @@ export const user = pgTable("user", {
   emailVerified: boolean("email_verified").notNull().default(false),
   image: text("image"),
   phone: text("phone"),
+  twoFactorEnabled: boolean("two_factor_enabled").notNull().default(false),
   createdAt: ts("created_at").notNull().defaultNow(),
   updatedAt: ts("updated_at").notNull().defaultNow(),
 });
@@ -63,6 +64,17 @@ export const verification = pgTable("verification", {
   expiresAt: ts("expires_at").notNull(),
   createdAt: ts("created_at").notNull().defaultNow(),
   updatedAt: ts("updated_at").notNull().defaultNow(),
+});
+
+/** Two-step sign-in secrets (Better Auth two-factor plugin, migration 0010). */
+export const twoFactor = pgTable("two_factor", {
+  id: text("id").primaryKey(),
+  secret: text("secret").notNull(),
+  backupCodes: text("backup_codes").notNull(),
+  userId: text("user_id").notNull(),
+  verified: boolean("verified").notNull().default(true),
+  failedVerificationCount: integer("failed_verification_count").notNull().default(0),
+  lockedUntil: ts("locked_until"),
 });
 
 // ---------------------------------------------------------------- tenancy
@@ -280,6 +292,11 @@ export const auditEvents = pgTable("audit_events", {
   ip: text("ip"),
   userAgent: text("user_agent"),
   createdAt: ts("created_at").notNull().defaultNow(),
+  // Filled by the audit_events_link trigger (hash chain per workspace, migration 0009).
+  chain: text("chain"),
+  chainSeq: bigint("chain_seq", { mode: "number" }),
+  prevHash: text("prev_hash"),
+  hash: text("hash"),
 });
 
 export const outbox = pgTable("outbox", {
@@ -442,6 +459,7 @@ export const agentVersions = pgTable(
     publishedBy: text("published_by"),
     publishedAt: ts("published_at"),
     publishResult: jsonb("publish_result"),
+    guardrailsVersion: integer("guardrails_version"),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
@@ -717,3 +735,98 @@ export type CarrierAccount = typeof carrierAccounts.$inferSelect;
 export type PhoneNumber = typeof phoneNumbers.$inferSelect;
 export type Campaign = typeof campaigns.$inferSelect;
 export type CampaignTarget = typeof campaignTargets.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// Security (migration 0009)
+// ---------------------------------------------------------------------------
+export const securityEventKind = pgEnum("security_event_kind", [
+  "signin_ok", "signin_failed", "signin_locked", "signout",
+  "access_denied", "session_revoked", "password_changed",
+  "mfa_enabled", "mfa_disabled", "mfa_failed",
+]);
+export type SecurityEventKind = (typeof securityEventKind.enumValues)[number];
+
+export const securityEvents = pgTable("security_events", {
+  id: bigint("id", { mode: "number" }).primaryKey().generatedAlwaysAsIdentity(),
+  kind: securityEventKind("kind").notNull(),
+  email: text("email"),
+  userId: text("user_id"),
+  tenantId: uuid("tenant_id"),
+  ip: text("ip"),
+  userAgent: text("user_agent"),
+  detail: jsonb("detail"),
+  createdAt: ts("created_at").notNull().defaultNow(),
+});
+
+export const alertSeverity = pgEnum("alert_severity", ["low", "medium", "high", "critical"]);
+export const alertStatus = pgEnum("alert_status", ["open", "acknowledged", "resolved", "false_positive"]);
+export type AlertSeverity = (typeof alertSeverity.enumValues)[number];
+export type AlertStatus = (typeof alertStatus.enumValues)[number];
+
+export const securityAlerts = pgTable("security_alerts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  tenantId: uuid("tenant_id"),
+  rule: text("rule").notNull(),
+  severity: alertSeverity("severity").notNull(),
+  title: text("title").notNull(),
+  subject: text("subject").notNull(),
+  detail: jsonb("detail").notNull().default({}),
+  dedupeKey: text("dedupe_key").notNull(),
+  status: alertStatus("status").notNull().default("open"),
+  hits: integer("hits").notNull().default(1),
+  firstSeen: ts("first_seen").notNull().defaultNow(),
+  lastSeen: ts("last_seen").notNull().defaultNow(),
+  notifiedAt: ts("notified_at"),
+  handledBy: text("handled_by"),
+  handledAt: ts("handled_at"),
+  note: text("note"),
+});
+export type SecurityAlert = typeof securityAlerts.$inferSelect;
+
+export const securityDetectorState = pgTable("security_detector_state", {
+  name: text("name").primaryKey(),
+  lastId: bigint("last_id", { mode: "number" }).notNull().default(0),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+});
+
+// ---------------------------------------------------------------------------
+// AI safety checks (migration 0011)
+// ---------------------------------------------------------------------------
+export const safetyStatus = pgEnum("safety_status", ["queued", "running", "passed", "failed", "needs_review", "error"]);
+export const safetyReason = pgEnum("safety_reason", ["publish", "manual", "sweep"]);
+export type SafetyStatus = (typeof safetyStatus.enumValues)[number];
+
+export const agentSafetyChecks = pgTable(
+  "agent_safety_checks",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    agentId: uuid("agent_id").notNull(),
+    versionId: uuid("version_id").notNull(),
+    promptHash: text("prompt_hash").notNull(),
+    suiteVersion: integer("suite_version").notNull(),
+    guardrailsVersion: integer("guardrails_version"),
+    vertical: text("vertical").notNull().default("general"),
+    targetModel: text("target_model").notNull(),
+    judgeModel: text("judge_model").notNull(),
+    reason: safetyReason("reason").notNull(),
+    status: safetyStatus("status").notNull().default("queued"),
+    held: integer("held").notNull().default(0),
+    failed: integer("failed").notNull().default(0),
+    review: integer("review").notNull().default(0),
+    criticalFailed: integer("critical_failed").notNull().default(0),
+    results: jsonb("results").notNull().default([]),
+    error: text("error"),
+    cachedFrom: uuid("cached_from"),
+    requestedBy: text("requested_by"),
+    reviewedBy: text("reviewed_by"),
+    reviewedAt: ts("reviewed_at"),
+    reviewNote: text("review_note"),
+    attempts: integer("attempts").notNull().default(0),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    startedAt: ts("started_at"),
+    finishedAt: ts("finished_at"),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type AgentSafetyCheck = typeof agentSafetyChecks.$inferSelect;

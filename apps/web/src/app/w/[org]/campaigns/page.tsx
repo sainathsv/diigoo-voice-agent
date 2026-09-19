@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import { holdsAnywhere } from "@jenai/authz";
 import { Empty, Flash, PageHead, Section, StatusBadge, fmtDate } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadCampaigns } from "@/server/queries/modules";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Campaigns" };
 
@@ -12,7 +12,7 @@ export default async function CampaignsPage({ params, searchParams }: { params: 
   const { org: slug } = await params;
   const flash = await searchParams;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "campaigns:view")) notFound();
+  if (!holdsAnywhere(ctx.access, "campaigns:view")) return deny(ctx, { perm: "campaigns:view" });
   const list = await loadCampaigns(ctx.org.id, ctx.access);
 
   return (

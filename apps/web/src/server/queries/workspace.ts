@@ -11,6 +11,7 @@ import {
   supportGrants,
   user,
   withTenant,
+  securityAlerts,
 } from "@jenai/db";
 
 /** Everything the Team page needs, read inside the tenant. */
@@ -84,4 +85,11 @@ export async function loadBranches(tenantId: string) {
       : [];
     return rows.map((b) => ({ ...b, people: new Set(counts.filter((c) => c.branchId === b.id).map((c) => c.membershipId)).size }));
   });
+}
+
+/** Security alerts about this workspace (RLS: a tenant sees only its own). */
+export async function loadSecurityAlerts(tenantId: string) {
+  return withTenant(tenantId, (tx) =>
+    tx.select().from(securityAlerts).orderBy(desc(securityAlerts.lastSeen)).limit(20),
+  );
 }

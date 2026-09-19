@@ -123,8 +123,24 @@ const STAFF = [
   { email: "finance@diigoo.test", name: "Finance", role: "finance" },
 ];
 
+/** Built-in roles follow the code: new permissions reach existing databases on the next seed. */
+async function syncSystemRoles() {
+  const rows = await db.select().from(roles).where(eq(roles.isSystem, true));
+  for (const [side, list] of [["client", CLIENT_ROLE_TEMPLATES], ["platform", PLATFORM_ROLE_TEMPLATES]] as const) {
+    for (const t of list) {
+      const r = rows.find((x) => x.side === side && x.key === t.key && x.tenantId === null);
+      const want = [...t.permissions].sort();
+      if (r && JSON.stringify([...r.permissions].sort()) !== JSON.stringify(want)) {
+        await db.update(roles).set({ permissions: want, description: t.description, updatedAt: new Date() }).where(eq(roles.id, r.id));
+        console.log(`seed: updated built-in role ${side}:${t.key}`);
+      }
+    }
+  }
+}
+
 /** Idempotent: plan catalog, agent templates and a subscription for every client without one. */
 async function catalog() {
+  await syncSystemRoles();
   for (const p of PLAN_CATALOG) {
     await db.insert(plans).values(p).onConflictDoUpdate({ target: plans.key, set: { ...p, updatedAt: new Date() } });
   }

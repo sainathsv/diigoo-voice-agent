@@ -1,3 +1,5 @@
+import { assertSafeUrl } from "./net-guard";
+
 /**
  * Dograh API client. Pure HTTP: no database, no tenant logic. One instance per
  * client connection. Paths verified against the Dograh source on 2026-09-19.
@@ -119,10 +121,12 @@ export class DograhClient {
   }
 
   private async raw(method: string, path: string, body: unknown, headers: Record<string, string>, context: string): Promise<unknown> {
+    await assertSafeUrl(this.api);
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
     try {
       const res = await this.fetchImpl(`${this.api}${path}`, {
+        redirect: "error",
         method,
         headers: { "Content-Type": "application/json", ...headers },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -222,14 +226,18 @@ export class DograhClient {
    */
   async fetchArtifact(url: string, range?: string | null): Promise<Response> {
     const headers: Record<string, string> = range ? { Range: range } : {};
+    await assertSafeUrl(url);
     const first = await this.fetchImpl(url, { headers, redirect: "manual", cache: "no-store" });
     if (first.status < 300 || first.status >= 400) return first;
     const loc = first.headers.get("location");
     if (!loc) return first;
     const target = new URL(loc, url);
     if (this.mediaBaseUrl && target.pathname.startsWith("/voice-audio/")) {
-      return this.fetchImpl(`${this.mediaBaseUrl.replace(/\/+$/, "")}${target.pathname}`, { headers, cache: "no-store" });
+      const media = `${this.mediaBaseUrl.replace(/\/+$/, "")}${target.pathname}`;
+      await assertSafeUrl(media); // the internal store must be on JENAI_ALLOWED_PRIVATE_HOSTS
+      return this.fetchImpl(media, { headers, redirect: "error", cache: "no-store" });
     }
-    return this.fetchImpl(target.toString(), { headers, cache: "no-store" });
+    await assertSafeUrl(target.toString());
+    return this.fetchImpl(target.toString(), { headers, redirect: "error", cache: "no-store" });
   }
 }

@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import { can, holdsAnywhere, phoneFor } from "@jenai/authz";
 import { Empty, Flash, PageHead, Pager, Section, StatusBadge, fmtDate, fmtDuration } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadCalls } from "@/server/queries/modules";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Calls" };
 
@@ -12,7 +12,7 @@ export default async function CallsPage({ params, searchParams }: { params: Prom
   const { org: slug } = await params;
   const sp = await searchParams;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "calls:view")) notFound();
+  if (!holdsAnywhere(ctx.access, "calls:view")) return deny(ctx, { perm: "calls:view" });
   const page = Number(sp.page ?? 1) || 1;
   const { rows, total, branches } = await loadCalls(ctx.org.id, ctx.access, { direction: sp.direction, status: sp.status, branch: sp.branch, page });
   const q = (over: Record<string, string | undefined>) => {

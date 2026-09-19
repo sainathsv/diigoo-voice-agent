@@ -15,6 +15,7 @@ import {
   syncTenantCalls,
   voiceClient,
 } from "@jenai/engine";
+import { assertSafeUrl } from "@jenai/voice";
 import { requirePlatform } from "../platform/context";
 import { requestMeta } from "../session";
 
@@ -22,6 +23,7 @@ const back = (orgId: string, msg: { ok?: string; error?: string }, anchor = ""):
   const q = new URLSearchParams(msg.error ? { error: msg.error } : { ok: msg.ok ?? "Saved" });
   redirect(`/console/clients/${orgId}?${q}${anchor}`);
 };
+
 const uuid = z.uuid();
 
 async function log(orgId: string, actor: string, action: string, summary: string, diff?: unknown) {
@@ -45,6 +47,12 @@ export async function saveConnection(fd: FormData) {
     .safeParse(Object.fromEntries(fd));
   if (!p.success) back(orgId, { error: p.error!.issues[0]?.message ?? "Check the connection details." }, "#voice");
   const d = p.data!;
+  // Refuse internal addresses up front (cloud metadata, loopback, private ranges).
+  try {
+    await assertSafeUrl(d.baseUrl);
+  } catch (e) {
+    back(orgId, { error: `${(e as Error).message}. Use the engine's public https address.` }, "#voice");
+  }
   const auth = d.authKind === "api_key" ? { kind: "api_key" as const, apiKey: (d.apiKey ?? "").trim() } : { kind: "password" as const, email: (d.email ?? "").trim(), password: d.password ?? "" };
   if ((auth.kind === "api_key" && auth.apiKey.length < 10) || (auth.kind === "password" && (!auth.email || !auth.password))) back(orgId, { error: "Enter the API key, or the email and password." }, "#voice");
   await withTenant(orgId, (tx) => saveVoiceConnection(tx, orgId, { baseUrl: d.baseUrl, externalOrgId: d.externalOrgId === "" ? null : d.externalOrgId, auth, mode: "read_only" }, ctx.user.userId));

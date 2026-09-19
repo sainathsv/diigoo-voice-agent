@@ -1,30 +1,21 @@
+import "server-only";
+import { appDb, sql } from "@jenai/db";
+
 /**
- * Per-account sign-in throttle, independent of IP address (IP limits alone can
- * be dodged by rotating addresses). In-memory: correct for one web instance.
- * Move to Redis before running more than one instance (Blueprint Phase 1).
+ * Per-account sign-in lockout, independent of IP address (IP limits alone can
+ * be dodged by rotating addresses). Counted in the database from the sign-in
+ * events every web server writes, so it holds across any number of servers and
+ * restarts: 10 wrong passwords since the last success, within 15 minutes.
  */
-const WINDOW_MS = 15 * 60_000;
-const MAX_FAILURES = 10;
-const failures = new Map<string, number[]>();
+export const MAX_FAILURES = 10;
+export const WINDOW_MINUTES = 15;
 
-function key(email: string) {
-  return email.trim().toLowerCase();
-}
-
-function recent(email: string, now: number) {
-  const list = (failures.get(key(email)) ?? []).filter((t) => now - t < WINDOW_MS);
-  failures.set(key(email), list);
-  return list;
-}
-
-export function isLocked(email: string, now = Date.now()): boolean {
-  return recent(email, now).length >= MAX_FAILURES;
-}
-
-export function recordFailure(email: string, now = Date.now()): void {
-  recent(email, now).push(now);
-}
-
-export function clearFailures(email: string): void {
-  failures.delete(key(email));
+export async function isLocked(email: string): Promise<boolean> {
+  try {
+    const [r] = await appDb().execute<{ n: number }>(sql`select lookup.signin_failures(${email.trim().toLowerCase()}, ${WINDOW_MINUTES}) as n`);
+    return Number(r?.n ?? 0) >= MAX_FAILURES;
+  } catch (e) {
+    console.error(`[security] lockout check failed: ${(e as Error).message}`);
+    return false; // fail open for sign-in; the IP limiter and alerts still apply
+  }
 }

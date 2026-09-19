@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "3.1136.0",
+    "@aws-sdk/client-sns": "3.1136.0",
     "@jenai/authz": "workspace:*",
     "@jenai/db": "workspace:*",
     "@jenai/voice": "workspace:*",

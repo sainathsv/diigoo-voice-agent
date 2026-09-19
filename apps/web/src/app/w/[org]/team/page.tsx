@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { holdsAnywhere } from "@jenai/authz";
 import { Avatar, Empty, Flash, PageHead, Section, StatusBadge, fmtDate } from "@/components/ui";
 import { ConfirmButton } from "@/components/client";
@@ -7,6 +6,7 @@ import { requireWorkspace } from "@/server/access";
 import { addRoleBinding, removeRoleBinding, revokeInvitation, setMemberStatus } from "@/server/actions/workspace";
 import { loadTeam } from "@/server/queries/workspace";
 import { InviteForm } from "./invite-form";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Team" };
 
@@ -14,7 +14,7 @@ export default async function TeamPage({ params, searchParams }: { params: Promi
   const { org: slug } = await params;
   const flash = await searchParams;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "users:view")) notFound();
+  if (!holdsAnywhere(ctx.access, "users:view")) return deny(ctx, { perm: "users:view" });
   const t = await loadTeam(ctx.org.id);
   const branchName = (id: string | null) => (id ? (t.branches.find((b) => b.id === id)?.name ?? "Branch") : "Whole organization");
   const canAssign = holdsAnywhere(ctx.access, "users:assign_roles");

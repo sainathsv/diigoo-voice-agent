@@ -5,6 +5,7 @@ import { audit, calls, withTenant } from "@jenai/db";
 import { voiceClient } from "@jenai/engine";
 import { actorFields, requireWorkspace } from "@/server/access";
 import { requestMeta } from "@/server/session";
+import { logDenied } from "@/server/security-log";
 
 /**
  * Recording playback behind a permission check. The engine's download URL is
@@ -21,7 +22,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ org: str
     return { c, v };
   });
   const c = found.c;
-  if (!c || !c.recordingRef || !can(ctx.access, "recordings:play", { branchId: c.branchId })) return new NextResponse("Not found", { status: 404 });
+  if (!c || !c.recordingRef || !can(ctx.access, "recordings:play", { branchId: c.branchId })) {
+    if (!c || (c.recordingRef && !can(ctx.access, "recordings:play", { branchId: c.branchId }))) await logDenied(ctx, { perm: "recordings:play", id });
+    return new NextResponse("Not found", { status: 404 });
+  }
   if (!found.v) return new NextResponse("Voice engine not connected", { status: 503 });
 
   const range = req.headers.get("range");

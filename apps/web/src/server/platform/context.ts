@@ -5,6 +5,8 @@ import { can, type AccessContext, type PlatformPermission } from "@jenai/authz";
 import { withTenant } from "@jenai/db";
 import { myOrganizations, requireUser } from "../session";
 import { loadGrants, type Actor } from "../grants";
+import { logDenied } from "../security-log";
+import { STAFF_MFA_REQUIRED } from "@/lib/mfa-policy";
 
 export interface PlatformCtx {
   platformOrgId: string;
@@ -32,11 +34,25 @@ export const platformContext = cache(async (): Promise<PlatformCtx | null> => {
 /** Gate for every console page and action. The platform DB pool may only be used after this. */
 export async function requirePlatform(perm?: PlatformPermission): Promise<PlatformCtx> {
   const ctx = await platformContext();
-  if (!ctx) redirect("/orgs");
-  if (perm && !can(ctx.access, perm)) redirect(`/console?denied=${encodeURIComponent(perm)}`);
+  if (!ctx) {
+    const u = await requireUser();
+    await logDenied({ user: { userId: u.id } }, { area: "console", reason: "not Diigoo staff" });
+    redirect("/orgs");
+  }
+  if (STAFF_MFA_REQUIRED && !(await staffHasTwoStep())) redirect("/account/security?required=staff");
+  if (perm && !can(ctx.access, perm)) {
+    await logDenied({ user: ctx.user, org: { id: ctx.platformOrgId } }, { area: "console", perm });
+    redirect(`/console?denied=${encodeURIComponent(perm)}`);
+  }
   return ctx;
 }
 
 export function platformCan(ctx: PlatformCtx, perm: PlatformPermission) {
   return can(ctx.access, perm);
+}
+
+/** Staff must have two-step sign-in on (production default). */
+async function staffHasTwoStep(): Promise<boolean> {
+  const u = await requireUser();
+  return Boolean((u as { twoFactorEnabled?: boolean }).twoFactorEnabled);
 }

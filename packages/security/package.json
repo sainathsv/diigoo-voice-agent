@@ -1,0 +1,25 @@
+{
+  "name": "@jenai/security",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"security: run with pnpm --filter @jenai/security attack (needs the app running)\"",
+    "attack": "vitest run",
+    "ai-redteam": "tsx src/ai-redteam.ts"
+  },
+  "dependencies": {
+    "@jenai/db": "workspace:*",
+    "drizzle-orm": "0.45.2",
+    "@jenai/engine": "workspace:*",
+    "better-auth": "1.7.5",
+    "@jenai/voice": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "tsx": "4.23.13"
+  }
+}

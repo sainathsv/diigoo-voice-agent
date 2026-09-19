@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { holdsAnywhere } from "@jenai/authz";
 import { SERIES_LABEL } from "@jenai/engine";
 import { Flash, PageHead, Section } from "@/components/ui";
@@ -7,6 +6,7 @@ import { SubmitButton } from "@/components/client";
 import { requireWorkspace } from "@/server/access";
 import { loadCampaignForm } from "@/server/queries/modules";
 import { createCampaign } from "@/server/actions/modules";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "New campaign" };
 
@@ -16,7 +16,7 @@ export default async function NewCampaign({ params, searchParams }: { params: Pr
   const { org: slug } = await params;
   const { error } = await searchParams;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "campaigns:create")) notFound();
+  if (!holdsAnywhere(ctx.access, "campaigns:create")) return deny(ctx, { perm: "campaigns:create" });
   const f = await loadCampaignForm(ctx.org.id);
 
   if (!f.campaignsAllowed) {

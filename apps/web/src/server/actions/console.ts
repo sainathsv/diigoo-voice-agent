@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { and, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
-import { can } from "@jenai/authz";
+import { can, privilegedIn } from "@jenai/authz";
 import {
   PROVISIONING_STEPS,
   audit,
@@ -261,7 +261,7 @@ export async function inviteStaff(_: ConsoleFormState, fd: FormData): Promise<Co
   if (existing) return { error: "Already on the Diigoo team." };
   const link = await withTenant(ctx.platformOrgId, async (tx) => {
     const inv = await createInvitation(tx, { tenantId: ctx.platformOrgId, email: p.data.email, name: p.data.name, roleId: role.id, invitedBy: ctx.user.userId });
-    await audit(tx, { tenantId: ctx.platformOrgId, actorUserId: ctx.user.userId, action: "staff.invited", targetType: "invitation", targetId: inv.id, summary: `Invited ${p.data.email} as ${role.name}` });
+    await audit(tx, { tenantId: ctx.platformOrgId, actorUserId: ctx.user.userId, action: "staff.invited", targetType: "invitation", targetId: inv.id, summary: `Invited ${p.data.email} as ${role.name}`, diff: { roleKey: role.key, roleName: role.name, privileged: privilegedIn(role.permissions) } });
     return inv.url;
   });
   revalidatePath("/console/staff");

@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import { can } from "@jenai/authz";
 import { Empty, PageHead, Section, fmtDate } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
-import { loadAudit } from "@/server/queries/workspace";
+import { loadAudit, loadSecurityAlerts } from "@/server/queries/workspace";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Activity log" };
 
@@ -12,9 +12,10 @@ export default async function ActivityPage({ params, searchParams }: { params: P
   const { org: slug } = await params;
   const { filter } = await searchParams;
   const ctx = await requireWorkspace(slug);
-  if (!can(ctx.access, "audit:view")) notFound();
+  if (!can(ctx.access, "audit:view")) return deny(ctx, { perm: "audit:view" });
   const onlySupport = filter === "support";
-  const rows = await loadAudit(ctx.org.id, onlySupport);
+  const [rows, alerts] = await Promise.all([loadAudit(ctx.org.id, onlySupport), loadSecurityAlerts(ctx.org.id)]);
+  const openAlerts = alerts.filter((a) => a.status === "open" || a.status === "acknowledged");
 
   return (
     <>
@@ -28,6 +29,31 @@ export default async function ActivityPage({ params, searchParams }: { params: P
           </div>
         }
       />
+      {alerts.length ? (
+        <Section
+          title="Security alerts"
+          sub={openAlerts.length ? "JENAI's security team is looking into these. Nothing is needed from you unless we contact you." : "Recent alerts about this workspace, all closed by JENAI's security team."}
+        >
+          <div className="tbl-wrap">
+            <table className="tbl">
+              <thead><tr><th>When</th><th>What</th><th>Status</th></tr></thead>
+              <tbody>
+                {alerts.map((a) => (
+                  <tr key={a.id}>
+                    <td className="whitespace-nowrap text-ink-soft">{fmtDate(a.lastSeen)}</td>
+                    <td><div>{a.title}</div><div className="text-[12px] text-grey">{a.subject}</div></td>
+                    <td className="whitespace-nowrap">
+                      <span className={`badge ${a.status === "open" ? "badge-bad" : a.status === "acknowledged" ? "badge-copper" : "badge-muted"}`}>
+                        {a.status === "open" ? "Open" : a.status === "acknowledged" ? "Being looked at" : a.status === "false_positive" ? "No issue found" : "Resolved"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Section>
+      ) : null}
       <Section title={onlySupport ? "JENAI support activity" : "Latest 200 events"}>
         {rows.length === 0 ? (
           <Empty>Nothing recorded yet.</Empty>

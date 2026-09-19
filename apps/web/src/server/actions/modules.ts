@@ -5,7 +5,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { can } from "@jenai/authz";
 import { agentVersions, agents, audit, campaignTargets, campaigns, consents, contacts, leads, phoneNumbers, suppressions, withTenant } from "@jenai/db";
-import { LimitError, PublishBlocked, assertFeature, createVersion, entitlements, publishVersion } from "@jenai/engine";
+import { LimitError, PublishBlocked, assertFeature, createVersion, entitlements, publishVersion, requestSafetyCheck } from "@jenai/engine";
 import { lintVersion, toE164 } from "@jenai/voice";
 import { actorFields, requireWorkspace, workspaceAction } from "../access";
 import { requestMeta } from "../session";
@@ -106,10 +106,29 @@ export async function submitForApproval(fd: FormData) {
     const errs = lintVersion(v).filter((i) => i.level === "error");
     if (errs.length) return { error: errs.map((e) => e.message).join(" ") };
     await tx.update(agentVersions).set({ state: "pending_approval" }).where(eq(agentVersions.id, versionId));
+    // Start the AI safety check now, so it is usually done before the approver looks.
+    await requestSafetyCheck(tx, { tenantId: ctx.org.id, versionId, reason: "publish", requestedBy: ctx.user.userId });
     await audit(tx, { ...(await meta(ctx)), action: "agent.submitted", targetType: "agent_version", targetId: versionId, summary: `Submitted version ${v.number} of ${agent!.name} for approval` });
-    return { ok: "Sent for approval", agentId: v.agentId };
+    return { ok: "Sent for approval. The AI safety check has started.", agentId: v.agentId };
   });
   go(slug, `agents/${"agentId" in r ? r.agentId : ""}`, r);
+}
+
+/** Attack this version with the AI red-team suite (the same check publishing waits for). */
+export async function runSafetyCheckNow(fd: FormData) {
+  const slug = String(fd.get("slug"));
+  const versionId = String(fd.get("versionId"));
+  const ctx = await requireWorkspace(slug);
+  const r = await withTenant(ctx.org.id, async (tx) => {
+    const [v] = await tx.select().from(agentVersions).where(eq(agentVersions.id, versionId));
+    if (!v) return { error: "Version not found." };
+    const [agent] = await tx.select().from(agents).where(eq(agents.id, v.agentId));
+    if (!can(ctx.access, "agents:edit", { branchId: agent!.branchId }) && !can(ctx.access, "agents:publish", { branchId: agent!.branchId })) return { error: "Your role cannot run safety checks." };
+    const c = await requestSafetyCheck(tx, { tenantId: ctx.org.id, versionId, reason: "manual", requestedBy: ctx.user.userId });
+    await audit(tx, { ...(await meta(ctx)), action: "agent.safety_check_requested", targetType: "agent_version", targetId: versionId, summary: `Asked for an AI safety check of version ${v.number} of ${agent!.name}` });
+    return { ok: c.status === "passed" ? "These exact prompts already passed the safety check." : "Safety check started. It takes about 2 minutes; refresh to see the result.", agentId: v.agentId };
+  });
+  go(slug, `agents/${"agentId" in r ? `${r.agentId}?v=${versionId}` : ""}`, r);
 }
 
 /** Approve (maker-checker) and publish to inbound and outbound together. */

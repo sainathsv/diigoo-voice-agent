@@ -17,7 +17,10 @@ export default async function OrgsPage({ searchParams }: { searchParams: Promise
     <main className="mx-auto max-w-[640px] px-4 py-12">
       <div className="mb-8 flex items-center justify-between">
         <Logo />
-        <SignOutButton />
+        <div className="flex gap-2">
+          <Link className="btn btn-ghost btn-sm" href="/account/security">Sign-in and security</Link>
+          <SignOutButton />
+        </div>
       </div>
       <h1 className="h-display text-[24px]">Hello, {u.name.split(" ")[0]}</h1>
       <p className="mt-1 text-grey">Signed in as {u.email}. Choose where to work.</p>

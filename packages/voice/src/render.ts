@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import type { DograhDefinition } from "./dograh";
+import { CONTRADICTIONS, GUARDRAILS_VERSION, stripGuardrails, withGuardrails } from "./guardrails";
 
 /**
- * One shared behaviour base + per-client facts (Blueprint Part 9). The layout
- * matches oss-poc/agent_base.py exactly, so prompts published by the platform
- * are byte-compatible with what is live today.
+ * Platform guardrails + per-client facts + one shared behaviour base
+ * (Blueprint Part 9). Below the guardrails the layout matches
+ * oss-poc/agent_base.py, so legacy live prompts still import cleanly.
  */
 export interface TemplateInput {
   basePrompt: string;
@@ -24,6 +25,7 @@ export interface Rendered {
   extraction: Array<{ name: string; type: string; prompt: string }>;
   extractionPrompt: string;
   hash: string;
+  guardrailsVersion: number;
 }
 
 const FIRST_WORDS = "FIRST WORDS, word for word, once, then stop and listen:";
@@ -35,12 +37,12 @@ export function defaultOutboundOpening(greeting: string): string {
 
 export function render(t: TemplateInput, v: VersionInput, domain: string): Rendered {
   const facts = v.facts.trim();
-  const inboundPrompt = `${facts}\n\n${FIRST_WORDS}\n"${v.greeting.trim()}"\n\n${t.basePrompt}`;
+  const inboundPrompt = withGuardrails(`${facts}\n\n${FIRST_WORDS}\n"${v.greeting.trim()}"\n\n${t.basePrompt}`);
   const opening = (v.outboundOpening?.trim() || defaultOutboundOpening(v.greeting)).trim();
-  const outboundPrompt = `${facts}\n\n${FIRST_WORDS}\n"${opening}"\n\n${t.basePrompt}`;
+  const outboundPrompt = withGuardrails(`${facts}\n\n${FIRST_WORDS}\n"${opening}"\n\n${t.basePrompt}`);
   const extraction = t.extraction.map((x) => ({ ...x, prompt: x.prompt.replaceAll("{{domain}}", domain) }));
   const hash = promptHash(inboundPrompt, outboundPrompt, t.endPrompt);
-  return { inboundPrompt, outboundPrompt, endPrompt: t.endPrompt, extraction, extractionPrompt: t.extractionPrompt, hash };
+  return { inboundPrompt, outboundPrompt, endPrompt: t.endPrompt, extraction, extractionPrompt: t.extractionPrompt, hash, guardrailsVersion: GUARDRAILS_VERSION };
 }
 
 export function promptHash(...parts: string[]): string {
@@ -74,7 +76,8 @@ export function startPrompt(def: DograhDefinition | null | undefined): string {
  * Recover {facts, greeting} from a prompt built with the shared template, so a
  * live agent can be imported without retyping. Returns null for legacy prompts.
  */
-export function parseBuiltPrompt(prompt: string, basePrompt: string): { facts: string; greeting: string } | null {
+export function parseBuiltPrompt(built: string, basePrompt: string): { facts: string; greeting: string } | null {
+  const prompt = stripGuardrails(built).prompt;
   const i = prompt.indexOf(`\n\n${FIRST_WORDS}\n"`);
   if (i < 0) return null;
   const rest = prompt.slice(i + FIRST_WORDS.length + 4); // skip "\n\n" + FIRST_WORDS + "\n\""
@@ -104,6 +107,9 @@ export function lintVersion(v: VersionInput): LintIssue[] {
       level: "error",
       message: "Say it is an AI assistant in the greeting (IT Rules 2026 require a spoken AI disclosure; TRAI requires automated calls to identify themselves).",
     });
+  }
+  for (const c of CONTRADICTIONS) {
+    if (c.re.test(`${v.facts}\n${text}`)) issues.push({ level: "error", message: c.message });
   }
   if (/\b(\d{1,3}(,\d{3})+|\d+\s?(rs|rupees|lakh|₹))/i.test(v.facts) && !/ONLY price|only prices/i.test(v.facts)) {
     issues.push({ level: "warning", message: "Prices found in the facts. State which prices are the ONLY ones the agent knows, so it never invents others." });

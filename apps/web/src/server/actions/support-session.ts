@@ -35,6 +35,7 @@ export async function enterSupport(fd: FormData) {
     targetType: "support_grant",
     targetId: grantId,
     summary: `${ctx.user.name} (JENAI) opened the workspace with ${row.grant.mode} access`,
+    diff: { mode: row.grant.mode, expiresAt: row.grant.expiresAt },
     ...(await requestMeta()),
   });
   redirect(`/w/${row.org.slug}`);

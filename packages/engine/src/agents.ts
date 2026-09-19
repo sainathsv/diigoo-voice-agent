@@ -2,6 +2,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { agentTemplates, agentVersions, agents, withTenant, type Agent, type AgentTemplate, type AgentVersion, type Tx } from "@jenai/db";
 import { lintVersion, parseBuiltPrompt, promptHash, publishBoth, render, startPrompt, type DograhClient, type PublishResult } from "@jenai/voice";
 import { voiceClient } from "./voice-conn";
+import { requestSafetyCheck, safetyGate } from "./safety/checks";
 
 export const DEFAULT_TEMPLATE = { key: "clinic_receptionist", version: 1 };
 
@@ -122,9 +123,19 @@ export async function publishVersion(tenantId: string, versionId: string, actorU
     if (v.conn.mode !== "managed") throw new PublishBlocked("Publishing to live calls is switched off for this client (read-only). Diigoo turns it on when the client moves to the new platform.");
     const tpl = await templateOf(tx, agent!);
     const r = render(tpl, ver, agent!.domain);
-    await tx.update(agentVersions).set({ state: "publishing", inboundPrompt: r.inboundPrompt, outboundPrompt: r.outboundPrompt, promptHash: r.hash }).where(eq(agentVersions.id, versionId));
-    return { agent: agent!, rendered: r, client: v.client };
+    // AI safety gate: these exact prompts must have passed the red-team suite.
+    const gate = await safetyGate(tx, versionId, r.hash);
+    if (!gate.ok) {
+      if (!gate.check || gate.check.promptHash !== r.hash || gate.check.status === "error") {
+        await requestSafetyCheck(tx, { tenantId, versionId, reason: "publish", requestedBy: actorUserId });
+      }
+      // Returned, not thrown: throwing here would roll back the check just queued.
+      return { kind: "blocked" as const, message: gate.check ? gate.message : "Safety check started (about 2 minutes). Publish again when it has passed." };
+    }
+    await tx.update(agentVersions).set({ state: "publishing", inboundPrompt: r.inboundPrompt, outboundPrompt: r.outboundPrompt, promptHash: r.hash, guardrailsVersion: r.guardrailsVersion }).where(eq(agentVersions.id, versionId));
+    return { kind: "ready" as const, agent: agent!, rendered: r, client: v.client };
   });
+  if (prep.kind === "blocked") throw new PublishBlocked(prep.message);
 
   const result = await publishBoth(prep.client, { inboundWorkflowId: prep.agent.inboundWorkflowId, outboundWorkflowId: prep.agent.outboundWorkflowId }, prep.rendered);
 

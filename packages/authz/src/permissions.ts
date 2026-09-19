@@ -143,6 +143,8 @@ export const PLATFORM_MODULES = {
     permissions: {
       "platform:staff.manage": "Manage Diigoo staff and their roles",
       "platform:audit.view": "See the platform-wide activity log",
+      "platform:security.view": "See security alerts, sign-in activity and audit-log integrity",
+      "platform:security.manage": "Acknowledge, resolve and close security alerts",
     },
   },
 } as const;
@@ -178,4 +180,19 @@ export function describePermission(p: Permission): string {
     }
   }
   return p;
+}
+
+/**
+ * Permissions that hand out control rather than data. Granting a role that
+ * holds any of these raises a security alert (privilege escalation watch).
+ */
+export const PRIVILEGED_PERMISSIONS: ReadonlySet<Permission> = new Set<Permission>([
+  "org:manage", "org:transfer_ownership", "roles:manage", "users:assign_roles",
+  "apikeys:manage", "integrations:manage", "support_access:grant", "billing:manage",
+  "platform:breakglass", "platform:staff.manage", "platform:support.approve",
+  "platform:clients.manage", "platform:billing.manage", "platform:security.manage",
+]);
+
+export function privilegedIn(perms: readonly string[]): string[] {
+  return perms.filter((p) => PRIVILEGED_PERMISSIONS.has(p as Permission));
 }

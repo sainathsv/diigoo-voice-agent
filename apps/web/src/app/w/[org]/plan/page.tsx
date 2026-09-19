@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { holdsAnywhere } from "@jenai/authz";
 import { FEATURE_LABELS, LIMIT_LABELS, rupees } from "@jenai/engine";
 import { PageHead, Section, fmtDate } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadPlanUsage } from "@/server/queries/modules";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Plan and usage" };
 
@@ -17,7 +17,7 @@ const MODEL: Record<string, string> = {
 export default async function PlanPage({ params }: { params: Promise<{ org: string }> }) {
   const { org: slug } = await params;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "billing:view")) notFound();
+  if (!holdsAnywhere(ctx.access, "billing:view")) return deny(ctx, { perm: "billing:view" });
   const { ent, period, statement: s, counts } = await loadPlanUsage(ctx.org.id);
   const sub = ent.subscription;
   const pct = s.includedMinutes ? Math.min(100, (s.usage.minutes / s.includedMinutes) * 100) : 0;

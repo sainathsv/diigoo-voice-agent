@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { holdsAnywhere } from "@jenai/authz";
 import { PURPOSE_LABEL, SERIES_LABEL } from "@jenai/engine";
 import { Empty, PageHead, Section, StatusBadge, fmtDate } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadNumbers } from "@/server/queries/modules";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Phone numbers" };
 
@@ -13,7 +13,7 @@ const KYC: Record<string, string> = { not_started: "pending", link_sent: "in_pro
 export default async function NumbersPage({ params }: { params: Promise<{ org: string }> }) {
   const { org: slug } = await params;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "numbers:view")) notFound();
+  if (!holdsAnywhere(ctx.access, "numbers:view")) return deny(ctx, { perm: "numbers:view" });
   const { nums, accounts } = await loadNumbers(ctx.org.id);
 
   return (

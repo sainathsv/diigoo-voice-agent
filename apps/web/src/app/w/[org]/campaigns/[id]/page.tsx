@@ -1,12 +1,12 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import { can, phoneFor } from "@jenai/authz";
 import { Empty, Flash, PageHead, Section, StatusBadge, fmtDate } from "@/components/ui";
 import { SubmitButton } from "@/components/client";
 import { requireWorkspace } from "@/server/access";
 import { loadCampaign } from "@/server/queries/modules";
 import { addTargets, campaignTransition } from "@/server/actions/modules";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Campaign" };
 
@@ -26,12 +26,12 @@ function Move({ slug, id, to, label, primary = false }: { slug: string; id: stri
 export default async function CampaignPage({ params, searchParams }: { params: Promise<{ org: string; id: string }>; searchParams: Promise<{ ok?: string; error?: string }> }) {
   const { org: slug, id } = await params;
   const flash = await searchParams;
-  if (!/^[0-9a-f-]{36}$/i.test(id)) notFound();
   const ctx = await requireWorkspace(slug);
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return deny(ctx, { malformedId: id.slice(0, 80) });
   const d = await loadCampaign(ctx.org.id, id);
-  if (!d) notFound();
+  if (!d) return deny(ctx, { missing: id });
   const scope = { branchId: d.c.branchId };
-  if (!can(ctx.access, "campaigns:view", scope)) notFound();
+  if (!can(ctx.access, "campaigns:view", scope)) return deny(ctx, { perm: "campaigns:view", id });
   const c = d.c;
   const reveal = can(ctx.access, "contacts:reveal_phone", scope);
   const counts = d.targets.reduce<Record<string, number>>((m, t) => ((m[t.state] = (m[t.state] ?? 0) + 1), m), {});

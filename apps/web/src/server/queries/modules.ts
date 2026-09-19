@@ -20,6 +20,10 @@ import {
 } from "@jenai/db";
 import { billingPeriod, entitlements, statement, usage } from "@jenai/engine";
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CALL_STATUS = new Set(["queued", "ringing", "in_progress", "completed", "no_answer", "busy", "failed", "unknown"]);
+const LEAD_STAGE = new Set(["new", "contacted", "callback", "booked", "won", "lost"]);
+
 /** SQL filter limiting rows to the branches a person may see for `perm` ("all" means no filter). */
 function branchScope(access: AccessContext, perm: Permission, col: typeof calls.branchId | typeof leads.branchId | typeof campaigns.branchId): SQL | undefined | "none" {
   const b = branchesFor(access, perm);
@@ -34,9 +38,10 @@ export async function loadCalls(tenantId: string, access: AccessContext, f: { di
   const conds: SQL[] = [];
   if (scope) conds.push(scope);
   if (f.direction === "inbound" || f.direction === "outbound") conds.push(eq(calls.direction, f.direction));
-  if (f.status) conds.push(eq(calls.status, f.status as never));
-  if (f.branch) conds.push(eq(calls.branchId, f.branch));
-  const page = Math.max(1, f.page ?? 1);
+  // Filters come from the URL: accept only known values (hostile input must not reach the database as an enum).
+  if (f.status && CALL_STATUS.has(f.status)) conds.push(eq(calls.status, f.status as never));
+  if (f.branch && UUID.test(f.branch)) conds.push(eq(calls.branchId, f.branch));
+  const page = Math.min(10_000, Math.max(1, Math.floor(Number(f.page) || 1)));
   return withTenant(tenantId, async (tx) => {
     const where = conds.length ? and(...conds) : undefined;
     const rows = await tx
@@ -76,7 +81,7 @@ export async function loadLeads(tenantId: string, access: AccessContext, f: { st
   if (scope === "none") return { rows: [], counts: {} as Record<string, number>, team: [] };
   const conds: SQL[] = [];
   if (scope) conds.push(scope);
-  if (f.stage) conds.push(eq(leads.stage, f.stage as never));
+  if (f.stage && LEAD_STAGE.has(f.stage)) conds.push(eq(leads.stage, f.stage as never));
   if (f.mine && f.membershipId) conds.push(eq(leads.ownerMembershipId, f.membershipId));
   return withTenant(tenantId, async (tx) => {
     const rows = await tx

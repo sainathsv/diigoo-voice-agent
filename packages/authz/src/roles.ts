@@ -132,6 +132,7 @@ export const PLATFORM_ROLE_TEMPLATES: readonly RoleTemplate<PlatformPermission>[
       "platform:support.request", "platform:support.approve",
       "platform:templates.manage", "platform:telephony.manage",
       "platform:billing.view", "platform:audit.view",
+      "platform:security.view", "platform:security.manage",
     ],
   },
   {
@@ -181,7 +182,7 @@ export const PLATFORM_ROLE_TEMPLATES: readonly RoleTemplate<PlatformPermission>[
     name: "Auditor (read-only)",
     description: "Reads everything administrative, including all access grants.",
     defaultScope: "org",
-    permissions: ["platform:clients.view", "platform:billing.view", "platform:audit.view"],
+    permissions: ["platform:clients.view", "platform:billing.view", "platform:audit.view", "platform:security.view"],
   },
 ];
 

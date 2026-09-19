@@ -7,6 +7,8 @@ import { organizations, withTenant, type Organization } from "@jenai/db";
 import { loadGrants, type Actor } from "./grants";
 import { myOrganizations, requireUser } from "./session";
 import { activeSupportSession } from "./platform/support";
+import { deny, logDenied } from "./security-log";
+import { STAFF_MFA_REQUIRED } from "@/lib/mfa-policy";
 
 export interface WorkspaceCtx {
   org: Organization;
@@ -46,7 +48,9 @@ export const requireWorkspace = cache(async (slug: string): Promise<WorkspaceCtx
 
   // Not a member: Diigoo staff may enter under an approved, unexpired support grant.
   const s = await activeSupportSession(u.id, slug);
-  if (!s) notFound();
+  if (!s) return deny({ user }, { workspace: slug.slice(0, 80), reason: "not a member and no support access" });
+  // Staff opening client data must have passed two-step sign-in (production default).
+  if (STAFF_MFA_REQUIRED && !(u as { twoFactorEnabled?: boolean }).twoFactorEnabled) redirect("/account/security?required=staff");
   return {
     org: s.org,
     user,
@@ -68,7 +72,12 @@ export async function workspaceAction(slug: string, perm: Permission, target?: T
   if (ctx.org.status === "suspended" && !perm.endsWith(":view")) {
     throw new Error("This workspace is suspended. Contact JENAI support.");
   }
-  assertCan(ctx.access, perm, target);
+  try {
+    assertCan(ctx.access, perm, target);
+  } catch (e) {
+    await logDenied(ctx, { perm, target: target ?? null, via: ctx.support ? "support" : "member" });
+    throw e;
+  }
   return ctx;
 }
 

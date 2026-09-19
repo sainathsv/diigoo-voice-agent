@@ -72,7 +72,10 @@ export default async function WorkspaceLayout({ children, params }: { children: 
               <div className="truncate text-[12px] text-grey">{ctx.support ? "JENAI support" : ctx.user.email}</div>
             </div>
           </div>
-          <div className="mt-3"><SignOutButton /></div>
+          <div className="mt-3 flex gap-2">
+            <SignOutButton />
+            <Link className="btn btn-ghost btn-sm" href="/account/security">Security</Link>
+          </div>
         </aside>
         <main className="min-w-0">{children}</main>
       </div>

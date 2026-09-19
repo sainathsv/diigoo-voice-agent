@@ -1,12 +1,12 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
 import { CLIENT_MODULES, can, holdsAnywhere } from "@jenai/authz";
 import { Flash, PageHead, Section } from "@/components/ui";
 import { SubmitButton } from "@/components/client";
 import { requireWorkspace } from "@/server/access";
 import { cloneRole, updateRolePermissions } from "@/server/actions/workspace";
 import { loadTeam } from "@/server/queries/workspace";
+import { deny } from "@/server/security-log";
 
 export const metadata: Metadata = { title: "Roles and access" };
 
@@ -14,7 +14,7 @@ export default async function RolesPage({ params, searchParams }: { params: Prom
   const { org: slug } = await params;
   const sp = await searchParams;
   const ctx = await requireWorkspace(slug);
-  if (!holdsAnywhere(ctx.access, "users:view")) notFound();
+  if (!holdsAnywhere(ctx.access, "users:view")) return deny(ctx, { perm: "users:view" });
   const t = await loadTeam(ctx.org.id);
   const selected = t.roles.find((r) => r.id === sp.role) ?? t.roles.find((r) => r.key === "front_desk") ?? t.roles[0];
   const manage = can(ctx.access, "roles:manage");

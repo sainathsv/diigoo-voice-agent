@@ -6,3 +6,5 @@ export * from "./leads";
 export * from "./telephony";
 export * from "./dialer/index";
 export * from "./analyze";
+export * from "./security/index";
+export * from "./safety/index";
