@@ -12,7 +12,7 @@ import { platformDb } from "../client";
 import { audit } from "../audit";
 import { PROVISIONING_STEPS } from "../provisioning";
 import { PLAN_CATALOG } from "../catalog";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
@@ -30,6 +30,7 @@ import {
   teamMembers,
   teams,
   user,
+  programTemplates,
 } from "../schema";
 
 env("DATABASE_PLATFORM_URL");
@@ -150,6 +151,22 @@ async function catalog() {
     .insert(agentTemplates)
     .values({ key: t.key, version: t.version, name: t.name, basePrompt: t.base_prompt, endPrompt: t.end_prompt, extraction: t.extraction, extractionPrompt: t.extraction_prompt })
     .onConflictDoNothing();
+  // Call program catalogue (migration 0013): one JSON file per program, upserted by key + version.
+  const dir = path.resolve(here, "../../seed-data/programs");
+  const files = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")).sort() : [];
+  for (const f of files) {
+    const g = JSON.parse(readFileSync(path.join(dir, f), "utf8"));
+    const row = {
+      key: g.key, version: g.version, vertical: g.vertical, name: g.name, summary: g.summary,
+      direction: g.direction ?? "outbound", purpose: g.purpose, goal: g.goal, taskPrompt: g.task_prompt, opening: g.opening,
+      variables: g.variables ?? [], clientFields: g.client_fields ?? [], extraction: g.extraction ?? [], outcomes: g.outcomes ?? [],
+      defaults: g.defaults ?? {}, requirements: g.requirements ?? {}, complianceNote: g.compliance_note ?? "",
+      redteamCases: g.redteam_cases ?? [], status: g.status ?? "active",
+    };
+    await db.insert(programTemplates).values(row).onConflictDoUpdate({ target: [programTemplates.key, programTemplates.version], set: { ...row, updatedAt: new Date() } });
+  }
+  if (files.length) console.log(`seed: ${files.length} call programs in the catalogue`);
+
   const clients = await db.select().from(organizations).where(eq(organizations.kind, "client"));
   const have = new Set((await db.select({ id: subscriptions.tenantId }).from(subscriptions)).map((r) => r.id));
   for (const o of clients) {

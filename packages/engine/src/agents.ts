@@ -3,6 +3,7 @@ import { agentTemplates, agentVersions, agents, withTenant, type Agent, type Age
 import { lintVersion, parseBuiltPrompt, promptHash, publishBoth, render, startPrompt, type DograhClient, type PublishResult } from "@jenai/voice";
 import { voiceClient } from "./voice-conn";
 import { requestSafetyCheck, safetyGate } from "./safety/checks";
+import { programVariables } from "./programs";
 
 export const DEFAULT_TEMPLATE = { key: "clinic_receptionist", version: 1 };
 
@@ -116,7 +117,7 @@ export async function publishVersion(tenantId: string, versionId: string, actorU
     if (!ver) throw new PublishBlocked("Version not found.");
     if (!["draft", "pending_approval", "failed", "superseded"].includes(ver.state)) throw new PublishBlocked(`This version is ${ver.state}; it cannot be published.`);
     const [agent] = await tx.select().from(agents).where(eq(agents.id, ver.agentId));
-    const issues = lintVersion(ver).filter((i) => i.level === "error");
+    const issues = lintVersion(ver, await programVariables(tx, ver.tenantId, agent!.clientProgramId)).filter((i) => i.level === "error");
     if (issues.length) throw new PublishBlocked(issues.map((i) => i.message).join(" "));
     const v = await voiceClient(tx, tenantId);
     if (!v) throw new PublishBlocked("This client has no voice engine connection.");

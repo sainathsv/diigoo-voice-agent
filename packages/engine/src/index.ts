@@ -1,6 +1,7 @@
 export * from "./plans";
 export * from "./voice-conn";
 export * from "./agents";
+export * from "./programs";
 export * from "./sync";
 export * from "./leads";
 export * from "./telephony";

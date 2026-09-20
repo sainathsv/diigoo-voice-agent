@@ -17,6 +17,8 @@ export interface VersionInput {
   greeting: string;
   facts: string;
   outboundOpening?: string | null;
+  /** A call program's job (migration 0013): what this agent is calling about. */
+  taskPrompt?: string | null;
 }
 export interface Rendered {
   inboundPrompt: string;
@@ -35,8 +37,16 @@ export function defaultOutboundOpening(greeting: string): string {
   return `Hello {{caller_name}}, this is ${who} calling about {{call_purpose}}. Please tell me, is this a good time?`;
 }
 
+/**
+ * Placeholders a call fills in. {{caller_name}} and {{call_purpose}} always;
+ * a call program adds its own (amount due, last visit, property number), which
+ * the dialer passes per person.
+ */
+export const ALWAYS_ALLOWED = ["caller_name", "call_purpose"] as const;
+
 export function render(t: TemplateInput, v: VersionInput, domain: string): Rendered {
-  const facts = v.facts.trim();
+  const job = v.taskPrompt?.trim() ? `\n\n${v.taskPrompt.trim()}` : "";
+  const facts = `${v.facts.trim()}${job}`;
   const inboundPrompt = withGuardrails(`${facts}\n\n${FIRST_WORDS}\n"${v.greeting.trim()}"\n\n${t.basePrompt}`);
   const opening = (v.outboundOpening?.trim() || defaultOutboundOpening(v.greeting)).trim();
   const outboundPrompt = withGuardrails(`${facts}\n\n${FIRST_WORDS}\n"${opening}"\n\n${t.basePrompt}`);
@@ -94,13 +104,19 @@ export interface LintIssue {
 }
 
 /** Gate G0 (Blueprint Part 9): checks every version must pass before it can be published. */
-export function lintVersion(v: VersionInput): LintIssue[] {
+export function lintVersion(v: VersionInput, allowedVariables: readonly string[] = []): LintIssue[] {
   const issues: LintIssue[] = [];
   const text = `${v.greeting}\n${v.outboundOpening ?? ""}`;
   if (v.greeting.trim().length < 10) issues.push({ level: "error", message: "The greeting is too short." });
   if (v.facts.trim().length < 80) issues.push({ level: "error", message: "Add the business facts (services, timings, address, what the agent may and may not say)." });
-  if (/\{\{\s*(?!caller_name|call_purpose)[a-z_]+\s*\}\}/i.test(`${v.facts}\n${text}`)) {
-    issues.push({ level: "error", message: "Only {{caller_name}} and {{call_purpose}} placeholders are filled in on calls; remove any other {{...}}." });
+  const allowed = new Set<string>([...ALWAYS_ALLOWED, ...allowedVariables]);
+  const used = [...`${v.facts}\n${v.taskPrompt ?? ""}\n${text}`.matchAll(/\{\{\s*([a-z0-9_]+)\s*\}\}/gi)].map((m) => m[1]!.toLowerCase());
+  const unknown = [...new Set(used.filter((n) => !allowed.has(n)))];
+  if (unknown.length) {
+    issues.push({
+      level: "error",
+      message: `Nothing fills in ${unknown.map((n) => `{{${n}}}`).join(", ")} on a call. Callers would hear it read out. Allowed here: ${[...allowed].map((n) => `{{${n}}}`).join(", ")}.`,
+    });
   }
   if (!/\b(AI|artificial intelligence|virtual assistant|automated assistant)\b/i.test(text)) {
     issues.push({

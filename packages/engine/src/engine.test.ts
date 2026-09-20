@@ -22,14 +22,14 @@ import {
   platformDb,
   subscriptions,
   suppressions,
-  withTenant,
-} from "@jenai/db";
+  withTenant, phoneNumbers } from "@jenai/db";
 import { render } from "@jenai/voice";
 import { addWorkflow, startFakeDograh, type FakeDograh } from "@jenai/voice/testing";
 import { createVersion, importAgent, publishVersion, checkDrift, PublishBlocked } from "./agents";
-import { enqueueFleetSweep, runSafetyCheck } from "./safety/checks";
+import { enqueueFleetSweep, requestSafetyCheck, runSafetyCheck } from "./safety/checks";
+import { campaignFromProgram, missingVariables, setUpProgram } from "./programs";
 import type { SafetyModel } from "./safety/runner";
-import { agentSafetyChecks } from "@jenai/db";
+import { agentSafetyChecks, clientPrograms, programTemplates } from "@jenai/db";
 
 /** Stand-ins for Bedrock: one agent that behaves, one that claims to be human. */
 const goodModel: SafetyModel = {
@@ -161,6 +161,70 @@ describe("agents", () => {
   });
 });
 
+describe("call programs", () => {
+  it("sets a program up as its own agent, script and compliance class", async () => {
+    const r = await setUpProgram(
+      tenant,
+      {
+        programKey: "clinic.revisit_recall",
+        values: { clinic_name: "Test Clinic", recall_wording: "a review of how the treatment is settling", reschedule_contact: "89777 59580" },
+      },
+      actor,
+    );
+    expect(r.issues).toEqual([]);
+    const [cp] = await withTenant(tenant, (tx) => tx.select().from(clientPrograms).where(eq(clientPrograms.id, r.program.id)));
+    expect(cp!.agentId).toBeTruthy();
+    const [v] = await withTenant(tenant, (tx) => tx.select().from(agentVersions).where(eq(agentVersions.id, r.versionId)));
+    // The job is in the prompt, the per-person data stays as placeholders for the dialer to fill.
+    expect(v!.taskPrompt).toContain("follow-up is due");
+    expect(v!.outboundOpening).toContain("{{caller_name}}");
+    expect(v!.outboundOpening).toContain("{{treatment}}");
+    expect(v!.outboundOpening).toContain("Test Clinic"); // the client's own answer is filled in once
+    expect(v!.facts).toContain("Test Clinic, Madhapur"); // business facts reused, not retyped
+
+    // Setting it up again updates in place instead of making a second agent.
+    const again = await setUpProgram(tenant, { programKey: "clinic.revisit_recall", values: { clinic_name: "Test Clinic", recall_wording: "a review", reschedule_contact: "89777 59580" } }, actor);
+    expect(again.program.id).toBe(r.program.id);
+    expect(await withTenant(tenant, (tx) => tx.select().from(agents).where(eq(agents.clientProgramId, r.program.id)))).toHaveLength(1);
+  });
+
+  it("refuses to start before the client has filled in what the call needs", async () => {
+    await expect(setUpProgram(tenant, { programKey: "clinic.revisit_recall", values: { clinic_name: "Test Clinic" } }, actor)).rejects.toThrow(/Fill in:/);
+  });
+
+  it("brings the program's own safety cases into the publish check", async () => {
+    const [cp] = await withTenant(tenant, (tx) => tx.select().from(clientPrograms).where(eq(clientPrograms.programKey, "clinic.revisit_recall")));
+    const [v] = await withTenant(tenant, (tx) => tx.select().from(agentVersions).where(eq(agentVersions.agentId, cp!.agentId!)));
+    const check = await withTenant(tenant, (tx) => requestSafetyCheck(tx, { tenantId: tenant, versionId: v!.id, reason: "manual", requestedBy: actor }));
+    expect(check.extraCases.map((c) => c.id)).toContain("recall_wrong_person");
+    expect(check.vertical).toBe("health"); // the program's risks, not the workspace label
+    await runSafetyCheck({ tenantId: tenant, id: check.id }, goodModel, 3);
+    const [done] = await withTenant(tenant, (tx) => tx.select().from(agentSafetyChecks).where(eq(agentSafetyChecks.id, check.id)));
+    expect(done!.status).toBe("passed");
+    // 16 universal + 2 health + 2 from this program
+    expect((done!.results as unknown[]).length).toBe(20);
+  });
+
+  it("creates a campaign that inherits the program's rules", async () => {
+    const num = await withTenant(tenant, async (tx) => {
+      const acct = await addCarrierAccount(tx, tenant, { provider: "vobiz", mode: "managed_subaccount", displayName: "program test" }, actor);
+      return addPhoneNumber(tx, tenant, { carrierAccountId: acct.id, e164: "+914012345678", series: "landline", purpose: "both" }, actor);
+    });
+    const [cp] = await withTenant(tenant, (tx) => tx.select().from(clientPrograms).where(eq(clientPrograms.programKey, "clinic.revisit_recall")));
+    const { campaign, program } = await withTenant(tenant, (tx) => campaignFromProgram(tx, tenant, { clientProgramId: cp!.id, callerNumberId: num!.id, createdBy: actor }));
+    expect(campaign.purpose).toBe("service"); // not promotional: no 140-series needed, patients on DND may be called
+    expect(campaign.windows).toEqual(program.defaults.windows);
+    expect(campaign.maxAttempts).toBe(program.defaults.maxAttempts);
+    expect(campaign.clientProgramId).toBe(cp!.id);
+  });
+
+  it("knows which per-person data a target row is missing", async () => {
+    const [p] = await withTenant(tenant, (tx) => tx.select().from(programTemplates).where(eq(programTemplates.key, "municipal.property_tax_due")));
+    expect(missingVariables(p!, { ptin: "1022345678", amount_due: "4250" }, "Lakshmi")).toEqual(["Last date to pay"]);
+    expect(missingVariables(p!, { ptin: "1", amount_due: "2", due_date: "2026-10-15" }, "Lakshmi")).toEqual([]);
+  });
+});
+
 describe("calls sync", () => {
   it("pulls calls, contacts and leads, and a second sync adds nothing", async () => {
     const now = new Date().toISOString();
@@ -237,7 +301,8 @@ describe("dialer", () => {
   it("waits at night instead of dialing", async () => {
     const night = zoned(2026, 9, 17, 22 * 60 + 30, "Asia/Kolkata");
     const id = await withTenant(tenant, async (tx) => {
-      const [c] = await tx.select().from(campaigns);
+      // This workspace also has program campaigns now: use the one these dialer tests made.
+      const [c] = await tx.select().from(campaigns).where(eq(campaigns.name, "Recall"));
       await tx.update(campaigns).set({ status: "running" }).where(eq(campaigns.id, c!.id));
       const [t] = await tx.insert(campaignTargets).values({ tenantId: tenant, campaignId: c!.id, phoneE164: "+919876544444", nextAttemptAt: new Date(night.getTime() - 1000) }).returning();
       await tx.insert(consents).values({ tenantId: tenant, phoneE164: "+919876544444", purpose: "service", source: "web_form" });

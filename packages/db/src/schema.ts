@@ -428,6 +428,7 @@ export const agents = pgTable(
     outboundWorkflowId: integer("outbound_workflow_id"),
     outboundWorkflowUuid: text("outbound_workflow_uuid"),
     liveVersionId: uuid("live_version_id"),
+    clientProgramId: uuid("client_program_id"),
     status: text("status").notNull().default("active"),
     createdAt: ts("created_at").notNull().defaultNow(),
     updatedAt: ts("updated_at").notNull().defaultNow(),
@@ -460,6 +461,7 @@ export const agentVersions = pgTable(
     publishedAt: ts("published_at"),
     publishResult: jsonb("publish_result"),
     guardrailsVersion: integer("guardrails_version"),
+    taskPrompt: text("task_prompt"),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
@@ -661,6 +663,7 @@ export const campaigns = pgTable(
     purpose: consentPurpose("purpose").notNull(),
     status: campaignStatus("status").notNull().default("draft"),
     callPurposeText: text("call_purpose_text"),
+    clientProgramId: uuid("client_program_id"),
     timezone: text("timezone").notNull().default("Asia/Kolkata"),
     windows: jsonb("windows").$type<CallingWindows>().notNull(),
     maxConcurrency: integer("max_concurrency").notNull().default(2),
@@ -789,6 +792,44 @@ export const securityDetectorState = pgTable("security_detector_state", {
   updatedAt: ts("updated_at").notNull().defaultNow(),
 });
 
+export interface ProgramVariable {
+  name: string;
+  label: string;
+  type: "text" | "number" | "date" | "money";
+  required: boolean;
+  example?: string;
+}
+export interface ProgramField {
+  name: string;
+  label: string;
+  help?: string;
+  required: boolean;
+  example?: string;
+}
+export interface ProgramOutcome {
+  key: string;
+  label: string;
+  stage?: "new" | "contacted" | "callback" | "booked" | "won" | "lost";
+}
+export interface ProgramDefaults {
+  windows?: { days: number[]; start: string; end: string };
+  maxAttempts?: number;
+  dailyCapPerContact?: number;
+  maxConcurrency?: number;
+}
+export interface ProgramRequirements {
+  callerIdSeries?: "series_140" | "normal" | "any";
+  consent?: "explicit" | "existing_relationship" | "statutory";
+  records?: string[];
+}
+export interface ProgramRedteamCase {
+  id: string;
+  severity: "critical" | "high" | "medium";
+  risk: string;
+  turns: string[];
+  rubric: string;
+}
+
 // ---------------------------------------------------------------------------
 // AI safety checks (migration 0011)
 // ---------------------------------------------------------------------------
@@ -823,6 +864,7 @@ export const agentSafetyChecks = pgTable(
     reviewedAt: ts("reviewed_at"),
     reviewNote: text("review_note"),
     attempts: integer("attempts").notNull().default(0),
+    extraCases: jsonb("extra_cases").$type<ProgramRedteamCase[]>().notNull().default([]),
     createdAt: ts("created_at").notNull().defaultNow(),
     startedAt: ts("started_at"),
     finishedAt: ts("finished_at"),
@@ -830,3 +872,56 @@ export const agentSafetyChecks = pgTable(
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
 export type AgentSafetyCheck = typeof agentSafetyChecks.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// Call programs (migration 0013)
+// ---------------------------------------------------------------------------
+export const programTemplates = pgTable(
+  "program_templates",
+  {
+    key: text("key").notNull(),
+    version: integer("version").notNull(),
+    vertical: text("vertical").notNull(),
+    name: text("name").notNull(),
+    summary: text("summary").notNull(),
+    direction: text("direction").notNull().default("outbound"),
+    purpose: consentPurpose("purpose").notNull(),
+    goal: text("goal").notNull(),
+    taskPrompt: text("task_prompt").notNull(),
+    opening: text("opening").notNull(),
+    variables: jsonb("variables").$type<ProgramVariable[]>().notNull().default([]),
+    clientFields: jsonb("client_fields").$type<ProgramField[]>().notNull().default([]),
+    extraction: jsonb("extraction").$type<Array<{ name: string; type: string; prompt: string }>>().notNull().default([]),
+    outcomes: jsonb("outcomes").$type<ProgramOutcome[]>().notNull().default([]),
+    defaults: jsonb("defaults").$type<ProgramDefaults>().notNull().default({}),
+    requirements: jsonb("requirements").$type<ProgramRequirements>().notNull().default({}),
+    complianceNote: text("compliance_note").notNull().default(""),
+    redteamCases: jsonb("redteam_cases").$type<ProgramRedteamCase[]>().notNull().default([]),
+    status: text("status").notNull().default("active"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.key, t.version] })],
+);
+export type ProgramTemplate = typeof programTemplates.$inferSelect;
+
+export const clientPrograms = pgTable(
+  "client_programs",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    branchId: uuid("branch_id"),
+    programKey: text("program_key").notNull(),
+    programVersion: integer("program_version").notNull(),
+    name: text("name").notNull(),
+    agentId: uuid("agent_id"),
+    callerNumberId: uuid("caller_number_id"),
+    values: jsonb("values").$type<Record<string, string>>().notNull().default({}),
+    status: text("status").notNull().default("draft"),
+    createdBy: text("created_by"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type ClientProgram = typeof clientPrograms.$inferSelect;

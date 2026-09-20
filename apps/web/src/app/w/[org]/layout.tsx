@@ -10,6 +10,7 @@ const NAV: Array<{ href: string; label: string; perm?: Permission; group?: strin
   { href: "", label: "Overview" },
   { href: "/calls", label: "Calls", perm: "calls:view" },
   { href: "/leads", label: "Leads", perm: "contacts:view" },
+  { href: "/programs", label: "Call programs", perm: "agents:view" },
   { href: "/campaigns", label: "Campaigns", perm: "campaigns:view" },
   { href: "/agents", label: "AI agents", perm: "agents:view" },
   { href: "/numbers", label: "Phone numbers", perm: "numbers:view" },

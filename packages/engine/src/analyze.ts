@@ -9,8 +9,9 @@
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
-import { agents, calls, suppressions, withTenant } from "@jenai/db";
+import { agents, calls, leads, suppressions, withTenant } from "@jenai/db";
 import { deriveLead, parsePreferredTime } from "./leads";
+import { programExtraction } from "./programs";
 
 export const extractionSchema = z.object({
   caller_name: z.string().trim().min(1).max(80).nullable(),
@@ -23,9 +24,16 @@ export const extractionSchema = z.object({
 });
 export type Extraction = z.infer<typeof extractionSchema>;
 
+/** A call program's own questions, appended to the standard ones (migration 0013). */
+export interface ProgramAsk {
+  key: string;
+  extraction: Array<{ name: string; type: string; prompt: string }>;
+  outcomes: Array<{ key: string; label: string; stage?: string }>;
+}
+
 export interface Extractor {
   readonly model: string;
-  extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound" }): Promise<unknown>;
+  extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }): Promise<unknown>;
 }
 
 const PLACEHOLDER = /\b(DD|MM|YYYY|Mon|HH)\b|<[^>]+>|\{\{/;
@@ -63,7 +71,14 @@ export function cleanExtraction(raw: unknown): Extraction | null {
   return out;
 }
 
-function prompt(input: { transcript: string; startedAt: Date; domain: string; direction: string }) {
+function programBlock(p: ProgramAsk | null | undefined): string {
+  if (!p?.extraction.length) return "";
+  const keys = p.extraction.map((e) => ` "${e.name}": string|null (${e.prompt})`).join(",\n");
+  const outcomes = p.outcomes.map((o) => `"${o.key}"`).join("|");
+  return `\n\nThis call was part of the "${p.key}" program. ALSO include these keys, null when not said:\n{\n${keys}${outcomes ? `,\n "outcome": ${outcomes}|null (how the call ended)` : ""}\n}`;
+}
+
+function prompt(input: { transcript: string; startedAt: Date; domain: string; direction: string; program?: ProgramAsk | null }) {
   const today = input.startedAt.toLocaleDateString("en-GB", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", year: "numeric", weekday: "long" });
   return `You analyse one phone call handled by an AI receptionist for a ${input.domain} business in India. The call was ${input.direction} on ${today} (IST). The transcript may mix Telugu, Hindi and English.
 
@@ -72,7 +87,7 @@ Return ONLY a JSON object with exactly these keys, null when not said. Every val
  "preferred_time": string|null (the agreed appointment, written like "20 Sep 2026, 11:00 AM" or "20 Sep 2026" if no time; resolve words like today, tomorrow, repu, kal, next Monday against the call date),
  "interest_level": "hot"|"warm"|"cold"|null, "next_step": "booked"|"callback"|"whatsapp"|"none"|null ("booked" only if a day AND exact time were confirmed),
  "do_not_call": true|false|null (true only if they asked not to be called again), "summary": string|null (one sentence)}
-Never invent a name, time or detail that is not in the transcript.
+Never invent a name, time or detail that is not in the transcript.${programBlock(input.program)}
 
 TRANSCRIPT:
 ${input.transcript.slice(0, 24_000)}`;
@@ -84,12 +99,12 @@ export class BedrockExtractor implements Extractor {
   constructor(readonly model = process.env.JENAI_ANALYZER_MODEL ?? "deepseek.v3.2", region = process.env.JENAI_ANALYZER_REGION ?? "ap-south-1") {
     this.client = new BedrockRuntimeClient({ region });
   }
-  async extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound" }) {
+  async extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }) {
     const r = await this.client.send(
       new ConverseCommand({
         modelId: this.model,
         messages: [{ role: "user", content: [{ text: prompt(input) }] }],
-        inferenceConfig: { maxTokens: 400, temperature: 0 },
+        inferenceConfig: { maxTokens: input.program ? 700 : 400, temperature: 0 },
       }),
     );
     return (r.output?.message?.content ?? []).map((c) => ("text" in c ? c.text : "")).join("");
@@ -101,6 +116,29 @@ export interface AnalyzeStats {
   leads: number;
   optOuts: number;
   failed: number;
+}
+
+/** Program answers are free text from a model: keep them short, strings only. */
+function cleanProgramFields(raw: unknown, p: ProgramAsk): Record<string, string> {
+  const obj = (() => {
+    if (typeof raw === "object" && raw) return raw as Record<string, unknown>;
+    if (typeof raw !== "string") return {};
+    try {
+      return JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0] ?? raw) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  })();
+  const out: Record<string, string> = {};
+  for (const e of p.extraction) {
+    const v = obj[e.name];
+    if (v === null || v === undefined || v === "") continue;
+    const text = String(v).trim().slice(0, 200);
+    if (text && !PLACEHOLDER.test(text)) out[e.name] = text;
+  }
+  const outcome = obj.outcome;
+  if (typeof outcome === "string" && p.outcomes.some((o) => o.key === outcome)) out.outcome = outcome;
+  return out;
 }
 
 /** Analyse finished calls that have a transcript and have not been analysed yet. */
@@ -115,13 +153,24 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
       .orderBy(desc(calls.startedAt))
       .limit(opts.limit ?? 20),
   );
+  const programs = new Map<string, ProgramAsk | null>();
   for (const { c, domain } of todo) {
     try {
-      const raw = await extractor.extract({ transcript: c.transcript!, startedAt: c.startedAt, domain: domain ?? "clinic", direction: c.direction });
+      let program: ProgramAsk | null = null;
+      if (c.agentId) {
+        if (!programs.has(c.agentId)) {
+          const row = await withTenant(tenantId, (tx) => programExtraction(tx, tenantId, c.agentId!));
+          programs.set(c.agentId, row ? { key: row.key, extraction: row.extraction, outcomes: row.outcomes } : null);
+        }
+        program = programs.get(c.agentId) ?? null;
+      }
+      const raw = await extractor.extract({ transcript: c.transcript!, startedAt: c.startedAt, domain: domain ?? "clinic", direction: c.direction, program });
       const x = cleanExtraction(raw);
+      const extra = program ? cleanProgramFields(raw, program) : {};
       await withTenant(tenantId, async (tx) => {
         const merged: Record<string, unknown> = { ...c.extracted };
         if (x) for (const [k, v] of Object.entries(x)) if (v !== null && (merged[k] === undefined || merged[k] === null || merged[k] === "")) merged[k] = v;
+        for (const [k, v] of Object.entries(extra)) merged[k] = v;
         await tx
           .update(calls)
           .set({ extracted: merged, summary: x?.summary ?? c.summary, disposition: (x?.next_step as string) ?? c.disposition, analyzedAt: new Date(), analysisModel: extractor.model })
@@ -134,6 +183,16 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
           }
         }
         if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
+        // A program says what its own outcomes mean for the lead (paid, disputed, booked).
+        if (c.contactId && program && typeof extra.outcome === "string") {
+          const stage = program.outcomes.find((o) => o.key === extra.outcome)?.stage;
+          if (stage) {
+            await tx
+              .update(leads)
+              .set({ stage: stage as never, updatedAt: new Date() })
+              .where(and(eq(leads.tenantId, tenantId), eq(leads.contactId, c.contactId)));
+          }
+        }
       });
       stats.analyzed++;
     } catch {

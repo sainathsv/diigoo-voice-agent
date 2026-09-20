@@ -3,6 +3,8 @@ import {
   agentSafetyChecks,
   agentVersions,
   agents,
+  clientPrograms,
+  programTemplates,
   organizations,
   platformDb,
   withTenant,
@@ -31,16 +33,25 @@ async function promptsOf(tx: Tx, versionId: string) {
   if (!v) throw new Error("Version not found.");
   const [a] = await tx.select().from(agents).where(eq(agents.id, v.agentId));
   const [org] = await tx.select({ vertical: organizations.vertical }).from(organizations).where(eq(organizations.id, v.tenantId));
+  // A call program adds its own adversarial callers (a tax call must refuse card details, and so on).
+  const [prog] = a?.clientProgramId
+    ? await tx
+        .select({ cases: programTemplates.redteamCases, key: programTemplates.key, vertical: programTemplates.vertical })
+        .from(clientPrograms)
+        .innerJoin(programTemplates, and(eq(programTemplates.key, clientPrograms.programKey), eq(programTemplates.version, clientPrograms.programVersion)))
+        .where(eq(clientPrograms.id, a.clientProgramId))
+    : [];
   if (v.state === "imported" || v.state === "live" || v.state === "superseded") {
     // What callers hear (or heard): check it as it is, legacy prompts included.
-    return { version: v, agent: a!, vertical: org?.vertical ?? null, inbound: v.inboundPrompt ?? "", hash: v.promptHash ?? "", guardrails: guardrailsVersionOf(v.inboundPrompt ?? "") };
+    return { version: v, agent: a!, vertical: prog?.vertical ?? org?.vertical ?? null, extraCases: prog?.cases ?? [], inbound: v.inboundPrompt ?? "", hash: v.promptHash ?? "", guardrails: guardrailsVersionOf(v.inboundPrompt ?? "") };
   }
   const tpl = await templateOf(tx, a!);
-  const r = render(tpl, v, a!.domain);
+  const r = render(tpl, { ...v, taskPrompt: v.taskPrompt }, a!.domain);
   if (v.promptHash !== r.hash) {
     await tx.update(agentVersions).set({ inboundPrompt: r.inboundPrompt, outboundPrompt: r.outboundPrompt, promptHash: r.hash, guardrailsVersion: r.guardrailsVersion }).where(eq(agentVersions.id, v.id));
   }
-  return { version: v, agent: a!, vertical: org?.vertical ?? null, inbound: r.inboundPrompt, hash: r.hash, guardrails: r.guardrailsVersion };
+  // A clinic program run by any kind of client still needs the health cases: the job carries the risk.
+  return { version: v, agent: a!, vertical: prog?.vertical ?? org?.vertical ?? null, extraCases: prog?.cases ?? [], inbound: r.inboundPrompt, hash: r.hash, guardrails: r.guardrailsVersion };
 }
 
 /**
@@ -83,6 +94,7 @@ export async function requestSafetyCheck(
     judgeModel: judge,
     reason: input.reason,
     requestedBy: input.requestedBy,
+    extraCases: p.extraCases,
   };
   const [row] = await tx
     .insert(agentSafetyChecks)
@@ -151,7 +163,8 @@ export async function runSafetyCheck(ref: { tenantId: string; id: string }, mode
   });
   try {
     if (!prompt.trim()) throw new Error("The version changed after this check was queued; start a new check.");
-    const results = await runSuite(model, prompt, casesFor(check.vertical), concurrency);
+    const cases = [...casesFor(check.vertical), ...check.extraCases];
+    const results = await runSuite(model, prompt, cases, concurrency);
     const s = summarise(results);
     const row = await withTenant(ref.tenantId, async (tx) => {
       const [row] = await tx
