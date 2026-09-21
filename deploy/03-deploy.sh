@@ -31,7 +31,7 @@ done
 
 say() { printf "\n\033[1m%s\033[0m\n" "$*"; }
 pw() { openssl rand -base64 30 | tr -d '/@" =+' | cut -c1-28; }
-onserver() { $SSH "cd /opt/jenai/app && sudo -u jenai env \$(grep -v '^#' /etc/jenai/env | xargs) $1"; }
+onserver() { $SSH "sudo -u jenai bash -c 'set -a; . /etc/jenai/env; set +a; export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; cd /opt/jenai/app && $1'"; }
 
 say "1. Copying the code"
 rsync -az --delete \
@@ -54,10 +54,11 @@ if [ "$FIRST_RUN" = "yes" ]; then
 
   $SSH "sudo tee /etc/jenai/env >/dev/null <<ENVFILE
 # JENAI production. Written by deploy/03-deploy.sh.
-DATABASE_ADMIN_URL=postgres://jenai_root:${MASTER_PW}@${DB_HOST}:5432/postgres
-DATABASE_OWNER_URL=postgres://jenai_owner:${OWNER_PW}@${DB_HOST}:5432/jenai
-DATABASE_URL=postgres://jenai_app:${APP_PW}@${DB_HOST}:5432/jenai
-DATABASE_PLATFORM_URL=postgres://jenai_platform:${PLATFORM_PW}@${DB_HOST}:5432/jenai
+# sslmode=require: the database refuses unencrypted connections.
+DATABASE_ADMIN_URL=postgres://jenai_root:${MASTER_PW}@${DB_HOST}:5432/postgres?sslmode=require
+DATABASE_OWNER_URL=postgres://jenai_owner:${OWNER_PW}@${DB_HOST}:5432/jenai?sslmode=require
+DATABASE_URL=postgres://jenai_app:${APP_PW}@${DB_HOST}:5432/jenai?sslmode=require
+DATABASE_PLATFORM_URL=postgres://jenai_platform:${PLATFORM_PW}@${DB_HOST}:5432/jenai?sslmode=require
 BETTER_AUTH_SECRET=${AUTH_SECRET}
 BETTER_AUTH_URL=https://${HOST}
 JENAI_PUBLIC_URL=https://${HOST}
@@ -79,12 +80,13 @@ sudo chown root:jenai /etc/jenai/env && sudo chmod 640 /etc/jenai/env"
 fi
 
 say "3. Installing and building"
-$SSH 'cd /opt/jenai/app && sudo -u jenai env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm install --frozen-lockfile --silent && \
-  sudo -u jenai env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 NODE_ENV=production pnpm --filter @jenai/web build 2>&1 | tail -3'
+# The build reads the database settings while it collects page data, so the
+# settings file is loaded here too.
+onserver "pnpm install --frozen-lockfile --silent"
+onserver "pnpm --filter @jenai/web build 2>&1 | tail -5"
 
 say "4. Completing the standalone server (static files and the public folder)"
-$SSH 'cd /opt/jenai/app/apps/web && sudo -u jenai cp -r .next/static .next/standalone/apps/web/.next/ && \
-  sudo -u jenai cp -r public .next/standalone/apps/web/ 2>/dev/null || true; echo ok'
+onserver "cp -r apps/web/.next/static apps/web/.next/standalone/apps/web/.next/ && cp -r apps/web/public apps/web/.next/standalone/apps/web/ 2>/dev/null; echo ok"
 
 if [ "$FIRST_RUN" = "yes" ]; then
   say "5. Database roles and tables"
@@ -92,7 +94,7 @@ if [ "$FIRST_RUN" = "yes" ]; then
   onserver "pnpm db:migrate"
   if [ -n "$ADMIN" ]; then
     say "6. The first super admin"
-    onserver "pnpm db:seed:platform -- --admin '$ADMIN' --name '$ADMIN_NAME'"
+    onserver "pnpm db:seed:platform -- --admin $ADMIN --name \"$ADMIN_NAME\""
   fi
 else
   say "5. Applying any new migrations"

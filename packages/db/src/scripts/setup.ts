@@ -23,6 +23,8 @@ if (drop && process.env.NODE_ENV === "production") throw new Error("refusing to 
 
 const sql = postgres(adminUrl, { max: 1, onnotice: () => {} });
 
+// Roles are NOSUPERUSER by default. Never say so out loud: a managed database's
+// administrator is not a superuser and refuses to set that attribute at all.
 async function ensureRole(name: string, password: string, attrs: string) {
   const [r] = await sql`select 1 from pg_roles where rolname = ${name}`;
   if (r) await sql.unsafe(`alter role "${name}" with login ${attrs} password '${password.replace(/'/g, "''")}'`);
@@ -30,11 +32,21 @@ async function ensureRole(name: string, password: string, attrs: string) {
 }
 
 try {
-  await ensureRole(owner.user, owner.password, "nobypassrls nosuperuser");
-  await ensureRole(app.user, app.password, "nobypassrls nosuperuser");
-  await ensureRole(plat.user, plat.password, "bypassrls nosuperuser");
+  await ensureRole(owner.user, owner.password, "nobypassrls");
+  await ensureRole(app.user, app.password, "nobypassrls");
+  await ensureRole(plat.user, plat.password, "bypassrls");
   // The owner must be able to hand function ownership to the platform role (SECURITY DEFINER lookups).
   await sql.unsafe(`grant "${plat.user}" to "${owner.user}"`);
+  // On a managed database (RDS) the administrator is not a superuser, so it has
+  // to be a member of a role before it can create a database owned by it.
+  const [who] = await sql<{ me: string }[]>`select current_user as me`;
+  const me = who!.me;
+  for (const role of [owner.user, app.user, plat.user]) {
+    if (role === me) continue;
+    await sql.unsafe(`grant "${role}" to "${me}" with set true`).catch(async () => {
+      await sql.unsafe(`grant "${role}" to "${me}"`).catch(() => undefined); // older servers
+    });
+  }
 
   if (drop) {
     await sql.unsafe(`drop database if exists "${owner.db}" with (force)`);

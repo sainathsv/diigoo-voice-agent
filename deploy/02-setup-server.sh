@@ -35,7 +35,10 @@ say "4. The account the app runs as, and where it lives"
 $SSH 'sudo useradd -r -m -d /opt/jenai -s /usr/sbin/nologin jenai 2>/dev/null || true
   sudo mkdir -p /opt/jenai/app /etc/jenai /var/log/jenai
   sudo chown -R jenai:jenai /opt/jenai /var/log/jenai
-  sudo chmod 750 /etc/jenai'
+  # Deploys run as ubuntu and step into the app folder, so it has to be traversable.
+  sudo chmod 755 /opt/jenai /opt/jenai/app
+  # Settings live here: readable by the app account's group, nobody else.
+  sudo chown root:jenai /etc/jenai && sudo chmod 750 /etc/jenai'
 
 say "5. HTTPS certificate for '"$HOST"' (through DNS, using the server role)"
 $SSH "sudo certbot certonly --dns-route53 --cert-name $HOST -d $HOST --non-interactive --agree-tos --register-unsafely-without-email 2>&1 | tail -3"
@@ -54,8 +57,8 @@ server {
 }
 
 server {
-  listen 443 ssl;
-  http2 on;
+  # nginx 1.24 (Ubuntu 24.04) takes http2 on the listen line; 1.25+ accepts it too.
+  listen 443 ssl http2;
   server_name HOSTNAME;
 
   ssl_certificate     /etc/letsencrypt/live/HOSTNAME/fullchain.pem;
@@ -132,7 +135,7 @@ User=jenai
 WorkingDirectory=/opt/jenai/app
 EnvironmentFile=/etc/jenai/env
 Environment=NODE_ENV=production
-ExecStart=/opt/jenai/app/node_modules/.bin/tsx apps/worker/src/index.ts
+ExecStart=/opt/jenai/app/apps/worker/node_modules/.bin/tsx apps/worker/src/index.ts
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
