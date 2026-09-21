@@ -10,6 +10,7 @@
     "db:setup": "pnpm --filter @jenai/db run setup",
     "db:migrate": "pnpm --filter @jenai/db run migrate",
     "db:seed": "pnpm --filter @jenai/db run seed",
-    "db:reset": "pnpm --filter @jenai/db run reset"
+    "db:reset": "pnpm --filter @jenai/db run reset",
+    "db:seed:platform": "pnpm --filter @jenai/db run seed:platform"
   }
 }

@@ -6,6 +6,9 @@ import type { NextConfig } from "next";
 config({ path: path.resolve(process.cwd(), "../../.env"), quiet: true });
 
 const nextConfig: NextConfig = {
+  // A self-contained server for the production box: node .next/standalone/apps/web/server.js
+  output: "standalone",
+  outputFileTracingRoot: path.resolve(process.cwd(), "../.."),
   transpilePackages: ["@jenai/reports", "@jenai/db", "@jenai/authz", "@jenai/engine", "@jenai/voice"],
   serverExternalPackages: ["postgres"],
   poweredByHeader: false,
