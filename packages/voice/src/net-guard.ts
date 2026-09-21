@@ -6,9 +6,13 @@ import { isIP } from "node:net";
  * staff and redirects come from the engine; neither may point the server at
  * internal networks or the cloud metadata service (169.254.169.254).
  *
- * Private hosts are allowed only when explicitly listed:
- *   JENAI_ALLOWED_PRIVATE_HOSTS=minio:9000,api:8000   (inside the engine's network)
- *   JENAI_ALLOW_PRIVATE_ENGINE=true                    (tests and local fakes only)
+ * Two trust levels, because the addresses come from different people:
+ *   assertSafeUrl    the voice engine, set by Diigoo staff. Private hosts may be
+ *                    allowed by JENAI_ALLOWED_PRIVATE_HOSTS (minio next to the
+ *                    engine) or JENAI_ALLOW_PRIVATE_ENGINE (tests only).
+ *   assertClientUrl  a webhook or API address typed by a CLIENT. Never allowed
+ *                    near our network, whatever the engine switches say
+ *                    (JENAI_ALLOW_PRIVATE_WEBHOOKS exists for tests alone).
  * Egress rules on the server remain the second line of defence (DNS rebinding).
  */
 
@@ -50,7 +54,7 @@ function allowedPrivate(u: URL): boolean {
 }
 
 /** Throws unless the URL is http(s) and every address it resolves to is public (or explicitly allowed). */
-export async function assertSafeUrl(raw: string): Promise<URL> {
+export async function assertSafeUrl(raw: string, opts: { allowPrivate?: boolean } = {}): Promise<URL> {
   let u: URL;
   try {
     u = new URL(raw);
@@ -59,11 +63,20 @@ export async function assertSafeUrl(raw: string): Promise<URL> {
   }
   if (u.protocol !== "https:" && u.protocol !== "http:") throw new BlockedUrlError(raw, "only http and https are allowed");
   if (u.username || u.password) throw new BlockedUrlError(raw, "credentials in URLs are not allowed");
-  if (allowedPrivate(u)) return u;
+  if (opts.allowPrivate !== false && allowedPrivate(u)) return u;
   const host = u.hostname.replace(/^\[|\]$/g, "");
   const addrs = isIP(host) ? [{ address: host }] : await lookup(host, { all: true, verbatim: true }).catch(() => []);
   if (!addrs.length) throw new BlockedUrlError(raw, "host does not resolve");
   const bad = addrs.find((a) => isPrivateAddress(a.address));
   if (bad) throw new BlockedUrlError(raw, `resolves to a private or internal address (${bad.address})`);
   return u;
+}
+
+/**
+ * For addresses a client typed (their CRM, their webhook). Our own network is
+ * never a valid destination for these, so the engine's local-development
+ * switches do not apply.
+ */
+export async function assertClientUrl(raw: string): Promise<URL> {
+  return assertSafeUrl(raw, { allowPrivate: process.env.JENAI_ALLOW_PRIVATE_WEBHOOKS === "true" ? undefined : false });
 }

@@ -14,6 +14,7 @@ const NAV: Array<{ href: string; label: string; perm?: Permission; group?: strin
   { href: "/campaigns", label: "Campaigns", perm: "campaigns:view" },
   { href: "/agents", label: "AI agents", perm: "agents:view" },
   { href: "/numbers", label: "Phone numbers", perm: "numbers:view" },
+  { href: "/integrations", label: "Your systems", perm: "integrations:manage" },
   { href: "/plan", label: "Plan and usage", perm: "billing:view" },
   { href: "/team", label: "Team", perm: "users:view" },
   { href: "/roles", label: "Roles and access", perm: "users:view" },

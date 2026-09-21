@@ -13,6 +13,10 @@
  * Cost control for a large fleet: at most JENAI_SAFETY_SWEEP_PER_HOUR (default
  * 100) re-checks are queued per hour; publish checks always go first.
  *
+ * The integrations loop is ON by default (JENAI_INTEGRATIONS=false turns it
+ * off): it hands call results back to each client's own system (their CRM),
+ * retrying with a widening gap and never sending the same event twice.
+ *
  * The security loop is ON by default (JENAI_SECURITY=false turns it off): the
  * detector every minute, audit-log integrity and retention every hour. High and
  * critical alerts go to JENAI_ALERT_SNS_TOPIC_ARN when set, else to this log.
@@ -24,9 +28,12 @@ import {
   BedrockExtractor,
   BedrockSafetyModel,
   analyzeCalls,
+  claimDeliveries,
   claimSafetyChecks,
+  deliver,
   enqueueFleetSweep,
   requeueStuckChecks,
+  requeueStuckDeliveries,
   runSafetyCheck,
   detect,
   logNotifier,
@@ -48,6 +55,8 @@ const SAFETY = process.env.JENAI_SAFETY !== "false";
 const SAFETY_PARALLEL = Math.max(1, Number(process.env.JENAI_SAFETY_PARALLEL ?? 2));
 const SWEEP_PER_HOUR = Math.max(0, Number(process.env.JENAI_SAFETY_SWEEP_PER_HOUR ?? 100));
 const RECHECK_DAYS = Math.max(1, Number(process.env.JENAI_SAFETY_RECHECK_DAYS ?? 90));
+const INTEGRATIONS = process.env.JENAI_INTEGRATIONS !== "false";
+const DELIVERY_BATCH = Math.max(1, Number(process.env.JENAI_INTEGRATIONS_BATCH ?? 10));
 const SYNC_MS = Math.max(60, Number(process.env.JENAI_SYNC_SECONDS ?? 300)) * 1000;
 const TICK_MS = 3000;
 let stopping = false;
@@ -139,6 +148,24 @@ async function safetyLoop() {
   }
 }
 
+async function integrationsLoop() {
+  while (!stopping) {
+    const db = platformDb();
+    let claimed: Array<{ tenantId: string; id: string }> = [];
+    try {
+      const stuck = await requeueStuckDeliveries(db);
+      if (stuck) log("integration.requeued", { count: stuck });
+      claimed = await claimDeliveries(db, DELIVERY_BATCH);
+      const results = await Promise.all(claimed.map((c) => deliver(c)));
+      const failed = results.filter((r) => !r.ok);
+      if (results.length) log("integration.delivered", { sent: results.length - failed.length, retrying: failed.length, firstError: failed[0]?.message?.slice(0, 120) });
+    } catch (e) {
+      log("integration.error", { message: (e as Error).message });
+    }
+    if (!claimed.length) await new Promise((r) => setTimeout(r, 5_000));
+  }
+}
+
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     log("worker.stopping", { signal: sig });
@@ -147,8 +174,9 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
-log("worker.started", { realDials: REAL, sync: SYNC, analyze: ANALYZE, syncSeconds: SYNC_MS / 1000, security: SECURITY, alertTopic: ALERT_TOPIC ? "sns" : "log", safety: SAFETY, safetyRecheckDays: RECHECK_DAYS });
+log("worker.started", { realDials: REAL, sync: SYNC, analyze: ANALYZE, syncSeconds: SYNC_MS / 1000, security: SECURITY, alertTopic: ALERT_TOPIC ? "sns" : "log", safety: SAFETY, safetyRecheckDays: RECHECK_DAYS, integrations: INTEGRATIONS });
 void dialerLoop();
 if (SYNC) void syncLoop();
 if (SECURITY) void securityLoop();
 if (SAFETY) void safetyLoop();
+if (INTEGRATIONS) void integrationsLoop();

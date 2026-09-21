@@ -227,6 +227,9 @@ export const apiKeys = pgTable(
     keyHash: text("key_hash").notNull().unique(),
     scopes: text("scopes").array().notNull(),
     branchId: uuid("branch_id"),
+    allowedIps: text("allowed_ips").array().notNull().default([]),
+    lastUsedIp: text("last_used_ip"),
+    callsMade: integer("calls_made").notNull().default(0),
     createdBy: text("created_by"),
     lastUsedAt: ts("last_used_at"),
     expiresAt: ts("expires_at"),
@@ -664,6 +667,7 @@ export const campaigns = pgTable(
     status: campaignStatus("status").notNull().default("draft"),
     callPurposeText: text("call_purpose_text"),
     clientProgramId: uuid("client_program_id"),
+    onDemand: boolean("on_demand").notNull().default(false),
     timezone: text("timezone").notNull().default("Asia/Kolkata"),
     windows: jsonb("windows").$type<CallingWindows>().notNull(),
     maxConcurrency: integer("max_concurrency").notNull().default(2),
@@ -925,3 +929,75 @@ export const clientPrograms = pgTable(
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
 export type ClientProgram = typeof clientPrograms.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// Integrations (migration 0014): the client's own system stays the record of truth
+// ---------------------------------------------------------------------------
+export const integrationKind = pgEnum("integration_kind", ["webhook_out", "rest_generic", "zoho_crm", "salesforce", "hubspot", "leadsquared", "sap_odata", "google_sheets"]);
+export const integrationStatus = pgEnum("integration_status", ["draft", "connected", "error", "paused"]);
+export type IntegrationKind = (typeof integrationKind.enumValues)[number];
+
+export const integrations = pgTable(
+  "integrations",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    kind: integrationKind("kind").notNull(),
+    name: text("name").notNull(),
+    status: integrationStatus("status").notNull().default("draft"),
+    config: jsonb("config").$type<Record<string, unknown>>().notNull().default({}),
+    mapping: jsonb("mapping").$type<Record<string, Record<string, string>>>().notNull().default({}),
+    events: text("events").array().notNull().default([]),
+    credentials: text("credentials"),
+    direction: text("direction").notNull().default("both"),
+    lastOkAt: ts("last_ok_at"),
+    lastError: text("last_error"),
+    lastErrorAt: ts("last_error_at"),
+    createdBy: text("created_by"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type Integration = typeof integrations.$inferSelect;
+
+export const integrationEvents = pgTable(
+  "integration_events",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    integrationId: uuid("integration_id"),
+    direction: text("direction").notNull(),
+    kind: text("kind").notNull(),
+    refType: text("ref_type"),
+    refId: text("ref_id"),
+    externalId: text("external_id"),
+    idempotencyKey: text("idempotency_key").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
+    status: text("status").notNull().default("queued"),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: ts("next_attempt_at").notNull().defaultNow(),
+    httpStatus: integer("http_status"),
+    response: text("response"),
+    error: text("error"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type IntegrationEvent = typeof integrationEvents.$inferSelect;
+
+export const externalLinks = pgTable(
+  "external_links",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    integrationId: uuid("integration_id").notNull(),
+    ourType: text("our_type").notNull(),
+    ourId: uuid("our_id").notNull(),
+    externalType: text("external_type").notNull(),
+    externalId: text("external_id").notNull(),
+    externalUrl: text("external_url"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.integrationId, t.ourType, t.ourId] })],
+);

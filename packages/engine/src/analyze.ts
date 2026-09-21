@@ -12,6 +12,7 @@ import { z } from "zod";
 import { agents, calls, leads, suppressions, withTenant } from "@jenai/db";
 import { deriveLead, parsePreferredTime } from "./leads";
 import { programExtraction } from "./programs";
+import { emitAppointmentBooked, emitCallCompleted, emitDoNotCall } from "./integrations/events";
 
 export const extractionSchema = z.object({
   caller_name: z.string().trim().min(1).max(80).nullable(),
@@ -179,10 +180,14 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
           const phone = c.direction === "inbound" ? c.fromE164 : c.toE164;
           if (phone) {
             await tx.insert(suppressions).values({ tenantId, phoneE164: phone, reason: "opt_out", scope: null, source: `said on call ${c.externalRunId}` }).onConflictDoNothing();
+            await emitDoNotCall(tx, tenantId, phone, `said so on call ${c.id}`);
             stats.optOuts++;
           }
         }
         if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
+        // Hand the result back to the client's own system (their CRM stays the record of truth).
+        await emitCallCompleted(tx, tenantId, c.id);
+        if (merged.next_step === "booked" && typeof merged.preferred_time === "string") await emitAppointmentBooked(tx, tenantId, c.id, merged.preferred_time);
         // A program says what its own outcomes mean for the lead (paid, disputed, booked).
         if (c.contactId && program && typeof extra.outcome === "string") {
           const stage = program.outcomes.find((o) => o.key === extra.outcome)?.stage;

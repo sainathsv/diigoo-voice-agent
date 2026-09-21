@@ -55,7 +55,8 @@ async function gatewayFor(tx: Tx, tenantId: string, opts: TickOptions): Promise<
   return opts.simulator ?? sim;
 }
 
-async function policyFacts(tx: Tx, c: Campaign, phone: string, now: Date) {
+/** Consent, do-not-call, relationship and today's attempts for one number. Shared with the API preview. */
+export async function policyFacts(tx: Tx, c: Campaign, phone: string, now: Date) {
   const supp = await tx
     .select({ reason: suppressions.reason, scope: suppressions.scope, expiresAt: suppressions.expiresAt })
     .from(suppressions)

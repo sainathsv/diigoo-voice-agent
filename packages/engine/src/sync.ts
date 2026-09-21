@@ -2,6 +2,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { agents, calls, contacts, withTenant, type Agent, type Tx } from "@jenai/db";
 import { toE164, type DograhClient, type DograhRun } from "@jenai/voice";
 import { deriveLead } from "./leads";
+import { emitCallCompleted } from "./integrations/events";
 import { markConnection, voiceClient } from "./voice-conn";
 
 export interface SyncStats {
@@ -129,6 +130,9 @@ async function syncOne(tx: Tx, tenantId: string, client: DograhClient, agent: Ag
         if (row?.inserted) stats.inserted++;
         else stats.updated++;
         if (contactId && status === "completed" && (await deriveLead(sp, tenantId, { callId: row!.id, contactId, branchId: agent.branchId, extracted, at: startedAt }))) stats.leadsTouched++;
+        // Hand the call back to the client's own system. When the analyser is on it
+        // emits later with the outcome; the same key means only one delivery either way.
+        if (status === "completed" && (process.env.JENAI_ANALYZE !== "true" || !transcript)) await emitCallCompleted(sp, tenantId, row!.id);
       });
     } catch (e) {
       stats.errors.push(`run ${summary.id}: ${(e as Error).message}`);

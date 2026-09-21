@@ -208,7 +208,7 @@ describe("call programs", () => {
   it("creates a campaign that inherits the program's rules", async () => {
     const num = await withTenant(tenant, async (tx) => {
       const acct = await addCarrierAccount(tx, tenant, { provider: "vobiz", mode: "managed_subaccount", displayName: "program test" }, actor);
-      return addPhoneNumber(tx, tenant, { carrierAccountId: acct.id, e164: "+914012345678", series: "landline", purpose: "both" }, actor);
+      return addPhoneNumber(tx, tenant, { carrierAccountId: acct.id, e164: "+914012345678", series: "landline", purpose: "both" });
     });
     const [cp] = await withTenant(tenant, (tx) => tx.select().from(clientPrograms).where(eq(clientPrograms.programKey, "clinic.revisit_recall")));
     const { campaign, program } = await withTenant(tenant, (tx) => campaignFromProgram(tx, tenant, { clientProgramId: cp!.id, callerNumberId: num!.id, createdBy: actor }));
