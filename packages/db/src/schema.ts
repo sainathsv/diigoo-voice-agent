@@ -98,6 +98,7 @@ export const organizations = pgTable("organizations", {
   languages: text("languages").array().notNull(),
   supportAccessUntil: ts("support_access_until"),
   suspendedReason: text("suspended_reason"),
+  calendarToken: text("calendar_token"),
   createdAt: ts("created_at").notNull().defaultNow(),
   updatedAt: ts("updated_at").notNull().defaultNow(),
 });
@@ -1001,3 +1002,69 @@ export const externalLinks = pgTable(
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.integrationId, t.ourType, t.ourId] })],
 );
+
+// ---------------------------------------------------------------------------
+// Calendar (migration 0015)
+// ---------------------------------------------------------------------------
+export const resourceKind = pgEnum("resource_kind", ["doctor", "staff", "room", "equipment"]);
+export const appointmentKind = pgEnum("appointment_kind", ["visit", "follow_up", "procedure", "call_back", "block", "other"]);
+export const appointmentStatus = pgEnum("appointment_status", ["booked", "confirmed", "arrived", "completed", "cancelled", "no_show"]);
+export type AppointmentKind = (typeof appointmentKind.enumValues)[number];
+export type AppointmentStatus = (typeof appointmentStatus.enumValues)[number];
+
+export interface WorkingHours {
+  days?: number[];
+  start?: string;
+  end?: string;
+}
+
+export const resources = pgTable(
+  "resources",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    branchId: uuid("branch_id"),
+    name: text("name").notNull(),
+    kind: resourceKind("kind").notNull().default("doctor"),
+    title: text("title"),
+    colour: text("colour").notNull().default("#C96A3C"),
+    workingHours: jsonb("working_hours").$type<WorkingHours>().notNull().default({}),
+    active: boolean("active").notNull().default(true),
+    createdBy: text("created_by"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type Resource = typeof resources.$inferSelect;
+
+export const appointments = pgTable(
+  "appointments",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    branchId: uuid("branch_id"),
+    resourceId: uuid("resource_id"),
+    contactId: uuid("contact_id"),
+    callId: uuid("call_id"),
+    clientProgramId: uuid("client_program_id"),
+    title: text("title").notNull(),
+    kind: appointmentKind("kind").notNull().default("visit"),
+    status: appointmentStatus("status").notNull().default("booked"),
+    startsAt: ts("starts_at").notNull(),
+    endsAt: ts("ends_at").notNull(),
+    allDay: boolean("all_day").notNull().default(false),
+    personName: text("person_name"),
+    phoneE164: text("phone_e164"),
+    notes: text("notes"),
+    source: text("source").notNull().default("manual"),
+    externalId: text("external_id"),
+    createdBy: text("created_by"),
+    updatedBy: text("updated_by"),
+    cancelledReason: text("cancelled_reason"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type Appointment = typeof appointments.$inferSelect;

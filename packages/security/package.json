@@ -14,7 +14,8 @@
     "drizzle-orm": "0.45.2",
     "@jenai/engine": "workspace:*",
     "better-auth": "1.7.5",
-    "@jenai/voice": "workspace:*"
+    "@jenai/voice": "workspace:*",
+    "@jenai/reports": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "22.20.4",

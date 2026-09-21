@@ -65,7 +65,11 @@ beforeAll(async () => {
   ]);
 });
 
+/** Extra rows a single test made; cleaned up at the end. */
+const fixtures: Array<() => Promise<unknown>> = [];
+
 afterAll(async () => {
+  for (const undo of fixtures) await undo().catch(() => undefined);
   await db.delete(campaigns).where(eq(campaigns.id, ids.lbrCampaign!));
   await db.delete(phoneNumbers).where(eq(phoneNumbers.id, ids.lbrNum!));
   await db.delete(carrierAccounts).where(eq(carrierAccounts.id, ids.lbrAcct!));
@@ -137,8 +141,22 @@ describe("A01 privilege escalation", () => {
     expect(got).toHaveLength(0);
   });
   it("support staff cannot enter a workspace with someone else's grant id", async () => {
-    const [grant] = await db.select().from(supportGrants).where(eq(supportGrants.tenantId, zen)).limit(1);
-    const forged = { ...support, cookie: `${support.cookie}; jenai_support=${grant?.id ?? "00000000-0000-0000-0000-000000000000"}` };
+    // A live grant that belongs to a different staff member, not to this support agent.
+    const [founder] = await db.select({ id: user.id }).from(user).where(eq(user.email, "founder@diigoo.test"));
+    const [grant] = await db
+      .insert(supportGrants)
+      .values({
+        tenantId: zen,
+        staffUserId: founder!.id,
+        mode: "read",
+        reason: "attack suite fixture",
+        status: "approved",
+        startsAt: new Date(),
+        expiresAt: new Date(Date.now() + 30 * 60_000),
+      })
+      .returning();
+    fixtures.push(() => db.delete(supportGrants).where(eq(supportGrants.id, grant!.id)));
+    const forged = { ...support, cookie: `${support.cookie}; jenai_support=${grant!.id}` };
     expect((await get("/w/zennara", forged)).status).toBe(404);
   });
   it("client users cannot open the Diigoo console", async () => {

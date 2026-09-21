@@ -13,6 +13,7 @@ import { agents, calls, leads, suppressions, withTenant } from "@jenai/db";
 import { deriveLead, parsePreferredTime } from "./leads";
 import { programExtraction } from "./programs";
 import { emitAppointmentBooked, emitCallCompleted, emitDoNotCall } from "./integrations/events";
+import { appointmentFromCall } from "./calendar";
 
 export const extractionSchema = z.object({
   caller_name: z.string().trim().min(1).max(80).nullable(),
@@ -185,6 +186,21 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
           }
         }
         if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
+        // A booking goes straight into the calendar, so the front desk sees it without asking.
+        if (merged.next_step === "booked" && typeof merged.preferred_time === "string") {
+          const when = parsePreferredTime(merged.preferred_time);
+          if (when) {
+            await appointmentFromCall(tx, tenantId, {
+              callId: c.id,
+              contactId: c.contactId,
+              branchId: c.branchId,
+              when,
+              personName: (merged.caller_name as string) ?? null,
+              phone: c.direction === "inbound" ? c.fromE164 : c.toE164,
+              note: merged.concern ? `About: ${String(merged.concern)}` : null,
+            });
+          }
+        }
         // Hand the result back to the client's own system (their CRM stays the record of truth).
         await emitCallCompleted(tx, tenantId, c.id);
         if (merged.next_step === "booked" && typeof merged.preferred_time === "string") await emitAppointmentBooked(tx, tenantId, c.id, merged.preferred_time);

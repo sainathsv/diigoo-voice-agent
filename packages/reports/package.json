@@ -1,0 +1,25 @@
+{
+  "name": "@jenai/reports",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"reports: builders are covered by @jenai/security tests\"",
+    "report": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@jenai/authz": "workspace:*",
+    "@jenai/db": "workspace:*",
+    "drizzle-orm": "0.45.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}

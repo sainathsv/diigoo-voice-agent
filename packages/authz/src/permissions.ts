@@ -46,6 +46,8 @@ export const CLIENT_MODULES = {
       "agents:publish": "Publish an agent version to live calls",
       "knowledge:edit": "Edit knowledge base, services and prices",
       "schedule:edit": "Edit hours, holidays and availability",
+      "calendar:view": "See the calendar of visits and who they are with",
+      "calendar:edit": "Add, move and cancel entries in the calendar",
     },
   },
   numbers: {

@@ -49,6 +49,7 @@ export const CLIENT_ROLE_TEMPLATES: readonly RoleTemplate<ClientPermission>[] = 
       "numbers:view",
       "users:view", "users:invite", "users:assign_roles",
       "reports:view", "reports:export",
+      "calendar:view", "calendar:edit",
     ],
   },
   {
@@ -61,6 +62,7 @@ export const CLIENT_ROLE_TEMPLATES: readonly RoleTemplate<ClientPermission>[] = 
       "contacts:view", "contacts:edit", "contacts:reveal_phone",
       "schedule:edit",
       "reports:view",
+      "calendar:view", "calendar:edit",
     ],
   },
   {
@@ -88,6 +90,7 @@ export const CLIENT_ROLE_TEMPLATES: readonly RoleTemplate<ClientPermission>[] = 
       "agents:view", "agents:edit",
       "numbers:view",
       "reports:view",
+      "calendar:view",
     ],
   },
   {
@@ -95,14 +98,18 @@ export const CLIENT_ROLE_TEMPLATES: readonly RoleTemplate<ClientPermission>[] = 
     name: "Doctor / practitioner",
     description: "Sees call summaries for their own patients or customers only.",
     defaultScope: "branch",
-    permissions: ["calls:view_own", "contacts:view", "contacts:reveal_phone"],
+    permissions: ["calls:view_own", "contacts:view", "contacts:reveal_phone",
+      "calendar:view",
+    ],
   },
   {
     key: "analyst",
     name: "Analyst (read-only)",
     description: "Reads dashboards and masked data. No exports, no changes.",
     defaultScope: "org",
-    permissions: ["calls:view", "contacts:view", "campaigns:view", "agents:view", "numbers:view", "reports:view"],
+    permissions: ["calls:view", "contacts:view", "campaigns:view", "agents:view", "numbers:view", "reports:view",
+      "calendar:view",
+    ],
   },
   {
     key: "billing_contact",

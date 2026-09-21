@@ -6,7 +6,7 @@ import type { NextConfig } from "next";
 config({ path: path.resolve(process.cwd(), "../../.env"), quiet: true });
 
 const nextConfig: NextConfig = {
-  transpilePackages: ["@jenai/db", "@jenai/authz", "@jenai/engine", "@jenai/voice"],
+  transpilePackages: ["@jenai/reports", "@jenai/db", "@jenai/authz", "@jenai/engine", "@jenai/voice"],
   serverExternalPackages: ["postgres"],
   poweredByHeader: false,
   typedRoutes: false,
