@@ -208,13 +208,20 @@ async function move() {
   for (const table of TENANT_TABLES) {
     const rows = await withTenant(client.id, (tx) => tx.execute(sql.raw(`select * from ${table}`)), shared);
     if (!rows.length) continue;
+    // A json column arrives as a JavaScript object and has to go back as text;
+    // a text[] column arrives as an array and must stay one. Ask the database
+    // which is which rather than guessing from the value.
+    const types = await withTenant(client.id, (tx) =>
+      tx.execute(sql`select column_name, data_type from information_schema.columns where table_schema = 'public' and table_name = ${table}`), shared);
+    const jsonColumns = new Set((types as unknown as { column_name: string; data_type: string }[])
+      .filter((t) => t.data_type === "json" || t.data_type === "jsonb").map((t) => t.column_name));
     await withTenant(client.id, async (tx) => {
       for (const r of rows as Record<string, unknown>[]) {
         const cols = Object.keys(r);
         const names = sql.raw(cols.map((c) => `"${c}"`).join(", "));
         // sql.param keeps an array as ONE parameter. Without it a text[] column
         // is handed three separate values and Postgres sees a record.
-        const values = sql.join(cols.map((c) => sql`${sql.param(r[c])}`), sql`, `);
+        const values = sql.join(cols.map((c) => sql`${sql.param(jsonColumns.has(c) && r[c] !== null ? JSON.stringify(r[c]) : r[c])}`), sql`, `);
         await tx.execute(sql`insert into ${sql.raw(table)} (${names}) values (${values}) on conflict do nothing`);
       }
     }, theirs);
