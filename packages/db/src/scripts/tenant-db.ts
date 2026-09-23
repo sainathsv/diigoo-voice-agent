@@ -212,7 +212,9 @@ async function move() {
       for (const r of rows as Record<string, unknown>[]) {
         const cols = Object.keys(r);
         const names = sql.raw(cols.map((c) => `"${c}"`).join(", "));
-        const values = sql.join(cols.map((c) => sql`${r[c]}`), sql`, `);
+        // sql.param keeps an array as ONE parameter. Without it a text[] column
+        // is handed three separate values and Postgres sees a record.
+        const values = sql.join(cols.map((c) => sql`${sql.param(r[c])}`), sql`, `);
         await tx.execute(sql`insert into ${sql.raw(table)} (${names}) values (${values}) on conflict do nothing`);
       }
     }, theirs);
