@@ -69,10 +69,16 @@ async function provision() {
   const admin = postgres(adminUrl, { max: 1, onnotice: () => {} });
   console.log(`\n${label}: preparing ${database} on ${host}:${port}`);
   try {
+    // On a client's own database none of these may bypass row-level security.
+    // jenai_platform exists only because the migrations grant privileges to it;
+    // we never connect as it here, and the console reads our database, not
+    // theirs. Creating it without that attribute also means the provisioning
+    // account does not itself need it, since only a role holding BYPASSRLS may
+    // grant it to another.
     for (const [role, attrs, pw] of [
       ["jenai_owner", "nobypassrls", creds.owner],
       ["jenai_app", "nobypassrls", creds.app],
-      ["jenai_platform", "bypassrls", creds.platform],
+      ["jenai_platform", "nobypassrls", creds.platform],
     ] as const) {
       const [exists] = await admin`select 1 from pg_roles where rolname = ${role}`;
       const stmt = `${exists ? "alter" : "create"} role "${role}" with login ${attrs} password '${pw.replace(/'/g, "''")}'`;
