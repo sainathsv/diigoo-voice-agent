@@ -63,10 +63,14 @@ for (const p of PLAN_CATALOG) {
 }
 
 // 3. The shared agent behaviour and the call programs on offer.
-const tpl = JSON.parse(readFileSync(path.resolve(here, "../../seed-data/template.clinic_receptionist.v1.json"), "utf8"));
+// Every published template version stays installed: agents are pinned to the
+// version they were built on, so shipping v2 must not remove v1 under them.
+const TEMPLATE_FILES = ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json"];
+const templates = TEMPLATE_FILES.map((f) => JSON.parse(readFileSync(path.resolve(here, `../../seed-data/${f}`), "utf8")));
+const tpl = templates[templates.length - 1];
 await db
   .insert(agentTemplates)
-  .values({ key: tpl.key, version: tpl.version, name: tpl.name, basePrompt: tpl.base_prompt, endPrompt: tpl.end_prompt, extraction: tpl.extraction, extractionPrompt: tpl.extraction_prompt })
+  .values(templates.map((t) => ({ key: t.key, version: t.version, name: t.name, basePrompt: t.base_prompt, endPrompt: t.end_prompt, extraction: t.extraction, extractionPrompt: t.extraction_prompt })))
   .onConflictDoNothing();
 
 const programDir = path.resolve(here, "../../seed-data/programs");

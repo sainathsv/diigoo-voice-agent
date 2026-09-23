@@ -146,11 +146,16 @@ async function catalog() {
     await db.insert(plans).values(p).onConflictDoUpdate({ target: plans.key, set: { ...p, updatedAt: new Date() } });
   }
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const t = JSON.parse(readFileSync(path.resolve(here, "../../seed-data/template.clinic_receptionist.v1.json"), "utf8"));
-  await db
-    .insert(agentTemplates)
-    .values({ key: t.key, version: t.version, name: t.name, basePrompt: t.base_prompt, endPrompt: t.end_prompt, extraction: t.extraction, extractionPrompt: t.extraction_prompt })
-    .onConflictDoNothing();
+  // Every published template version stays installed. An agent is pinned to the
+  // version it was built on and keeps working until someone republishes it, so
+  // shipping v2 must never remove v1 from under the agents already using it.
+  for (const file of ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json"]) {
+    const t = JSON.parse(readFileSync(path.resolve(here, `../../seed-data/${file}`), "utf8"));
+    await db
+      .insert(agentTemplates)
+      .values({ key: t.key, version: t.version, name: t.name, basePrompt: t.base_prompt, endPrompt: t.end_prompt, extraction: t.extraction, extractionPrompt: t.extraction_prompt })
+      .onConflictDoNothing();
+  }
   // Call program catalogue (migration 0013): one JSON file per program, upserted by key + version.
   const dir = path.resolve(here, "../../seed-data/programs");
   const files = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")).sort() : [];
@@ -183,7 +188,7 @@ async function catalog() {
     });
     await db.update(organizations).set({ plan: key }).where(eq(organizations.id, o.id));
   }
-  console.log(`seed: catalog ready (${PLAN_CATALOG.length} plans, template ${t.key} v${t.version})`);
+  console.log(`seed: catalog ready (${PLAN_CATALOG.length} plans, clinic_receptionist templates v1 and v2)`);
 }
 
 /** Billing terms for the seeded clients. GHMC is billed postpaid by physical invoice against its work order. */

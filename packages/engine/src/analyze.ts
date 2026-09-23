@@ -23,6 +23,13 @@ export const extractionSchema = z.object({
   next_step: z.enum(["booked", "callback", "whatsapp", "none"]).nullable(),
   do_not_call: z.boolean().nullable(),
   summary: z.string().trim().max(400).nullable(),
+  // The basic history the advisor gathers on the call (template v2). Health
+  // detail, so it lives under the client's tenant like the transcript does.
+  duration: z.string().trim().max(60).nullable(),
+  tried_before: z.string().trim().max(160).nullable(),
+  background: z.string().trim().max(200).nullable(),
+  advice_given: z.string().trim().max(200).nullable(),
+  urgent: z.boolean().nullable(),
 });
 export type Extraction = z.infer<typeof extractionSchema>;
 
@@ -66,6 +73,11 @@ export function cleanExtraction(raw: unknown): Extraction | null {
     next_step: pick("next_step"),
     do_not_call: pick("do_not_call"),
     summary: pick("summary"),
+    duration: pick("duration"),
+    tried_before: pick("tried_before"),
+    background: pick("background"),
+    advice_given: pick("advice_given"),
+    urgent: pick("urgent"),
   };
   if (out.preferred_time && (PLACEHOLDER.test(out.preferred_time) || !parsePreferredTime(out.preferred_time))) out.preferred_time = null;
   // A booking without a real day and time is not a booking.
@@ -88,8 +100,13 @@ Return ONLY a JSON object with exactly these keys, null when not said. Every val
 {"caller_name": string|null (in English letters), "concern": string|null (what they asked about, 3 to 8 English words, e.g. "hair fall treatment"),
  "preferred_time": string|null (the agreed appointment, written like "20 Sep 2026, 11:00 AM" or "20 Sep 2026" if no time; resolve words like today, tomorrow, repu, kal, next Monday against the call date),
  "interest_level": "hot"|"warm"|"cold"|null, "next_step": "booked"|"callback"|"whatsapp"|"none"|null ("booked" only if a day AND exact time were confirmed),
- "do_not_call": true|false|null (true only if they asked not to be called again), "summary": string|null (one sentence)}
-Never invent a name, time or detail that is not in the transcript.${programBlock(input.program)}
+ "do_not_call": true|false|null (true only if they asked not to be called again), "summary": string|null (one sentence),
+ "duration": string|null (how long they have had the problem, as they said it, e.g. "6 months", "since last winter"),
+ "tried_before": string|null (what they already tried: home remedies, shampoos, creams, other doctors or clinics; up to 15 words),
+ "background": string|null (background they mentioned: recent delivery, thyroid, sugar, PCOD, a new medicine, colouring, family history, stress, sleep; up to 20 words),
+ "advice_given": string|null (the everyday care advice the agent actually gave on this call; up to 20 words),
+ "urgent": true|false|null (true only if they described something needing to be seen the same day: spreading redness with fever, a hot painful swelling, a non-healing wound, a mole that changed or bleeds, sudden patchy hair loss with a painful scalp, blistering after a product)}
+Never invent a name, time or detail that is not in the transcript. Never write a diagnosis: report only what the caller said.${programBlock(input.program)}
 
 TRANSCRIPT:
 ${input.transcript.slice(0, 24_000)}`;
@@ -106,7 +123,7 @@ export class BedrockExtractor implements Extractor {
       new ConverseCommand({
         modelId: this.model,
         messages: [{ role: "user", content: [{ text: prompt(input) }] }],
-        inferenceConfig: { maxTokens: input.program ? 700 : 400, temperature: 0 },
+        inferenceConfig: { maxTokens: input.program ? 900 : 600, temperature: 0 },
       }),
     );
     return (r.output?.message?.content ?? []).map((c) => ("text" in c ? c.text : "")).join("");

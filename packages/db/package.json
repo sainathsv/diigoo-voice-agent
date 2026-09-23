@@ -17,7 +17,8 @@
     "reset": "tsx src/scripts/setup.ts --drop && tsx src/scripts/migrate.ts && tsx src/scripts/seed.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "seed:platform": "tsx src/scripts/seed-platform.ts"
+    "seed:platform": "tsx src/scripts/seed-platform.ts",
+    "tenant-db": "tsx src/scripts/tenant-db.ts"
   },
   "dependencies": {
     "@jenai/authz": "workspace:*",

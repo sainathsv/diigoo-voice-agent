@@ -1,0 +1,178 @@
+/**
+ * Client-hosted data: stand up one client's records on their own Postgres.
+ *
+ *   pnpm --filter @jenai/db tenant-db provision --tenant blue-cloud --host 1.2.3.4 --label "Blue Cloud"
+ *   pnpm --filter @jenai/db tenant-db check     --tenant blue-cloud
+ *   pnpm --filter @jenai/db tenant-db disable   --tenant blue-cloud
+ *
+ * The client's admin connection comes from TENANT_DB_ADMIN_URL in the
+ * environment, never from an argument, so it stays out of shell history and
+ * process listings. The roles this script creates get fresh random passwords;
+ * the one the app needs is sealed into the registry and never printed.
+ */
+import { readdir, readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { randomBytes } from "node:crypto";
+import postgres from "postgres";
+import { eq, isNull } from "drizzle-orm";
+import { platformDb, dbFor, forgetTenantDb } from "../client";
+import { sealSecret } from "../secrets";
+import { agentTemplates, organizations, plans, programTemplates, roles, tenantDatabases } from "../schema";
+import { env } from "./env";
+
+const migrationsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../migrations");
+const command = process.argv[2] ?? "";
+const arg = (name: string, fallback = "") => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i > 0 ? (process.argv[i + 1] ?? fallback) : fallback;
+};
+const password = () => randomBytes(24).toString("base64url");
+
+async function org(slug: string) {
+  const [row] = await platformDb().select().from(organizations).where(eq(organizations.slug, slug));
+  if (!row) throw new Error(`No client with the address "${slug}". Create them in the console first.`);
+  if (row.kind !== "client") throw new Error(`"${slug}" is not a client workspace.`);
+  return row;
+}
+
+/** Applies every migration to a database that has none of them. */
+async function migrate(sql: postgres.Sql): Promise<number> {
+  await sql`create table if not exists schema_migrations (version text primary key, applied_at timestamptz not null default now())`;
+  const done = new Set((await sql<{ version: string }[]>`select version from schema_migrations`).map((r) => r.version));
+  const files = (await readdir(migrationsDir)).filter((f) => f.endsWith(".sql")).sort();
+  let applied = 0;
+  for (const f of files) {
+    if (done.has(f)) continue;
+    const body = await readFile(path.join(migrationsDir, f), "utf8");
+    await sql.begin(async (tx) => {
+      await tx.unsafe("set local lock_timeout = '5s'");
+      await tx.unsafe(body);
+      await tx`insert into schema_migrations (version) values (${f})`;
+    });
+    applied++;
+  }
+  return applied;
+}
+
+async function provision() {
+  const slug = arg("tenant");
+  const host = arg("host");
+  const port = Number(arg("port", "5432"));
+  if (!slug || !host) throw new Error("need --tenant <address> and --host <their server>");
+  const client = await org(slug);
+  const label = arg("label", client.name);
+  const database = arg("database", `jenai_${slug.replace(/-/g, "_")}`);
+  const adminUrl = env("TENANT_DB_ADMIN_URL");
+
+  const creds = { owner: password(), app: password(), platform: password() };
+  const admin = postgres(adminUrl, { max: 1, onnotice: () => {} });
+  console.log(`\n${label}: preparing ${database} on ${host}:${port}`);
+  try {
+    for (const [role, attrs, pw] of [
+      ["jenai_owner", "nobypassrls", creds.owner],
+      ["jenai_app", "nobypassrls", creds.app],
+      ["jenai_platform", "bypassrls", creds.platform],
+    ] as const) {
+      const [exists] = await admin`select 1 from pg_roles where rolname = ${role}`;
+      const stmt = `${exists ? "alter" : "create"} role "${role}" with login ${attrs} password '${pw.replace(/'/g, "''")}'`;
+      await admin.unsafe(stmt);
+    }
+    await admin.unsafe(`grant "jenai_platform" to "jenai_owner"`);
+    const [who] = await admin<{ me: string }[]>`select current_user as me`;
+    for (const role of ["jenai_owner", "jenai_app", "jenai_platform"]) {
+      if (role === who!.me) continue;
+      await admin.unsafe(`grant "${role}" to "${who!.me}" with set true`).catch(() => admin.unsafe(`grant "${role}" to "${who!.me}"`).catch(() => undefined));
+    }
+    const [db] = await admin`select 1 from pg_database where datname = ${database}`;
+    if (!db) await admin.unsafe(`create database "${database}" owner "jenai_owner"`);
+    console.log(`  roles ready, database ${db ? "already existed" : "created"}`);
+  } finally {
+    await admin.end();
+  }
+
+  // Schema, as the owner, over TLS.
+  const u = new URL(adminUrl);
+  const ownerUrl = `postgres://jenai_owner:${encodeURIComponent(creds.owner)}@${host}:${port}/${database}?sslmode=require`;
+  const owner = postgres(ownerUrl, { max: 1, onnotice: () => {}, ssl: { rejectUnauthorized: false } });
+  let version = 0;
+  try {
+    const applied = await migrate(owner);
+    const files = (await readdir(migrationsDir)).filter((f) => f.endsWith(".sql")).sort();
+    version = files.length;
+    console.log(`  schema: ${applied} migration(s) applied, now at ${version}`);
+
+    // Their tables key off organizations and the shared catalogues, so those
+    // rows travel with them, keeping the same ids so references still resolve.
+    const platform = platformDb();
+    const parent = client.parentId ? (await platform.select().from(organizations).where(eq(organizations.id, client.parentId)))[0] : null;
+    const builtInRoles = await platform.select().from(roles).where(isNull(roles.tenantId));
+    const [planRows, templateRows, programRows] = await Promise.all([
+      platform.select().from(plans),
+      platform.select().from(agentTemplates),
+      platform.select().from(programTemplates),
+    ]);
+    await owner.begin(async (tx) => {
+      for (const o of [parent, client].filter(Boolean)) {
+        await tx`insert into organizations ${tx(o as Record<string, unknown>)} on conflict (id) do nothing`;
+      }
+      for (const r of builtInRoles) await tx`insert into roles ${tx(r as Record<string, unknown>)} on conflict (id) do nothing`;
+      for (const p of planRows) await tx`insert into plans ${tx(p as Record<string, unknown>)} on conflict (key) do nothing`;
+      for (const t of templateRows) await tx`insert into agent_templates ${tx(t as Record<string, unknown>)} on conflict do nothing`;
+      for (const g of programRows) await tx`insert into program_templates ${tx(g as Record<string, unknown>)} on conflict do nothing`;
+    });
+    console.log(`  catalogues copied: ${builtInRoles.length} roles, ${planRows.length} plans, ${templateRows.length} agent templates, ${programRows.length} programs`);
+  } finally {
+    await owner.end();
+  }
+
+  await platformDb()
+    .insert(tenantDatabases)
+    .values({
+      tenantId: client.id, label, host, port, database, username: "jenai_app",
+      secret: sealSecret(client.id, "tenant_db", creds.app),
+      sslmode: arg("sslmode", "verify-full"), status: "ready", schemaVersion: version, lastOkAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: tenantDatabases.tenantId,
+      set: { label, host, port, database, username: "jenai_app", secret: sealSecret(client.id, "tenant_db", creds.app), status: "ready", schemaVersion: version, lastOkAt: new Date(), lastError: null, updatedAt: new Date() },
+    });
+  await forgetTenantDb(client.id);
+  console.log(`  registered. ${label}'s records now live on ${host}, not ours.`);
+  console.log(`  admin URL used: ${u.protocol}//${u.username}@${u.host} (password not shown)\n`);
+  await check();
+}
+
+async function check() {
+  const slug = arg("tenant");
+  const client = await org(slug);
+  const [row] = await platformDb().select().from(tenantDatabases).where(eq(tenantDatabases.tenantId, client.id));
+  if (!row) return console.log(`${client.name} uses the shared database.`);
+  try {
+    const db = await dbFor(client.id);
+    const [there] = await db.select({ slug: organizations.slug }).from(organizations).where(eq(organizations.id, client.id));
+    const ok = there?.slug === slug;
+    await platformDb().update(tenantDatabases).set(ok ? { status: "ready", lastOkAt: new Date(), lastError: null } : { status: "unreachable", lastError: "their database does not carry this client's own row" }).where(eq(tenantDatabases.tenantId, client.id));
+    console.log(ok
+      ? `${row.label}: reachable on ${row.host}:${row.port}/${row.database}, schema ${row.schemaVersion}, TLS ${row.sslmode}.`
+      : `${row.label}: connected, but their database does not carry this client's own row.`);
+  } catch (e) {
+    await platformDb().update(tenantDatabases).set({ status: "unreachable", lastError: String((e as Error).message).slice(0, 300) }).where(eq(tenantDatabases.tenantId, client.id));
+    console.log(`${row.label}: NOT reachable. ${(e as Error).message}`);
+  }
+}
+
+async function disable() {
+  const client = await org(arg("tenant"));
+  await platformDb().update(tenantDatabases).set({ status: "disabled", updatedAt: new Date() }).where(eq(tenantDatabases.tenantId, client.id));
+  await forgetTenantDb(client.id);
+  console.log(`${client.name} is back on the shared database. Their own server still holds the rows; nothing was deleted.`);
+}
+
+const run = { provision, check, disable }[command as "provision" | "check" | "disable"];
+if (!run) {
+  console.log("usage: tenant-db <provision|check|disable> --tenant <address> [--host <server>] [--port 5432] [--database <name>] [--label <name>]");
+  process.exit(1);
+}
+await run();
+process.exit(0);

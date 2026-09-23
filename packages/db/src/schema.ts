@@ -1068,3 +1068,27 @@ export const appointments = pgTable(
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
 export type Appointment = typeof appointments.$inferSelect;
+
+// ---------------------------------------------------- client-hosted data (0016)
+/**
+ * Clients who keep their own records on their own Postgres. Platform-level on
+ * purpose: this is the map to everyone else's databases, so it never moves.
+ */
+export const tenantDatabases = pgTable("tenant_databases", {
+  tenantId: uuid("tenant_id").primaryKey(),
+  label: text("label").notNull(),
+  host: text("host").notNull(),
+  port: integer("port").notNull().default(5432),
+  database: text("database").notNull(),
+  username: text("username").notNull(),
+  /** Sealed with sealSecret(tenantId, "tenant_db"). Never logged. */
+  secret: text("secret").notNull(),
+  sslmode: text("sslmode").notNull().default("verify-full"),
+  caCertificate: text("ca_certificate"),
+  status: text("status").notNull().default("pending"),
+  schemaVersion: integer("schema_version").notNull().default(0),
+  lastOkAt: ts("last_ok_at"),
+  lastError: text("last_error"),
+  createdAt: ts("created_at").notNull().defaultNow(),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+});
