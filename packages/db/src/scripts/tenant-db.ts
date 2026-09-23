@@ -127,7 +127,14 @@ async function provision() {
       platform.select().from(agentTemplates),
       platform.select().from(programTemplates),
     ]);
+    // These tables are seeded, not written by a tenant, and row-level security
+    // has no tenant to check them against: the organizations policy admits only
+    // a row whose id is the current tenant, and built-in roles carry no tenant
+    // at all. The owner owns these tables, so lifting FORCE lets it seed them
+    // and nothing else changes. Restored in the same transaction, always.
+    const guarded = ["organizations", "roles"] as const;
     await owner.begin(async (tx) => {
+      for (const t of guarded) await tx.unsafe(`alter table ${t} no force row level security`);
       for (const o of [parent, client].filter(Boolean)) {
         await tx`insert into organizations ${tx(columns(o as Record<string, unknown>))} on conflict (id) do nothing`;
       }
@@ -135,7 +142,14 @@ async function provision() {
       for (const p of planRows) await tx`insert into plans ${tx(columns(p as Record<string, unknown>))} on conflict (key) do nothing`;
       for (const t of templateRows) await tx`insert into agent_templates ${tx(columns(t as Record<string, unknown>))} on conflict do nothing`;
       for (const g of programRows) await tx`insert into program_templates ${tx(columns(g as Record<string, unknown>))} on conflict do nothing`;
+      for (const t of guarded) await tx.unsafe(`alter table ${t} force row level security`);
     });
+    // Belt and braces: if anything above threw, the transaction rolled the
+    // tables back with it, but say so out loud rather than assume.
+    const [still] = await owner<{ forced: boolean }[]>`
+      select bool_and(relforcerowsecurity) as forced from pg_class
+      where relname in ('organizations', 'roles') and relnamespace = 'public'::regnamespace`;
+    if (!still?.forced) throw new Error("row-level security was left off on their database; refusing to continue");
     console.log(`  catalogues copied: ${builtInRoles.length} roles, ${planRows.length} plans, ${templateRows.length} agent templates, ${programRows.length} programs`);
   } finally {
     await owner.end();
