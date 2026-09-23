@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import postgres from "postgres";
 import { eq, isNull } from "drizzle-orm";
-import { platformDb, forgetTenantDb, withTenant } from "../client";
+import { appDb, dbFor, platformDb, forgetTenantDb, withTenant, sql } from "../client";
 import { sealSecret } from "../secrets";
 import { agentTemplates, organizations, plans, programTemplates, roles, tenantDatabases } from "../schema";
 import { env } from "./env";
@@ -172,6 +172,56 @@ async function provision() {
   await check();
 }
 
+
+/**
+ * Tenant-owned tables, in an order that satisfies their references. Rows are
+ * copied with the app role inside a tenant transaction, exactly as the
+ * application writes them, so row-level security stays on throughout and a row
+ * belonging to anyone else cannot travel by accident.
+ *
+ * audit_events and outbox are deliberately absent: the audit log is a hash
+ * chain, and re-inserting links elsewhere would either break it or quietly
+ * rewrite history. A client's chain stays where it was written.
+ */
+const TENANT_TABLES = [
+  "branches", "teams", "memberships", "team_members", "roles", "role_bindings",
+  "invitations", "api_keys", "provisioning_steps", "support_grants", "subscriptions",
+  "carrier_accounts", "phone_numbers", "voice_connections", "agents", "agent_versions",
+  "contacts", "consents", "suppressions", "client_programs", "campaigns", "campaign_targets",
+  "calls", "dial_attempts", "leads", "resources", "appointments",
+  "integrations", "integration_events", "external_links",
+  "security_events", "security_alerts", "agent_safety_checks",
+] as const;
+
+/** Copies one client's existing rows from the shared database onto their own. */
+async function move() {
+  const client = await org(arg("tenant"));
+  const [row] = await platformDb().select().from(tenantDatabases).where(eq(tenantDatabases.tenantId, client.id));
+  if (!row) throw new Error(`${client.name} is not on their own database yet. Provision first.`);
+
+  const shared = appDb();
+  const theirs = await dbFor(client.id);
+  if (shared === theirs) throw new Error("routing still points at the shared database; nothing to move");
+
+  let moved = 0;
+  const report: string[] = [];
+  for (const table of TENANT_TABLES) {
+    const rows = await withTenant(client.id, (tx) => tx.execute(sql.raw(`select * from ${table}`)), shared);
+    if (!rows.length) continue;
+    await withTenant(client.id, async (tx) => {
+      for (const r of rows as Record<string, unknown>[]) {
+        const cols = Object.keys(r);
+        const names = sql.raw(cols.map((c) => `"${c}"`).join(", "));
+        const values = sql.join(cols.map((c) => sql`${r[c]}`), sql`, `);
+        await tx.execute(sql`insert into ${sql.raw(table)} (${names}) values (${values}) on conflict do nothing`);
+      }
+    }, theirs);
+    report.push(`${table} ${rows.length}`);
+    moved += rows.length;
+  }
+  console.log(moved ? `Moved ${moved} row(s) to ${row.label}: ${report.join(", ")}` : "Nothing to move.");
+}
+
 async function check() {
   const slug = arg("tenant");
   const client = await org(slug);
@@ -203,9 +253,9 @@ async function disable() {
   console.log(`${client.name} is back on the shared database. Their own server still holds the rows; nothing was deleted.`);
 }
 
-const run = { provision, check, disable }[command as "provision" | "check" | "disable"];
+const run = { provision, check, disable, move }[command as "provision" | "check" | "disable" | "move"];
 if (!run) {
-  console.log("usage: tenant-db <provision|check|disable> --tenant <address> [--host <server>] [--port 5432] [--database <name>] [--label <name>]");
+  console.log("usage: tenant-db <provision|check|disable|move> --tenant <address> [--host <server>] [--port 5432] [--database <name>] [--label <name>]");
   process.exit(1);
 }
 await run();
