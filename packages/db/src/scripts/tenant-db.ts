@@ -29,6 +29,15 @@ const arg = (name: string, fallback = "") => {
 };
 const password = () => randomBytes(24).toString("base64url");
 
+/**
+ * Rows come back from the query with the property names the code uses
+ * (parentId, createdAt); the columns they go back into are named the way SQL
+ * writes them (parent_id, created_at). Translate before inserting.
+ */
+function columns(row: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(row).map(([k, v]) => [k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`), v]));
+}
+
 async function org(slug: string) {
   const [row] = await platformDb().select().from(organizations).where(eq(organizations.slug, slug));
   if (!row) throw new Error(`No client with the address "${slug}". Create them in the console first.`);
@@ -120,12 +129,12 @@ async function provision() {
     ]);
     await owner.begin(async (tx) => {
       for (const o of [parent, client].filter(Boolean)) {
-        await tx`insert into organizations ${tx(o as Record<string, unknown>)} on conflict (id) do nothing`;
+        await tx`insert into organizations ${tx(columns(o as Record<string, unknown>))} on conflict (id) do nothing`;
       }
-      for (const r of builtInRoles) await tx`insert into roles ${tx(r as Record<string, unknown>)} on conflict (id) do nothing`;
-      for (const p of planRows) await tx`insert into plans ${tx(p as Record<string, unknown>)} on conflict (key) do nothing`;
-      for (const t of templateRows) await tx`insert into agent_templates ${tx(t as Record<string, unknown>)} on conflict do nothing`;
-      for (const g of programRows) await tx`insert into program_templates ${tx(g as Record<string, unknown>)} on conflict do nothing`;
+      for (const r of builtInRoles) await tx`insert into roles ${tx(columns(r as Record<string, unknown>))} on conflict (id) do nothing`;
+      for (const p of planRows) await tx`insert into plans ${tx(columns(p as Record<string, unknown>))} on conflict (key) do nothing`;
+      for (const t of templateRows) await tx`insert into agent_templates ${tx(columns(t as Record<string, unknown>))} on conflict do nothing`;
+      for (const g of programRows) await tx`insert into program_templates ${tx(columns(g as Record<string, unknown>))} on conflict do nothing`;
     });
     console.log(`  catalogues copied: ${builtInRoles.length} roles, ${planRows.length} plans, ${templateRows.length} agent templates, ${programRows.length} programs`);
   } finally {
