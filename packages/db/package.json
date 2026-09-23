@@ -18,7 +18,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "seed:platform": "tsx src/scripts/seed-platform.ts",
-    "tenant-db": "tsx src/scripts/tenant-db.ts"
+    "tenant-db": "tsx src/scripts/tenant-db.ts",
+    "client": "tsx src/scripts/client.ts"
   },
   "dependencies": {
     "@jenai/authz": "workspace:*",
