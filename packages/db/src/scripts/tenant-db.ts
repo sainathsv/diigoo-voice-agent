@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import postgres from "postgres";
 import { eq, isNull } from "drizzle-orm";
-import { platformDb, dbFor, forgetTenantDb } from "../client";
+import { platformDb, forgetTenantDb, withTenant } from "../client";
 import { sealSecret } from "../secrets";
 import { agentTemplates, organizations, plans, programTemplates, roles, tenantDatabases } from "../schema";
 import { env } from "./env";
@@ -178,8 +178,13 @@ async function check() {
   const [row] = await platformDb().select().from(tenantDatabases).where(eq(tenantDatabases.tenantId, client.id));
   if (!row) return console.log(`${client.name} uses the shared database.`);
   try {
-    const db = await dbFor(client.id);
-    const [there] = await db.select({ slug: organizations.slug }).from(organizations).where(eq(organizations.id, client.id));
+    // Read it back the way the application does: as the app role, inside a
+    // tenant-scoped transaction. Row-level security hides everything from a
+    // connection that has not said which tenant it is acting for, so a read
+    // without that context proves nothing.
+    const [there] = await withTenant(client.id, (tx) =>
+      tx.select({ slug: organizations.slug }).from(organizations).where(eq(organizations.id, client.id)),
+    );
     const ok = there?.slug === slug;
     await platformDb().update(tenantDatabases).set(ok ? { status: "ready", lastOkAt: new Date(), lastError: null } : { status: "unreachable", lastError: "their database does not carry this client's own row" }).where(eq(tenantDatabases.tenantId, client.id));
     console.log(ok
