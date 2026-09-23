@@ -12,14 +12,14 @@ import { applyMapping, retryable, type Connector, type ConnectorContext, type Ou
  * .in, others .com, .eu, .com.au, .jp.
  */
 
-const ACCOUNTS: Record<string, string> = {
+export const ACCOUNTS: Record<string, string> = {
   in: "https://accounts.zoho.in",
   com: "https://accounts.zoho.com",
   eu: "https://accounts.zoho.eu",
   au: "https://accounts.zoho.com.au",
   jp: "https://accounts.zoho.jp",
 };
-const API: Record<string, string> = {
+export const API: Record<string, string> = {
   in: "https://www.zohoapis.in",
   com: "https://www.zohoapis.com",
   eu: "https://www.zohoapis.eu",

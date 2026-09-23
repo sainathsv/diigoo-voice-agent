@@ -19,14 +19,16 @@
     "test": "vitest run",
     "seed:platform": "tsx src/scripts/seed-platform.ts",
     "tenant-db": "tsx src/scripts/tenant-db.ts",
-    "client": "tsx src/scripts/client.ts"
+    "client": "tsx src/scripts/client.ts",
+    "zoho": "tsx src/scripts/zoho.ts"
   },
   "dependencies": {
     "@jenai/authz": "workspace:*",
     "better-auth": "1.7.5",
     "dotenv": "17.4.2",
     "drizzle-orm": "0.45.2",
-    "postgres": "3.4.9"
+    "postgres": "3.4.9",
+    "@jenai/engine": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "22.20.4",
