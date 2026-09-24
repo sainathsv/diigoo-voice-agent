@@ -31,8 +31,9 @@ export function InviteForm({
           <input className="input" id="inv-name" name="name" placeholder="Priya Reddy" />
         </div>
         <div>
-          <label className="label" htmlFor="inv-email">Work email</label>
-          <input className="input" id="inv-email" name="email" type="email" required placeholder="priya@clinic.in" />
+          <label className="label" htmlFor="inv-email">Username or work email</label>
+          <input className="input" id="inv-email" name="email" type="text" inputMode="email" required placeholder="priya@clinic.in" />
+          <p className="help">A username like front_desk works for a shared login with no mailbox.</p>
         </div>
         <div>
           <label className="label" htmlFor="inv-role">Role</label>
@@ -53,8 +54,17 @@ export function InviteForm({
           </select>
           <p className="help">Front desk, branch managers and doctors work in one branch.</p>
         </div>
+        <div>
+          <label className="label" htmlFor="inv-password">Password (optional)</label>
+          <input className="input" id="inv-password" name="password" type="password" autoComplete="new-password" minLength={10} placeholder="Leave blank to send them a link" />
+          <p className="help">
+            Leave this blank and they get a link and choose their own, which is better whenever they have an email.
+            Set one and the login works straight away: for a shared front desk with no mailbox to send a link to.
+            Either way the activity log records who set it.
+          </p>
+        </div>
       </div>
-      <div><SubmitButton pendingText="Creating invitation">Create invitation</SubmitButton></div>
+      <div><SubmitButton pendingText="Creating the login">Create login</SubmitButton></div>
     </form>
   );
 }

@@ -7,6 +7,7 @@ import { addRoleBinding, removeRoleBinding, revokeInvitation, setMemberStatus } 
 import { loadTeam } from "@/server/queries/workspace";
 import { InviteForm } from "./invite-form";
 import { deny } from "@/server/security-log";
+import { displayLogin } from "@jenai/authz";
 
 export const metadata: Metadata = { title: "Team" };
 
@@ -47,7 +48,7 @@ export default async function TeamPage({ params, searchParams }: { params: Promi
                             <Avatar name={m.name} />
                             <div>
                               <div className="font-semibold">{m.name}{self ? <span className="ml-1.5 text-[12px] font-normal text-grey">(you)</span> : null}</div>
-                              <div className="text-[12.5px] text-grey">{m.email}</div>
+                              <div className="text-[12.5px] text-grey">{displayLogin(m.email)}</div>
                             </div>
                           </div>
                         </td>
@@ -131,7 +132,7 @@ export default async function TeamPage({ params, searchParams }: { params: Promi
                 <tbody>
                   {t.pending.map((i) => (
                     <tr key={i.id}>
-                      <td><div className="font-semibold">{i.name ?? i.email}</div><div className="text-[12.5px] text-grey">{i.email}</div></td>
+                      <td><div className="font-semibold">{i.name ?? displayLogin(i.email)}</div><div className="text-[12.5px] text-grey">{displayLogin(i.email)}</div></td>
                       <td>{i.roleName} · {branchName(i.branchId)}</td>
                       <td>{fmtDate(i.expiresAt)}</td>
                       {canInvite ? (

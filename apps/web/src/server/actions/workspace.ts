@@ -2,9 +2,9 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import { z } from "zod";
-import { ALL_CLIENT_PERMISSIONS, can, type AccessContext, type Target, privilegedIn } from "@jenai/authz";
+import { ALL_CLIENT_PERMISSIONS, USERNAME_PATTERN, can, displayLogin, isUsername, toLoginEmail, type AccessContext, type Target, privilegedIn } from "@jenai/authz";
 import {
   audit,
   branches,
@@ -19,7 +19,7 @@ import {
   type Tx,
 } from "@jenai/db";
 import { actorFields, requireWorkspace, workspaceAction, type WorkspaceCtx } from "../access";
-import { createInvitation } from "../invitations";
+import { createInvitation, hashToken } from "../invitations";
 import { requestMeta } from "../session";
 
 export type FormState = { ok?: string; error?: string; link?: string } | null;
@@ -51,16 +51,38 @@ async function meta(ctx: WorkspaceCtx) {
 
 const inviteSchema = z.object({
   slug: z.string(),
-  email: z.email().max(200),
+  /**
+   * A work email, or a username for someone who has none: a shared front desk,
+   * an office, a site with no mailbox of its own. A username resolves to an
+   * account under the reserved login domain, and the person still chooses their
+   * own password from the invitation link, so no password is ever set for them.
+   */
+  email: z
+    .string()
+    .trim()
+    .max(200)
+    .refine((v) => (isUsername(v) ? USERNAME_PATTERN.test(v) : z.email().safeParse(v).success),
+      "Enter a work email, or a username of 3 to 40 letters, digits, dot, dash or underscore."),
   name: z.string().trim().max(120).optional(),
   roleId: z.uuid(),
   branchId: z.union([z.uuid(), z.literal("")]).optional(),
+  /**
+   * Optional. Left blank, the person follows the invitation link and chooses
+   * their own password, which is the better path whenever they have an email.
+   * Filled in, the workspace owner sets their first one: the case this exists
+   * for is a shared front desk or an office with no mailbox to send a link to.
+   * Who set it is written to the activity log either way.
+   */
+  password: z.union([z.literal(""), z.string().min(10, "A password needs at least 10 characters.").max(128)]).optional(),
 });
 
 export async function inviteMember(_: FormState, fd: FormData): Promise<FormState> {
   const parsed = inviteSchema.safeParse(Object.fromEntries(fd));
-  if (!parsed.success) return { error: "Check the email address and role." };
-  const { slug, email, name, roleId } = parsed.data;
+  if (!parsed.success) return { error: parsed.error.issues[0]?.message ?? "Check the username or email, and the role." };
+  const { slug, name, roleId } = parsed.data;
+  const password = parsed.data.password || "";
+  const typed = parsed.data.email;
+  const email = toLoginEmail(typed);
   const branchId = parsed.data.branchId || null;
   try {
     const ctx = await workspaceAction(slug, "users:invite", { branchId });
@@ -75,12 +97,30 @@ export async function inviteMember(_: FormState, fd: FormData): Promise<FormStat
         .where(eq(user.email, email.toLowerCase()));
       if (existing) throw new Error("That person is already on this team. Change their roles instead.");
       const inv = await createInvitation(tx, { tenantId: ctx.org.id, email, name, roleId, branchId, invitedBy: ctx.user.userId });
+      // With a password supplied there is nobody to send a link to, so the
+      // account is made here and the invitation is spent immediately, through
+      // the same function the invitation page calls. The password is hashed by
+      // the auth layer and never stored or logged anywhere else.
+      if (password) {
+        const auth = (await import("../../lib/auth")).auth;
+        const actx = await auth.$context;
+        const created = await actx.internalAdapter.createUser({ email, name: name || displayLogin(email), emailVerified: true }, { method: "email-password" });
+        await actx.internalAdapter.linkAccount({
+          userId: created.id,
+          providerId: "credential",
+          accountId: created.id,
+          password: await actx.password.hash(password),
+        });
+        await tx.execute(sql`select lookup.accept_invitation(${hashToken(inv.url.split("/").pop()!)}, ${created.id})`);
+      }
       await audit(tx, {
         ...(await meta(ctx)),
-        action: "member.invited",
+        action: password ? "member.added" : "member.invited",
         targetType: "invitation",
         targetId: inv.id,
-        summary: `Invited ${email} as ${role.name}`,
+        summary: password
+          ? `Added ${displayLogin(email)} as ${role.name}, with a password set by ${ctx.user.email ?? "an admin"}`
+          : `Invited ${displayLogin(email)} as ${role.name}`,
         diff: { roleKey: role.key, roleName: role.name, branchId, privileged: privilegedIn(role.permissions) },
       });
       return inv.url;
