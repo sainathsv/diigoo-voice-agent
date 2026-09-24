@@ -10,8 +10,8 @@
  */
 import "./env";
 import { eq, and } from "drizzle-orm";
-import { exchangeGrantCode } from "@jenai/engine";
-import { integrations, organizations, platformDb, sealSecret, withTenant } from "../index";
+import { exchangeGrantCode, sealCredentials } from "@jenai/engine";
+import { integrations, organizations, platformDb, withTenant } from "../index";
 
 const arg = (name: string, fallback = "") => {
   const i = process.argv.indexOf(`--${name}`);
@@ -35,13 +35,15 @@ async function connect() {
   const t = await exchangeGrantCode({ dc, clientId: need("ZOHO_CLIENT_ID"), clientSecret: need("ZOHO_CLIENT_SECRET"), code: need("ZOHO_CODE") });
   console.log(`  got a refresh token${t.apiDomain ? `, api domain ${t.apiDomain}` : ""}`);
 
-  const credentials = sealSecret(org.id, "integration", JSON.stringify({
+  // sealCredentials, never sealSecret by hand: the purpose is part of the seal,
+  // and a mismatch stores a blob nothing can open.
+  const credentials = sealCredentials(org.id, {
     client_id: need("ZOHO_CLIENT_ID"),
     client_secret: need("ZOHO_CLIENT_SECRET"),
     refresh_token: t.refreshToken,
     access_token: t.accessToken,
     access_token_until: String(Date.now() + t.expiresIn * 1000),
-  }));
+  });
 
   await withTenant(org.id, async (tx) => {
     const [existing] = await tx.select().from(integrations).where(and(eq(integrations.kind, "zoho_crm"), eq(integrations.tenantId, org.id)));

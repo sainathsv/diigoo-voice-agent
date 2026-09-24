@@ -24,8 +24,13 @@ export function credentialsOf(i: Integration): Record<string, string> {
   if (!i.credentials) return {};
   try {
     return JSON.parse(openSecret(i.tenantId, PURPOSE, i.credentials)) as Record<string, string>;
-  } catch {
-    return {};
+  } catch (e) {
+    // Never quietly become "no credentials". A stored secret that will not open
+    // means it was sealed wrongly, or for another tenant, or has been tampered
+    // with, and the far end then reports something unrelated: Zoho answers
+    // invalid_client when it is handed an empty client id, which reads like the
+    // client's mistake rather than ours.
+    throw new Error(`${i.name}: the stored credentials could not be opened (${(e as Error).message}). Reconnect this integration.`);
   }
 }
 
