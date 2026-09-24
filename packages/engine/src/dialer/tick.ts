@@ -22,7 +22,7 @@ import {
   type Campaign,
   type Tx,
 } from "@jenai/db";
-import { entitlements } from "../plans";
+import { entitlements, planGate } from "../plans";
 import { voiceClient } from "../voice-conn";
 import { decide, nextAttempt, type Outcome, type Purpose } from "./policy";
 import { DograhGateway, SimulatedGateway, type DialGateway } from "./gateway";
@@ -72,7 +72,10 @@ export async function policyFacts(tx: Tx, c: Campaign, phone: string, now: Date)
     .select({ n: sql<number>`count(*)::int` })
     .from(dialAttempts)
     .where(and(eq(dialAttempts.phoneE164, phone), eq(dialAttempts.decision, "dial"), gte(dialAttempts.createdAt, midnight)));
-  return { suppressions: supp, consents: cons, hasRelationship: !!rel, attemptsToday: n };
+  // The workspace's own allowance travels with the contact's facts, so every
+  // caller of decide() is covered by it without having to remember.
+  const plan = await planGate(tx, c.tenantId, now);
+  return { suppressions: supp, consents: cons, hasRelationship: !!rel, attemptsToday: n, plan };
 }
 
 /** Record how a dial ended and schedule the next attempt (or finish the target). */

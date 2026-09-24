@@ -16,6 +16,7 @@ const base = (over: Partial<PolicyInput> = {}): PolicyInput => ({
   consents: [{ purpose: "service", status: "granted", expiresAt: null }],
   hasRelationship: false,
   attemptsToday: 0,
+  plan: { outboundToday: 0, outboundPerDay: null, endsOn: null, name: "Growth" },
   ...over,
 });
 
@@ -112,5 +113,53 @@ describe("nextAttempt()", () => {
   it("honours a requested callback time", () => {
     const at = zoned(2026, 9, 18, 16 * 60, TZ);
     expect(nextAttempt("callback", 1, THU_11, W, TZ, at)!.toISOString()).toBe(at.toISOString());
+  });
+});
+
+describe("what the plan allows", () => {
+  const demo = (over: Partial<PolicyInput["plan"]> = {}) =>
+    base({ plan: { outboundToday: 0, outboundPerDay: 30, endsOn: "2026-10-17", name: "Demo", ...over } });
+
+  it("dials while the day's allowance is unspent", () => {
+    expect(decide(demo({ outboundToday: 29 })).action).toBe("dial");
+  });
+
+  it("stops at the allowance and waits for the next Indian day, not the next UTC one", () => {
+    const d = decide(demo({ outboundToday: 30 }));
+    expect(d.action).toBe("defer");
+    if (d.action !== "defer") throw new Error("expected a defer");
+    expect(d.reason).toContain("30 outbound calls a day");
+    // 11:00 IST on the 17th, so the allowance comes back at midnight IST on the 18th.
+    expect(d.until.toISOString()).toBe(zoned(2026, 9, 18, 0, TZ).toISOString());
+  });
+
+  it("keeps refusing once past the allowance, however far past", () => {
+    expect(decide(demo({ outboundToday: 400 })).action).toBe("defer");
+  });
+
+  it("stops entirely the day after the plan ends", () => {
+    const d = decide(demo({ endsOn: "2026-09-16" }));
+    expect(d.action).toBe("skip");
+    if (d.action !== "skip") throw new Error("expected a skip");
+    expect(d.code).toBe("plan_expired");
+  });
+
+  it("still runs on the last day of the plan", () => {
+    expect(decide(demo({ endsOn: "2026-09-17" })).action).toBe("dial");
+  });
+
+  it("checks the workspace before the contact, so being out of plan burns no attempt", () => {
+    // Everything about this contact is also wrong; the plan must answer first,
+    // otherwise the caller records an attempt against someone we never called.
+    const d = decide(base({
+      plan: { outboundToday: 30, outboundPerDay: 30, endsOn: null, name: "Demo" },
+      target: { attemptNo: 99 },
+      suppressions: [{ reason: "opt_out", scope: null, expiresAt: null }],
+    }));
+    expect(d.action).toBe("defer");
+  });
+
+  it("does not cap a plan that has no daily allowance", () => {
+    expect(decide(base({ plan: { outboundToday: 9999, outboundPerDay: null, endsOn: null, name: "Growth" } })).action).toBe("dial");
   });
 });

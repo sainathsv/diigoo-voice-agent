@@ -8,6 +8,24 @@ import type { Plan } from "./schema";
  */
 export const PLAN_CATALOG: Array<Omit<Plan, "updatedAt">> = [
   {
+    key: "demo",
+    name: "Demo",
+    description: "A month to try it on real calls: 30 inbound and 30 outbound a day, then the plan has to change.",
+    billingModel: "prepaid",
+    monthlyFeePaise: 0,
+    feeBasis: "per_workspace",
+    includedMinutes: 0,
+    overagePaisePerMin: null,
+    limits: {
+      branches: 1, phone_numbers: 1, concurrent_calls: 2, agents: 2, users: 5, campaigns_per_month: 2,
+      inbound_calls_per_day: 30, outbound_calls_per_day: 30,
+    },
+    features: ["inbound_ai", "leads", "outbound_campaigns", "integrations"],
+    isPublic: false,
+    active: true,
+    sort: 5,
+  },
+  {
     key: "trial",
     name: "Trial",
     description: "Try an AI receptionist on test calls before going live.",

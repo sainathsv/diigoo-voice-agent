@@ -4,6 +4,7 @@
  * reasons to skip are checked before reasons to wait.
  */
 import { inWindow, nextDayWindowStart, nextWindowStart, type Windows } from "./time";
+import { istDay, startOfNextIstDay } from "./time-ist";
 
 export type Purpose = "service" | "transactional" | "promotional";
 export type Series = "landline" | "mobile" | "series_140" | "series_1600" | "toll_free";
@@ -29,9 +30,26 @@ export interface PolicyInput {
   hasRelationship: boolean;
   /** Dial decisions for this phone in this client today (all campaigns). */
   attemptsToday: number;
+  /**
+   * The workspace's own allowance, not this contact's. A plan may cap how many
+   * calls a client may place in a day, and a demo or trial ends on a date.
+   * Both are checked here so every outbound path is covered by one rule:
+   * the campaign dialer and a call their own CRM asks for go through this.
+   */
+  plan: {
+    /** Outbound calls already placed by this client today (IST). */
+    outboundToday: number;
+    /** The plan's daily allowance, or null when the plan does not cap it. */
+    outboundPerDay: number | null;
+    /** The last day the subscription covers (yyyy-mm-dd, IST), or null when open-ended. */
+    endsOn: string | null;
+    name: string;
+  };
 }
 
 export type SkipCode =
+  | "plan_expired"
+  | "daily_cap"
   | "max_attempts"
   | "opted_out"
   | "dnd_registry"
@@ -48,8 +66,23 @@ export type Decision =
 
 const live = (expiresAt: Date | null, now: Date) => !expiresAt || expiresAt.getTime() > now.getTime();
 
+
+
 export function decide(i: PolicyInput): Decision {
   const { now, campaign: c } = i;
+
+  // The workspace's allowance is checked before anything about this contact:
+  // being out of plan is not the contact's fault and must not burn an attempt.
+  if (i.plan.endsOn && istDay(now) > i.plan.endsOn) {
+    return { action: "skip", code: "plan_expired", reason: `The ${i.plan.name} plan ended on ${i.plan.endsOn}. Calls resume when a plan is in place.` };
+  }
+  if (i.plan.outboundPerDay !== null && i.plan.outboundToday >= i.plan.outboundPerDay) {
+    return {
+      action: "defer",
+      until: startOfNextIstDay(now),
+      reason: `The ${i.plan.name} plan allows ${i.plan.outboundPerDay} outbound calls a day, and ${i.plan.outboundToday} have been placed today.`,
+    };
+  }
 
   if (c.status !== "running") return { action: "defer", until: new Date(now.getTime() + 5 * 60_000), reason: "Campaign is not running" };
 

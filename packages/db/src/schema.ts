@@ -348,6 +348,9 @@ export interface PlanLimits {
   agents?: number;
   users?: number;
   campaigns_per_month?: number;
+  /** Calls a day, counted per calendar day in IST. Absent means no daily cap. */
+  inbound_calls_per_day?: number;
+  outbound_calls_per_day?: number;
 }
 
 export const subscriptions = pgTable("subscriptions", {

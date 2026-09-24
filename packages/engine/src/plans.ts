@@ -1,5 +1,6 @@
 import { and, eq, gte, lt, sql } from "drizzle-orm";
-import { calls, plans, subscriptions, type Plan, type PlanLimits, type Subscription, type Tx } from "@jenai/db";
+import { calls, dialAttempts, plans, subscriptions, type Plan, type PlanLimits, type Subscription, type Tx } from "@jenai/db";
+import { istDay, startOfNextIstDay } from "./dialer/time-ist";
 
 export { PLAN_CATALOG } from "@jenai/db";
 
@@ -26,6 +27,8 @@ export const LIMIT_LABELS: Record<keyof PlanLimits, string> = {
   agents: "AI agents",
   users: "Team members",
   campaigns_per_month: "Campaigns per month",
+  inbound_calls_per_day: "Inbound calls a day",
+  outbound_calls_per_day: "Outbound calls a day",
 };
 
 export interface Entitlements {
@@ -151,3 +154,37 @@ export function statement(e: Entitlements, u: Usage, period: Statement["period"]
 
 export const rupees = (paise: number | null | undefined) =>
   paise == null ? "" : `₹${(paise / 100).toLocaleString("en-IN", { minimumFractionDigits: paise % 100 ? 2 : 0, maximumFractionDigits: 2 })}`;
+
+/**
+ * What the plan allows this workspace right now: how much of today's outbound
+ * allowance is spent, and whether the subscription still runs.
+ *
+ * Counted from dial attempts rather than call records, because an attempt is
+ * written the moment we decide to dial. Call records arrive on the next sync,
+ * which is minutes later, and a cap that lags by minutes is not a cap.
+ */
+export async function planGate(tx: Tx, tenantId: string, now: Date) {
+  const e = await entitlements(tx, tenantId);
+  const perDay = e.limits.outbound_calls_per_day ?? null;
+  const endsOn = e.subscription?.endsOn ?? null;
+  if (perDay === null) return { outboundToday: 0, outboundPerDay: null, endsOn, name: e.plan.name };
+
+  const midnight = new Date(startOfNextIstDay(now).getTime() - 86_400_000);
+  const [{ n } = { n: 0 }] = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(dialAttempts)
+    .where(and(eq(dialAttempts.tenantId, tenantId), eq(dialAttempts.decision, "dial"), gte(dialAttempts.createdAt, midnight)));
+  return { outboundToday: n, outboundPerDay: perDay, endsOn, name: e.plan.name };
+}
+
+/** Inbound calls this workspace has already taken today, and what it is allowed. */
+export async function inboundToday(tx: Tx, tenantId: string, now: Date) {
+  const e = await entitlements(tx, tenantId);
+  const perDay = e.limits.inbound_calls_per_day ?? null;
+  const midnight = new Date(startOfNextIstDay(now).getTime() - 86_400_000);
+  const [{ n } = { n: 0 }] = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(calls)
+    .where(and(eq(calls.tenantId, tenantId), eq(calls.direction, "inbound"), gte(calls.startedAt, midnight)));
+  return { used: n, perDay, day: istDay(now), overBy: perDay === null ? 0 : Math.max(0, n - perDay), plan: e.plan.name };
+}

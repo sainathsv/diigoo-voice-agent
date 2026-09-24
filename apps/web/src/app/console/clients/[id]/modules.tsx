@@ -1,6 +1,6 @@
 import { desc, eq } from "drizzle-orm";
-import { agentVersions, agents, branches, carrierAccounts, phoneNumbers, plans, platformDb, subscriptions, voiceConnections, withTenant } from "@jenai/db";
-import { PURPOSE_LABEL, SERIES_LABEL, billingPeriod, entitlements, rupees, statement, usage, voiceClient } from "@jenai/engine";
+import { agentVersions, agents, branches, carrierAccounts, phoneNumbers, plans, platformDb, subscriptions, tenantDatabases, voiceConnections, withTenant } from "@jenai/db";
+import { PURPOSE_LABEL, SERIES_LABEL, billingPeriod, entitlements, inboundToday, planGate, rupees, statement, usage, voiceClient } from "@jenai/engine";
 import { Section, StatusBadge, fmtDate } from "@/components/ui";
 import { ConfirmButton, SubmitButton } from "@/components/client";
 import {
@@ -281,10 +281,42 @@ export async function PlanSection({ orgId, canManage }: { orgId: string; canMana
   });
   const paise = (v: number | null | undefined) => (v == null ? "" : String(v / 100));
 
+  // Today's allowance and where this client's records actually live. Both are
+  // read from the same places that enforce them, so this page cannot claim a
+  // cap the dialer is not applying, or a private server that is not connected.
+  const today = await withTenant(orgId, async (tx) => ({
+    out: await planGate(tx, orgId, now),
+    in: await inboundToday(tx, orgId, now),
+  }));
+  const [ownDb] = await db.select().from(tenantDatabases).where(eq(tenantDatabases.tenantId, orgId));
+  const capped = today.out.outboundPerDay !== null || today.in.perDay !== null;
+
   return (
     <div id="plan">
       <Section title="Plan and billing terms" sub="What the client is on and how the monthly bill is raised. No payments are taken here yet.">
         <div className="grid gap-5 px-5 py-4">
+          {capped || ownDb ? (
+            <div className="grid gap-3 sm:grid-cols-3">
+              {today.in.perDay !== null ? (
+                <Stat label={`Inbound today (${today.in.day})`} value={`${today.in.used} of ${today.in.perDay}`}
+                  note={today.in.overBy > 0 ? `${today.in.overBy} over the plan` : "within the plan"} bad={today.in.overBy > 0} />
+              ) : null}
+              {today.out.outboundPerDay !== null ? (
+                <Stat label="Outbound today" value={`${today.out.outboundToday} of ${today.out.outboundPerDay}`}
+                  note={today.out.outboundToday >= today.out.outboundPerDay ? "the dialer is holding until midnight IST" : "within the plan"}
+                  bad={today.out.outboundToday >= today.out.outboundPerDay} />
+              ) : null}
+              {sub?.endsOn ? (
+                <Stat label={`${today.out.name} plan ends`} value={sub.endsOn}
+                  note={sub.endsOn < now.toISOString().slice(0, 10) ? "ended: outbound calls are stopped" : "calls stop the day after"}
+                  bad={sub.endsOn < now.toISOString().slice(0, 10)} />
+              ) : null}
+              {ownDb ? (
+                <Stat label="Where their data lives" value={ownDb.status === "ready" ? "Their own server" : `Their own server (${ownDb.status})`}
+                  note={`${ownDb.label}: ${ownDb.host}:${ownDb.port}, TLS ${ownDb.sslmode}`} bad={ownDb.status !== "ready"} />
+              ) : null}
+            </div>
+          ) : null}
           <div className="tbl-wrap">
             <table className="tbl">
               <thead><tr><th>Period</th><th className="num">Calls</th><th className="num">Minutes</th><th className="num">Fee</th><th className="num">Usage</th><th className="num">Before GST</th></tr></thead>
@@ -325,6 +357,16 @@ export async function PlanSection({ orgId, canManage }: { orgId: string; canMana
           ) : null}
         </div>
       </Section>
+    </div>
+  );
+}
+
+function Stat({ label, value, note, bad }: { label: string; value: string; note: string; bad?: boolean }) {
+  return (
+    <div className={`rounded-lg border px-4 py-3 ${bad ? "border-[var(--bad-border,#e0b4b4)] bg-[var(--bad-bg,#fdf3f3)]" : "border-[var(--line,#e7e2da)]"}`}>
+      <div className="text-xs uppercase tracking-wide opacity-70">{label}</div>
+      <div className="text-lg font-semibold">{value}</div>
+      <div className="text-xs opacity-70">{note}</div>
     </div>
   );
 }
