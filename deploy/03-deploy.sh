@@ -39,7 +39,11 @@ rsync -az --delete \
   --exclude 'packages/security/reports' --exclude '*.log' \
   -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" \
   "$REPO/" "ubuntu@$IP:/tmp/jenai-app/"
-$SSH 'sudo rsync -a --delete --exclude node_modules /tmp/jenai-app/ /opt/jenai/app/ && sudo chown -R jenai:jenai /opt/jenai/app && rm -rf /tmp/jenai-app'
+# .next is excluded from the copy AND from the delete. Without the second
+# exclusion rsync tries to remove last build's .next, cannot (it holds the
+# node_modules we are preserving), and prints a screen of "cannot delete
+# non-empty directory" on every deploy. It is rebuilt in step 3 regardless.
+$SSH 'sudo rsync -a --delete --exclude node_modules --exclude .next /tmp/jenai-app/ /opt/jenai/app/ && sudo chown -R jenai:jenai /opt/jenai/app && rm -rf /tmp/jenai-app'
 
 if [ "$FIRST_RUN" = "yes" ]; then
   say "2. Secrets (made here, kept on the server and in the AWS parameter store)"
