@@ -93,13 +93,19 @@ if [ "$FIRST_RUN" = "yes" ]; then
   onserver "pnpm db:setup"
   onserver "pnpm db:migrate"
   if [ -n "$ADMIN" ]; then
-    say "6. The first super admin"
+    say "5b. The first super admin"
     onserver "pnpm db:seed:platform -- --admin $ADMIN --name \"$ADMIN_NAME\""
   fi
 else
   say "5. Applying any new migrations"
   onserver "pnpm db:migrate"
 fi
+
+# Plans, agent templates and call programs are shipped with the code, not with
+# a migration, so every deploy refreshes them. Idempotent, and it never removes
+# a template version an agent is still pinned to.
+say "6. Catalogue (plans, agent templates, call programs)"
+onserver "pnpm --filter @jenai/db catalog"
 
 say "7. Starting"
 $SSH 'sudo systemctl enable --now jenai-web jenai-worker >/dev/null 2>&1; sudo systemctl restart jenai-web jenai-worker; sleep 4; systemctl is-active jenai-web jenai-worker'

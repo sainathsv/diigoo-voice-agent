@@ -20,7 +20,8 @@
     "seed:platform": "tsx src/scripts/seed-platform.ts",
     "tenant-db": "tsx src/scripts/tenant-db.ts",
     "client": "tsx src/scripts/client.ts",
-    "zoho": "tsx src/scripts/zoho.ts"
+    "zoho": "tsx src/scripts/zoho.ts",
+    "catalog": "tsx src/scripts/catalog.ts"
   },
   "dependencies": {
     "@jenai/authz": "workspace:*",
