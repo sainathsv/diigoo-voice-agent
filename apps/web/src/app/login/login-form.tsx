@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { authClient } from "@/lib/auth-client";
+import { toLoginEmail } from "@jenai/authz";
 
 export function LoginForm({ next }: { next: string }) {
   const router = useRouter();
@@ -86,12 +87,13 @@ export function LoginForm({ next }: { next: string }) {
         setPending(true);
         setError(null);
         const { data, error } = await authClient.signIn.email({
-          email: String(fd.get("email") ?? "").trim(),
+          // A username signs in too: it resolves to the same account underneath.
+          email: toLoginEmail(String(fd.get("email") ?? "")),
           password: String(fd.get("password") ?? ""),
         });
         setPending(false);
         if (error) {
-          setError(error.status === 429 ? "Too many attempts. Wait a minute and try again." : "Email or password is incorrect.");
+          setError(error.status === 429 ? "Too many attempts. Wait a minute and try again." : "That username or email and password do not match.");
           return;
         }
         if (data && "twoFactorRedirect" in data && data.twoFactorRedirect) {
@@ -103,8 +105,8 @@ export function LoginForm({ next }: { next: string }) {
     >
       {error ? <div className="notice notice-bad" role="alert">{error}</div> : null}
       <div>
-        <label className="label" htmlFor="email">Work email</label>
-        <input className="input" id="email" name="email" type="email" autoComplete="username" required autoFocus />
+        <label className="label" htmlFor="email">Username or work email</label>
+        <input className="input" id="email" name="email" type="text" inputMode="email" autoComplete="username" required autoFocus />
       </div>
       <div>
         <label className="label" htmlFor="password">Password</label>

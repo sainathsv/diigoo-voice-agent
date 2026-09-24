@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { toLoginEmail, displayLogin, USERNAME_PATTERN } from "./login-id";
 import {
   ALL_CLIENT_PERMISSIONS,
   ALL_PLATFORM_PERMISSIONS,
@@ -107,5 +108,30 @@ describe("maskPhone()", () => {
     expect(maskPhone("+919876543210")).toBe("+91 ••••• •3210");
     expect(maskPhone("9876543210")).toBe("••••• •3210");
     expect(maskPhone("")).toBe("");
+  });
+});
+
+describe("signing in with a username", () => {
+  it("resolves a username to its account, whatever case it was typed in", () => {
+    expect(toLoginEmail("CY_Police")).toBe("cy_police@id.jenai.local");
+    expect(toLoginEmail("  cy_police  ")).toBe("cy_police@id.jenai.local");
+  });
+
+  it("leaves a real email alone", () => {
+    expect(toLoginEmail("Owner@Zennara.com")).toBe("owner@zennara.com");
+  });
+
+  it("shows a username back as a username, and an email as an email", () => {
+    expect(displayLogin("cy_police@id.jenai.local")).toBe("cy_police");
+    expect(displayLogin("owner@zennara.com")).toBe("owner@zennara.com");
+  });
+
+  it("refuses usernames that would read ambiguously", () => {
+    for (const bad of ["ab", "_leading", "has space", "a".repeat(41), "sneaky@thing"]) {
+      expect(USERNAME_PATTERN.test(bad), bad).toBe(false);
+    }
+    for (const good of ["CY_Police", "front-desk", "ghmc.ward12", "zen1"]) {
+      expect(USERNAME_PATTERN.test(good), good).toBe(true);
+    }
   });
 });
