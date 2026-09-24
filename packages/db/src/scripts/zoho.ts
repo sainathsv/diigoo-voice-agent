@@ -10,7 +10,7 @@
  */
 import "./env";
 import { eq, and } from "drizzle-orm";
-import { exchangeGrantCode, sealCredentials } from "@jenai/engine";
+import { credentialsOf, exchangeGrantCode, sealCredentials, zohoConnector } from "@jenai/engine";
 import { integrations, organizations, platformDb, withTenant } from "../index";
 
 const arg = (name: string, fallback = "") => {
@@ -50,7 +50,7 @@ async function connect() {
     const row = {
       kind: "zoho_crm" as const,
       name: `Zoho CRM (${dc})`,
-      status: "connected" as const,
+      status: "draft" as const,
       config: { dc, module: crmModule },
       events: ["call.completed", "lead.created", "lead.updated", "appointment.booked", "do_not_call.added"],
       credentials,
@@ -63,7 +63,29 @@ async function connect() {
     else await tx.insert(integrations).values({ tenantId: org.id, ...row });
   });
 
+  // Ask Zoho whether this actually works before calling it connected. Holding a
+  // valid token proves the handshake, not that the CRM will answer: an account
+  // without API access authorises happily and then refuses every request.
+  const state = await withTenant(org.id, async (tx) => {
+    const [i] = await tx.select().from(integrations).where(and(eq(integrations.kind, "zoho_crm"), eq(integrations.tenantId, org.id)));
+    const res = await zohoConnector.test({
+      integration: i!,
+      credentials: credentialsOf(i!),
+      fetch,
+      async save(patch) {
+        await tx.update(integrations)
+          .set({ ...(patch.credentials ? { credentials: sealCredentials(org.id, patch.credentials) } : {}), ...(patch.config ? { config: { ...i!.config, ...patch.config } } : {}), updatedAt: new Date() })
+          .where(and(eq(integrations.id, i!.id), eq(integrations.tenantId, org.id)));
+      },
+    });
+    await tx.update(integrations)
+      .set({ status: res.ok ? "connected" : "error", lastOkAt: res.ok ? new Date() : null, lastError: res.ok ? null : res.message, lastErrorAt: res.ok ? null : new Date(), updatedAt: new Date() })
+      .where(and(eq(integrations.id, i!.id), eq(integrations.tenantId, org.id)));
+    return res;
+  });
+
   console.log(`  stored against ${org.name}, writing to ${crmModule}.`);
+  console.log(state.ok ? `  VERIFIED: ${state.message}` : `  STORED BUT NOT WORKING: ${state.message}`);
   console.log(`  The grant code is now spent. The refresh token is sealed and does not expire.\n`);
 }
 
