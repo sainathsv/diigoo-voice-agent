@@ -206,8 +206,18 @@ async function move() {
   let moved = 0;
   const report: string[] = [];
   for (const table of TENANT_TABLES) {
-    const rows = await withTenant(client.id, (tx) => tx.execute(sql.raw(`select * from ${table}`)), shared);
-    if (!rows.length) continue;
+    const all = await withTenant(client.id, (tx) => tx.execute(sql.raw(`select * from ${table}`)), shared);
+    // Some tables let a tenant READ rows that belong to nobody while only
+    // letting them WRITE their own: the built-in roles are visible to every
+    // client and owned by none. Those are platform rows, they are already on
+    // the client's database from provisioning, and trying to copy them is
+    // rejected by the same policy that let us read them.
+    const rows = (all as Record<string, unknown>[]).filter((r) => !("tenant_id" in r) || r.tenant_id === client.id);
+    const shared_rows = all.length - rows.length;
+    if (!rows.length) {
+      if (shared_rows) report.push(`${table} 0 (${shared_rows} shared)`);
+      continue;
+    }
     // A json column arrives as a JavaScript object and has to go back as text;
     // a text[] column arrives as an array and must stay one. Ask the database
     // which is which rather than guessing from the value.
@@ -216,7 +226,7 @@ async function move() {
     const jsonColumns = new Set((types as unknown as { column_name: string; data_type: string }[])
       .filter((t) => t.data_type === "json" || t.data_type === "jsonb").map((t) => t.column_name));
     await withTenant(client.id, async (tx) => {
-      for (const r of rows as Record<string, unknown>[]) {
+      for (const r of rows) {
         const cols = Object.keys(r);
         const names = sql.raw(cols.map((c) => `"${c}"`).join(", "));
         // sql.param keeps an array as ONE parameter. Without it a text[] column
