@@ -5,12 +5,14 @@ import { NavLink } from "@/components/client";
 import { SignOutButton } from "@/components/sign-out";
 import { requireWorkspace } from "@/server/access";
 import { exitSupportAndReturn } from "@/server/actions/support-session";
+import { isCaseWorkspace } from "@/server/queries/helpline";
 
 const NAV: Array<{ href: string; label: string; perm?: Permission; group?: string }> = [
   { href: "", label: "Overview" },
   { href: "/calls", label: "Calls", perm: "calls:view" },
-  { href: "/leads", label: "Leads", perm: "contacts:view" },
-  { href: "/calendar", label: "Calendar", perm: "calendar:view" },
+  { href: "/leads", label: "Leads", perm: "contacts:view", group: "sales" },
+  { href: "/analytics", label: "Analytics", perm: "calls:view", group: "cases" },
+  { href: "/calendar", label: "Calendar", perm: "calendar:view", group: "sales" },
   { href: "/programs", label: "Call programs", perm: "agents:view" },
   { href: "/campaigns", label: "Campaigns", perm: "campaigns:view" },
   { href: "/agents", label: "AI agents", perm: "agents:view" },
@@ -28,7 +30,11 @@ export default async function WorkspaceLayout({ children, params }: { children: 
   const { org: slug } = await params;
   const ctx = await requireWorkspace(slug);
   const base = `/w/${slug}`;
-  const visible = NAV.filter((n) => !n.perm || holdsAnywhere(ctx.access, n.perm) || (n.perm === "org:manage" && holdsAnywhere(ctx.access, "support_access:grant")));
+  // A cyber crime helpline works from Analytics; sales leads and a booking calendar mean nothing there.
+  const caseMode = await isCaseWorkspace(ctx.org.id);
+  const visible = NAV.filter((n) => (n.group === "sales" ? !caseMode : n.group === "cases" ? caseMode : true)).filter(
+    (n) => !n.perm || holdsAnywhere(ctx.access, n.perm) || (n.perm === "org:manage" && holdsAnywhere(ctx.access, "support_access:grant")),
+  );
 
   return (
     <div className="min-h-full">

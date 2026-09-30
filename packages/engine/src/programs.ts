@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import {
   agentVersions,
   agents,
@@ -12,7 +12,7 @@ import {
   type ProgramVariable,
   type Tx,
 } from "@jenai/db";
-import { lintVersion } from "@jenai/voice";
+import { CYBER_INTAKE_DOMAIN, lintVersion } from "@jenai/voice";
 import { createVersion, templateOf, DEFAULT_TEMPLATE } from "./agents";
 import { verticalOf } from "./safety/cases";
 
@@ -26,15 +26,33 @@ import { verticalOf } from "./safety/cases";
  * can be versioned, checked and published on its own.
  */
 
-/** Programs on offer to one client: their industry's pack plus the general one. */
+/** CY Police's private complaint line; the only program whose agents may record complaint evidence. */
+export const CY_POLICE_PROGRAM = "police.cy_cybercrime_complaint";
+
+/** Programs on offer to one client: their industry's pack, the general one, and any written only for them. */
 export async function catalogueFor(tx: Tx, tenantId: string): Promise<ProgramTemplate[]> {
-  const [org] = await tx.select({ vertical: organizations.vertical }).from(organizations).where(eq(organizations.id, tenantId));
+  const [org] = await tx.select({ vertical: organizations.vertical, slug: organizations.slug }).from(organizations).where(eq(organizations.id, tenantId));
   const v = verticalOf(org?.vertical);
   return tx
     .select()
     .from(programTemplates)
-    .where(and(eq(programTemplates.status, "active"), inArray(programTemplates.vertical, v === "general" ? ["general"] : [v, "general"])))
+    .where(
+      and(
+        eq(programTemplates.status, "active"),
+        or(
+          and(isNull(programTemplates.tenantSlugs), inArray(programTemplates.vertical, v === "general" ? ["general"] : [v, "general"])),
+          sql`${org?.slug ?? ""} = any(${programTemplates.tenantSlugs})`,
+        ),
+      ),
+    )
     .orderBy(asc(programTemplates.vertical), asc(programTemplates.name));
+}
+
+/** A private program may only be set up by the workspaces it was written for. */
+async function assertOfferedTo(tx: Tx, tenantId: string, p: ProgramTemplate): Promise<void> {
+  if (!p.tenantSlugs) return;
+  const [org] = await tx.select({ slug: organizations.slug }).from(organizations).where(eq(organizations.id, tenantId));
+  if (!org || !p.tenantSlugs.includes(org.slug)) throw new ProgramSetupError(`Program ${p.key} is not in the catalogue.`);
 }
 
 export async function programTemplateOf(tx: Tx, key: string, version: number): Promise<ProgramTemplate> {
@@ -103,6 +121,7 @@ export interface SetUpInput {
 export async function setUpProgram(tenantId: string, input: SetUpInput, actorUserId: string | null): Promise<{ program: ClientProgram; versionId: string; issues: string[] }> {
   return withTenant(tenantId, async (tx) => {
     const p = await latestProgramVersion(tx, input.programKey);
+    await assertOfferedTo(tx, tenantId, p);
     const branchId = input.branchId ?? null;
     const missing = missingFields(p, input.values);
     if (missing.length) throw new ProgramSetupError(`Fill in: ${missing.join(", ")}.`);
@@ -147,7 +166,7 @@ export async function setUpProgram(tenantId: string, input: SetUpInput, actorUse
           purpose: p.purpose === "promotional" ? "outbound_sales" : p.direction === "inbound" ? "receptionist" : "reminders",
           templateKey: DEFAULT_TEMPLATE.key,
           templateVersion: DEFAULT_TEMPLATE.version,
-          domain: p.vertical === "health" ? "clinic" : p.vertical === "government" ? "civic" : "business",
+          domain: p.key === CY_POLICE_PROGRAM ? CYBER_INTAKE_DOMAIN : p.vertical === "health" ? "clinic" : p.vertical === "government" ? "civic" : "business",
           clientProgramId: program.id,
         })
         .returning();

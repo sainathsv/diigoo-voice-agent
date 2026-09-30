@@ -11,7 +11,8 @@ import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
 import { agents, calls, leads, suppressions, withTenant } from "@jenai/db";
 import { deriveLead, parsePreferredTime } from "./leads";
-import { programExtraction } from "./programs";
+import { CY_POLICE_PROGRAM, latestProgramVersion, programExtraction } from "./programs";
+import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { emitAppointmentBooked, emitCallCompleted, emitDoNotCall } from "./integrations/events";
 import { appointmentFromCall } from "./calendar";
 
@@ -94,7 +95,7 @@ function programBlock(p: ProgramAsk | null | undefined): string {
 
 function prompt(input: { transcript: string; startedAt: Date; domain: string; direction: string; program?: ProgramAsk | null }) {
   const today = input.startedAt.toLocaleDateString("en-GB", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", year: "numeric", weekday: "long" });
-  return `You analyse one phone call handled by an AI receptionist for a ${input.domain} business in India. The call was ${input.direction} on ${today} (IST). The transcript may mix Telugu, Hindi and English.
+  return `You analyse one phone call handled by an AI ${input.domain === "cyber crime" ? "complaint assistant for a police cyber crime helpline" : `receptionist for a ${input.domain} business`} in India. The call was ${input.direction} on ${today} (IST). The transcript may mix Telugu, Hindi and English.
 
 Return ONLY a JSON object with exactly these keys, null when not said. Every value must be in ENGLISH: translate Telugu or Hindi, never copy the caller's words.
 {"caller_name": string|null (in English letters), "concern": string|null (what they asked about, 3 to 8 English words, e.g. "hair fall treatment"),
@@ -183,6 +184,15 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
         }
         program = programs.get(c.agentId) ?? null;
       }
+      // Cyber crime lines read every call with the complaint questions, even an agent imported as it was.
+      const cyber = domain === CYBER_INTAKE_DOMAIN;
+      if (!program && cyber) {
+        if (!programs.has(CY_POLICE_PROGRAM)) {
+          const p = await withTenant(tenantId, (tx) => latestProgramVersion(tx, CY_POLICE_PROGRAM).catch(() => null));
+          programs.set(CY_POLICE_PROGRAM, p ? { key: p.key, extraction: p.extraction, outcomes: p.outcomes } : null);
+        }
+        program = programs.get(CY_POLICE_PROGRAM) ?? null;
+      }
       const raw = await extractor.extract({ transcript: c.transcript!, startedAt: c.startedAt, domain: domain ?? "clinic", direction: c.direction, program });
       const x = cleanExtraction(raw);
       const extra = program ? cleanProgramFields(raw, program) : {};
@@ -202,7 +212,8 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
             stats.optOuts++;
           }
         }
-        if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
+        // A complaint is not a sales lead: cyber crime calls feed Analytics, not Leads.
+        if (!cyber && c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
         // A booking goes straight into the calendar, so the front desk sees it without asking.
         if (merged.next_step === "booked" && typeof merged.preferred_time === "string") {
           const when = parsePreferredTime(merged.preferred_time);

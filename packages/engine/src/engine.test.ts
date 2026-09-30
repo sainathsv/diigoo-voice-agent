@@ -23,11 +23,11 @@ import {
   subscriptions,
   suppressions,
   withTenant, phoneNumbers } from "@jenai/db";
-import { render } from "@jenai/voice";
+import { CYBER_INTAKE_DOMAIN, render } from "@jenai/voice";
 import { addWorkflow, startFakeDograh, type FakeDograh } from "@jenai/voice/testing";
 import { createVersion, importAgent, publishVersion, checkDrift, PublishBlocked } from "./agents";
 import { enqueueFleetSweep, requestSafetyCheck, runSafetyCheck } from "./safety/checks";
-import { campaignFromProgram, missingVariables, setUpProgram } from "./programs";
+import { CY_POLICE_PROGRAM, campaignFromProgram, catalogueFor, missingVariables, setUpProgram } from "./programs";
 import type { SafetyModel } from "./safety/runner";
 import { agentSafetyChecks, clientPrograms, programTemplates } from "@jenai/db";
 
@@ -190,6 +190,35 @@ describe("call programs", () => {
 
   it("refuses to start before the client has filled in what the call needs", async () => {
     await expect(setUpProgram(tenant, { programKey: "clinic.revisit_recall", values: { clinic_name: "Test Clinic" } }, actor)).rejects.toThrow(/Fill in:/);
+  });
+
+  it("offers a private program only to the workspace it was written for", async () => {
+    const db = platformDb();
+    const keys = async (t: string) => (await withTenant(t, (tx) => catalogueFor(tx, t))).map((p) => p.key);
+    // Another client, even another police department, never sees or sets up CY Police's line.
+    expect(await keys(tenant)).not.toContain(CY_POLICE_PROGRAM);
+    await expect(setUpProgram(tenant, { programKey: CY_POLICE_PROGRAM, values: {} }, actor)).rejects.toThrow(/not in the catalogue/);
+
+    const [existing] = await db.select({ id: organizations.id }).from(organizations).where(eq(organizations.slug, "cy-police"));
+    if (existing) return; // a real cy-police workspace in this database: leave it alone
+    const [cy] = await db
+      .insert(organizations)
+      .values({ kind: "client", name: "CY Police", slug: "cy-police", status: "onboarding", vertical: "government", languages: ["hi", "en", "ne"] })
+      .returning();
+    try {
+      expect(await keys(cy!.id)).toContain(CY_POLICE_PROGRAM);
+      const values = {
+        department_name: "CY Police", portal: "cybercrime dot gov dot in", freeze_step: "Call 1930 straight away.",
+        evidence_channel: "our WhatsApp number", handover_wording: "Putting you through to an officer.", next_step_wording: "An officer will call you back.",
+      };
+      const facts = "YOU ARE the complaint assistant of the CY Police cyber crime cell. Office hours for walk-ins 10 AM to 5 PM.";
+      const r = await setUpProgram(cy!.id, { programKey: CY_POLICE_PROGRAM, values, facts }, actor);
+      expect(r.issues).toEqual([]);
+      const [agent] = await withTenant(cy!.id, (tx) => tx.select().from(agents).where(eq(agents.id, r.program.agentId!)));
+      expect(agent!.domain).toBe(CYBER_INTAKE_DOMAIN); // gets the evidence-intake safety rules
+    } finally {
+      await db.delete(organizations).where(eq(organizations.id, cy!.id));
+    }
   });
 
   it("brings the program's own safety cases into the publish check", async () => {

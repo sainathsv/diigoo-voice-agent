@@ -906,6 +906,8 @@ export const programTemplates = pgTable(
     complianceNote: text("compliance_note").notNull().default(""),
     redteamCases: jsonb("redteam_cases").$type<ProgramRedteamCase[]>().notNull().default([]),
     status: text("status").notNull().default("active"),
+    /** Null: every client in the vertical. Otherwise only these workspace slugs (migration 0017). */
+    tenantSlugs: text("tenant_slugs").array(),
     createdAt: ts("created_at").notNull().defaultNow(),
     updatedAt: ts("updated_at").notNull().defaultNow(),
   },
@@ -1095,3 +1097,4 @@ export const tenantDatabases = pgTable("tenant_databases", {
   createdAt: ts("created_at").notNull().defaultNow(),
   updatedAt: ts("updated_at").notNull().defaultNow(),
 });
+

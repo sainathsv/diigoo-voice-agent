@@ -11,3 +11,5 @@ export * from "./dialer/index";
 export * from "./analyze";
 export * from "./security/index";
 export * from "./safety/index";
+export * from "./scams";
+export * from "./call-analytics";

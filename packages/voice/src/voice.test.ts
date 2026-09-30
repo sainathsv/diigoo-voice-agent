@@ -6,7 +6,7 @@ process.env.JENAI_ALLOW_PRIVATE_ENGINE = "true";
 import { DograhClient } from "./dograh";
 import { publishBoth } from "./publish";
 import { lintVersion, parseBuiltPrompt, render, type TemplateInput } from "./render";
-import { GUARDRAILS_VERSION, guardrailsBlock, guardrailsVersionOf } from "./guardrails";
+import { CYBER_INTAKE_DOMAIN, GUARDRAILS_VERSION, guardrailsBlock, guardrailsVersionOf } from "./guardrails";
 import { toE164 } from "./phone";
 import { addWorkflow, startFakeDograh, type FakeDograh } from "./testing/fake-dograh";
 
@@ -138,6 +138,19 @@ describe("platform guardrails", () => {
     expect(r.guardrailsVersion).toBe(GUARDRAILS_VERSION);
     expect(guardrailsVersionOf(r.inboundPrompt)).toBe(GUARDRAILS_VERSION);
     expect(guardrailsVersionOf("a legacy prompt")).toBeNull();
+  });
+  it("lets only cyber crime intake record complaint evidence, and never secrets", () => {
+    const standard = render(T, V, "skin").inboundPrompt;
+    const intake = render(T, V, CYBER_INTAKE_DOMAIN).inboundPrompt;
+    expect(standard).toContain("Never ask for or accept Aadhaar, PAN, bank, card, UPI or OTP details.");
+    expect(standard).not.toContain("MAY record as evidence");
+    expect(intake.startsWith(guardrailsBlock(CYBER_INTAKE_DOMAIN))).toBe(true);
+    expect(intake).toContain("MAY record as evidence");
+    expect(intake).toMatch(/Never ask for or accept an OTP, UPI PIN, ATM PIN, CVV, card expiry date, password/);
+    expect(intake).toContain("only the LAST 4 digits of a card");
+    expect(intake).not.toContain("You only need a name and a mobile number to book.");
+    expect(guardrailsVersionOf(intake)).toBe(GUARDRAILS_VERSION);
+    expect(parseBuiltPrompt(intake, T.basePrompt)).toEqual({ facts: V.facts, greeting: V.greeting });
   });
   it("still imports facts and greeting from a guarded prompt", () => {
     const r = render(T, V, "skin");

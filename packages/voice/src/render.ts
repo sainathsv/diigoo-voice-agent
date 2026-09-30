@@ -47,9 +47,9 @@ export const ALWAYS_ALLOWED = ["caller_name", "call_purpose"] as const;
 export function render(t: TemplateInput, v: VersionInput, domain: string): Rendered {
   const job = v.taskPrompt?.trim() ? `\n\n${v.taskPrompt.trim()}` : "";
   const facts = `${v.facts.trim()}${job}`;
-  const inboundPrompt = withGuardrails(`${facts}\n\n${FIRST_WORDS}\n"${v.greeting.trim()}"\n\n${t.basePrompt}`);
+  const inboundPrompt = withGuardrails(`${facts}\n\n${FIRST_WORDS}\n"${v.greeting.trim()}"\n\n${t.basePrompt}`, domain);
   const opening = (v.outboundOpening?.trim() || defaultOutboundOpening(v.greeting)).trim();
-  const outboundPrompt = withGuardrails(`${facts}\n\n${FIRST_WORDS}\n"${opening}"\n\n${t.basePrompt}`);
+  const outboundPrompt = withGuardrails(`${facts}\n\n${FIRST_WORDS}\n"${opening}"\n\n${t.basePrompt}`, domain);
   const extraction = t.extraction.map((x) => ({ ...x, prompt: x.prompt.replaceAll("{{domain}}", domain) }));
   const hash = promptHash(inboundPrompt, outboundPrompt, t.endPrompt);
   return { inboundPrompt, outboundPrompt, endPrompt: t.endPrompt, extraction, extractionPrompt: t.extractionPrompt, hash, guardrailsVersion: GUARDRAILS_VERSION };

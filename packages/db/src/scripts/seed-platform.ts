@@ -82,7 +82,7 @@ for (const f of files) {
     direction: g.direction ?? "outbound", purpose: g.purpose, goal: g.goal, taskPrompt: g.task_prompt, opening: g.opening,
     variables: g.variables ?? [], clientFields: g.client_fields ?? [], extraction: g.extraction ?? [], outcomes: g.outcomes ?? [],
     defaults: g.defaults ?? {}, requirements: g.requirements ?? {}, complianceNote: g.compliance_note ?? "",
-    redteamCases: g.redteam_cases ?? [], status: g.status ?? "active",
+    redteamCases: g.redteam_cases ?? [], status: g.status ?? "active", tenantSlugs: g.only_for ?? null,
   };
   await db.insert(programTemplates).values(row).onConflictDoUpdate({ target: [programTemplates.key, programTemplates.version], set: { ...row, updatedAt: new Date() } });
 }
