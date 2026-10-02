@@ -4,23 +4,43 @@
  */
 
 export const SCAM_TYPES = [
-  { key: "upi_bank_card", label: "UPI, bank or card fraud", money: true },
-  { key: "fake_customer_care_kyc_apk", label: "Fake customer care, KYC or APK", money: true },
-  { key: "digital_arrest", label: "Digital arrest (fake police, CBI, customs)", money: true },
-  { key: "investment_trading", label: "Investment, trading or crypto", money: true },
-  { key: "part_time_job_task", label: "Part-time job or task scam", money: true },
-  { key: "sextortion", label: "Sextortion or video call blackmail", money: false },
-  { key: "loan_app", label: "Loan app harassment", money: false },
-  { key: "social_media_hack_fake_profile", label: "Hacked account or fake profile", money: false },
-  { key: "online_shopping_fake_booking", label: "Fake shopping, website or booking", money: true },
-  { key: "lottery_gift_romance", label: "Lottery, gift or romance scam", money: true },
-  { key: "sim_swap_aeps", label: "SIM swap or Aadhaar (AePS) withdrawal", money: true },
-  { key: "account_frozen", label: "Bank account frozen by a cyber cell", money: false },
-  { key: "online_harassment", label: "Online harassment, stalking or threats", money: false },
-  { key: "hacking_ransomware", label: "Hacking, ransomware or email fraud", money: true },
-  { key: "other", label: "Other cyber crime", money: false },
+  { key: "upi_bank_card", label: "UPI, bank or card fraud", money: true, category: "financial" },
+  { key: "fake_customer_care_kyc_apk", label: "Fake customer care, KYC or APK", money: true, category: "financial" },
+  { key: "digital_arrest", label: "Digital arrest (fake police, CBI, customs)", money: true, category: "financial" },
+  { key: "investment_trading", label: "Investment, trading or crypto", money: true, category: "financial" },
+  { key: "part_time_job_task", label: "Part-time job or task scam", money: true, category: "financial" },
+  { key: "sextortion", label: "Sextortion or video call blackmail", money: false, category: "social_media" },
+  { key: "loan_app", label: "Loan app harassment", money: false, category: "financial" },
+  { key: "social_media_hack_fake_profile", label: "Hacked account or fake profile", money: false, category: "social_media" },
+  { key: "online_shopping_fake_booking", label: "Fake shopping, website or booking", money: true, category: "financial" },
+  { key: "lottery_gift_romance", label: "Lottery, gift or romance scam", money: true, category: "financial" },
+  { key: "sim_swap_aeps", label: "SIM swap or Aadhaar (AePS) withdrawal", money: true, category: "financial" },
+  { key: "account_frozen", label: "Bank account frozen by a cyber cell", money: false, category: "account_frozen" },
+  { key: "online_harassment", label: "Online harassment, stalking or threats", money: false, category: "social_media" },
+  { key: "hacking_ransomware", label: "Hacking, ransomware or email fraud", money: true, category: "financial" },
+  { key: "other", label: "Other cyber crime", money: false, category: "other" },
 ] as const;
 export type ScamType = (typeof SCAM_TYPES)[number]["key"];
+
+/**
+ * The four main categories the department reads its complaints by. Every scam type
+ * belongs to one; a complaint whose type is not clear yet counts under Other.
+ */
+export const SCAM_CATEGORIES = [
+  { key: "financial", label: "Financial scams" },
+  { key: "social_media", label: "Social media" },
+  { key: "account_frozen", label: "Bank account frozen" },
+  { key: "other", label: "Other" },
+] as const;
+export type ScamCategory = (typeof SCAM_CATEGORIES)[number]["key"];
+
+export function categoryOf(scam: string | null | undefined): ScamCategory {
+  return SCAM_TYPES.find((s) => s.key === scam)?.category ?? "other";
+}
+
+export function categoryLabel(key: string | null | undefined): string {
+  return SCAM_CATEGORIES.find((c) => c.key === key)?.label ?? "Other";
+}
 
 export function scamLabel(key: string | null | undefined): string {
   return SCAM_TYPES.find((s) => s.key === key)?.label ?? (key ? key : "Not known yet");

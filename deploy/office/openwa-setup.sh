@@ -72,7 +72,7 @@ services:
 volumes:
   openwa-data:
 COMPOSE
-(cd $OW && sudo docker compose pull -q && sudo docker compose up -d)
+sudo docker compose --project-directory $OW -f $OW/docker-compose.yml pull -q && sudo docker compose --project-directory $OW -f $OW/docker-compose.yml up -d
 printf "waiting for OpenWA"
 for _ in $(seq 1 60); do curl -sf http://127.0.0.1:2785/api/health/ready >/dev/null && break; printf "."; sleep 3; done
 echo

@@ -2,7 +2,7 @@ import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { agents, calls, cases, withTenant, type Case } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { withWhatsApp } from "./complaint-form";
-import { isNotCyberCrime, scamKeyFromText, type ScamType } from "./scams";
+import { SCAM_CATEGORIES, categoryOf, isNotCyberCrime, scamKeyFromText, type ScamCategory, type ScamType } from "./scams";
 
 /** Where the WhatsApp follow-up of a complaint stands. */
 export interface WhatsAppProgress {
@@ -38,6 +38,8 @@ export interface CallAnalytics {
   people: number;
   lostRupees: number;
   urgent: number;
+  /** The four main categories, always all four, in the department's order. */
+  byCategory: Array<{ category: ScamCategory; count: number; lostRupees: number }>;
   byType: Array<{ type: ScamType | null; count: number; lostRupees: number }>;
   byDistrict: Array<{ district: string; count: number }>;
   byDay: Array<{ day: string; count: number }>;
@@ -154,6 +156,10 @@ export async function callAnalytics(tenantId: string, days = 30, opts: { branche
     people: new Set(complaints.map((c) => c.phone).filter(Boolean)).size,
     lostRupees: complaints.reduce((a, c) => a + c.lostRupees, 0),
     urgent: complaints.filter((c) => c.urgent).length,
+    byCategory: SCAM_CATEGORIES.map(({ key }) => {
+      const mine = complaints.filter((c) => categoryOf(c.scam) === key);
+      return { category: key, count: mine.length, lostRupees: mine.reduce((n, c) => n + c.lostRupees, 0) };
+    }),
     byType: [...byType].map(([type, v]) => ({ type, ...v })).sort((a, b) => b.count - a.count),
     byDistrict: [...byDistrict].map(([district, count]) => ({ district, count })).sort((a, b) => b.count - a.count).slice(0, 15),
     byDay: [...byDay].map(([day, count]) => ({ day, count })).sort((a, b) => a.day.localeCompare(b.day)),

@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 import { agents, calls, cases, organizations, platformDb, withTenant } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { callAnalytics, parseRupees } from "./call-analytics";
-import { isNotCyberCrime, scamKeyFromText } from "./scams";
+import { categoryOf, isNotCyberCrime, scamKeyFromText } from "./scams";
 
 let tenant = "";
 
@@ -74,6 +74,26 @@ describe("helpline analytics", () => {
     const wa = a.complaints.find((c) => c.callId === null)!;
     expect(wa).toMatchObject({ name: "Asha Negi", scam: "investment_trading", lostRupees: 75_000, district: "Tehri", phone: "+919800000077" });
     expect(a.byDistrict.find((d) => d.district === "Tehri")?.count).toBe(1);
+  });
+
+  it("groups complaints into the four main categories, from calls and WhatsApp alike", async () => {
+    expect(categoryOf("upi_bank_card")).toBe("financial");
+    expect(categoryOf("loan_app")).toBe("financial");
+    expect(categoryOf("sextortion")).toBe("social_media");
+    expect(categoryOf("social_media_hack_fake_profile")).toBe("social_media");
+    expect(categoryOf("account_frozen")).toBe("account_frozen");
+    expect(categoryOf("other")).toBe("other");
+    expect(categoryOf(null)).toBe("other");
+    const a = await callAnalytics(tenant, 30);
+    expect(a.byCategory.map((c) => c.category)).toEqual(["financial", "social_media", "account_frozen", "other"]);
+    expect(a.byCategory.reduce((n, c) => n + c.count, 0)).toBe(a.total);
+    // Two UPI calls and the WhatsApp-only investment complaint; the sextortion call; the call with no type.
+    expect(a.byCategory).toEqual([
+      { category: "financial", count: 3, lostRupees: 125_000 },
+      { category: "social_media", count: 1, lostRupees: 0 },
+      { category: "account_frozen", count: 0, lostRupees: 0 },
+      { category: "other", count: 1, lostRupees: 0 },
+    ]);
   });
 
   it("reads amounts the way the analyser writes them", () => {

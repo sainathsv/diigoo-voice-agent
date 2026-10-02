@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { branchesFor, can, holdsAnywhere, phoneFor } from "@jenai/authz";
-import { callAnalytics, scamLabel, SCAM_TYPES, type WhatsAppProgress } from "@jenai/engine";
+import { SCAM_CATEGORIES, callAnalytics, categoryLabel, categoryOf, scamLabel, SCAM_TYPES, type WhatsAppProgress } from "@jenai/engine";
 import { Empty, PageHead, Section, fmtDate, fmtDuration } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadCase } from "@/server/queries/cases";
@@ -83,7 +83,7 @@ async function ChatPanel({ slug, tenantId, caseId, canSee, closeHref }: { slug: 
   );
 }
 
-export default async function AnalyticsPage({ params, searchParams }: { params: Promise<{ org: string }>; searchParams: Promise<{ days?: string; type?: string; chat?: string }> }) {
+export default async function AnalyticsPage({ params, searchParams }: { params: Promise<{ org: string }>; searchParams: Promise<{ days?: string; type?: string; cat?: string; chat?: string }> }) {
   const { org: slug } = await params;
   const sp = await searchParams;
   const ctx = await requireWorkspace(slug);
@@ -92,14 +92,16 @@ export default async function AnalyticsPage({ params, searchParams }: { params: 
   const days = RANGES.find((d) => String(d) === sp.days) ?? 30;
   const a = await callAnalytics(ctx.org.id, days, { branches });
   const type = SCAM_TYPES.some((s) => s.key === sp.type) ? sp.type : sp.type === "none" ? "none" : undefined;
-  const list = type ? a.complaints.filter((c) => (type === "none" ? c.scam === null : c.scam === type)) : a.complaints;
+  const cat = SCAM_CATEGORIES.some((c) => c.key === sp.cat) ? sp.cat : undefined;
+  const list = a.complaints.filter((c) => (!type || (type === "none" ? c.scam === null : c.scam === type)) && (!cat || categoryOf(c.scam) === cat));
+  const types = cat ? a.byType.filter((t) => categoryOf(t.type) === cat) : a.byType;
   const exportable = holdsAnywhere(ctx.access, "contacts:export") && holdsAnywhere(ctx.access, "transcripts:view_raw");
   const sheets = holdsAnywhere(ctx.access, "transcripts:view_raw");
-  const maxType = Math.max(0, ...a.byType.map((t) => t.count));
+  const maxType = Math.max(0, ...types.map((t) => t.count));
   const maxDistrict = Math.max(0, ...a.byDistrict.map((d) => d.count));
   const maxDay = Math.max(0, ...a.byDay.map((d) => d.count));
   const q = (extra: Record<string, string>) => `/w/${slug}/analytics?${new URLSearchParams({ days: String(days), ...extra })}`;
-  const keep: Record<string, string> = type ? { type } : {};
+  const keep: Record<string, string> = { ...(type ? { type } : {}), ...(cat ? { cat } : {}) };
 
   return (
     <>
@@ -123,6 +125,32 @@ export default async function AnalyticsPage({ params, searchParams }: { params: 
         <div className="card card-pad"><div className="eyebrow">Urgent (danger mentioned)</div><div className={`h-display mt-1 text-[28px] ${a.urgent ? "text-bad" : ""}`}>{a.urgent}</div></div>
       </div>
 
+      {a.total > 0 ? (
+        <section className="mb-6" aria-label="Main categories">
+          <div className="mb-2 flex items-baseline justify-between gap-3">
+            <h2 className="h-display text-[17px]">Main categories</h2>
+            {cat ? <Link href={q({})} className="text-[12.5px] font-semibold text-copper-deep hover:underline">Show all categories</Link> : <span className="text-[12px] text-grey">From the calls and WhatsApp together. Click one to see only those complaints.</span>}
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            {a.byCategory.map((c) => (
+              <Link
+                key={c.category}
+                href={cat === c.category ? q({}) : q({ cat: c.category })}
+                className={`card card-pad block transition hover:border-ink ${cat === c.category ? "border-ink ring-1 ring-ink" : ""}`}
+                aria-current={cat === c.category ? "true" : undefined}
+              >
+                <div className="eyebrow">{categoryLabel(c.category)}</div>
+                <div className="mt-1 flex items-baseline gap-2">
+                  <span className="h-display text-[28px] tabular-nums">{c.count}</span>
+                  <span className="text-[12.5px] text-grey">{a.total ? Math.round((c.count / a.total) * 100) : 0}% of complaints</span>
+                </div>
+                <div className="mt-1 text-[12.5px] tabular-nums text-ink-soft">{c.lostRupees ? `${inr(c.lostRupees)} reported lost` : "No money reported lost"}</div>
+              </Link>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
       {a.total === 0 ? (
         <Section title="No complaints yet"><Empty>Complaints appear here within a minute or two of each call.</Empty></Section>
       ) : (
@@ -130,8 +158,8 @@ export default async function AnalyticsPage({ params, searchParams }: { params: 
           <div className="mb-6 grid gap-6 xl:grid-cols-2">
             <Section title="By type of scam" sub="Click a type to list only those complaints.">
               <div className="grid gap-4 px-5 py-4">
-                {a.byType.map((t) => (
-                  <Bar key={t.type ?? "none"} value={t.count} max={maxType} label={t.type ? scamLabel(t.type) : "Type not clear yet"} sub={t.lostRupees ? `${inr(t.lostRupees)} lost` : undefined} href={q({ type: t.type ?? "none" })} />
+                {types.map((t) => (
+                  <Bar key={t.type ?? "none"} value={t.count} max={maxType} label={t.type ? scamLabel(t.type) : "Type not clear yet"} sub={t.lostRupees ? `${inr(t.lostRupees)} lost` : undefined} href={q({ ...(cat ? { cat } : {}), type: t.type ?? "none" })} />
                 ))}
               </div>
             </Section>
@@ -149,8 +177,8 @@ export default async function AnalyticsPage({ params, searchParams }: { params: 
           </div>
 
           <Section
-            title={`${list.length} complaint${list.length === 1 ? "" : "s"}${type ? `: ${type === "none" ? "type not clear yet" : scamLabel(type)}` : ""}`}
-            actions={type ? <Link href={q({})} className="btn btn-ghost btn-sm">Show every type</Link> : undefined}
+            title={`${list.length} complaint${list.length === 1 ? "" : "s"}${cat ? `: ${categoryLabel(cat)}` : ""}${type ? `: ${type === "none" ? "type not clear yet" : scamLabel(type)}` : ""}`}
+            actions={type || cat ? <Link href={q({})} className="btn btn-ghost btn-sm">Show every complaint</Link> : undefined}
           >
             <div className="tbl-wrap">
               <table className="tbl">
