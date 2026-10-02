@@ -61,6 +61,8 @@ interface SyncOptions {
   storeRecordings: boolean;
   /** Re-read every answered call still missing something, however old. */
   full: boolean;
+  /** Calls before this moment are never imported (JENAI_SYNC_SINCE: e.g. test calls made before going live). */
+  since: Date | null;
 }
 
 async function upsertContact(tx: Tx, tenantId: string, phone: string, name: string | null, branchId: string | null, at: Date): Promise<string> {
@@ -76,7 +78,7 @@ async function upsertContact(tx: Tx, tenantId: string, phone: string, name: stri
 }
 
 async function syncOne(tx: Tx, tenantId: string, client: DograhClient, agent: Agent, wf: number, direction: "inbound" | "outbound", o: SyncOptions, stats: SyncStats) {
-  const { max, fetchTranscripts, storeRecordings, full } = o;
+  const { max, fetchTranscripts, storeRecordings, full, since } = o;
   // Newest first. Runs from the last 48 hours are all looked at, so a recent call that is still
   // open (in progress, or a download failed) is retried even behind newer finished ones; older
   // than that, the first run already held as finished ends the scan.
@@ -109,6 +111,11 @@ async function syncOne(tx: Tx, tenantId: string, client: DograhClient, agent: Ag
     const done = new Set(known.filter((k) => k.status !== "in_progress" && k.status !== "unknown" && !retry(k)).map((k) => k.id));
     let reachedKnown = false;
     for (const r of p.runs) {
+      // Newest first: the first run before the start date ends the scan.
+      if (since && new Date(r.created_at) < since) {
+        reachedKnown = true;
+        break;
+      }
       if (done.has(String(r.id))) {
         if (full || Date.now() - new Date(r.created_at).getTime() < RETRY_MS) continue;
         reachedKnown = true;
@@ -221,9 +228,18 @@ async function syncOne(tx: Tx, tenantId: string, client: DograhClient, agent: Ag
  * engine; idempotent (upsert on the engine's run id). Limited per workflow so
  * a first sync never floods the database.
  */
+/** JENAI_SYNC_SINCE as a date; a value that is not a date is refused rather than ignored. */
+export function syncSinceFromEnv(env: Record<string, string | undefined> = process.env): Date | null {
+  const v = env.JENAI_SYNC_SINCE?.trim();
+  if (!v) return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) throw new Error(`JENAI_SYNC_SINCE is not a date: ${v}`);
+  return d;
+}
+
 export async function syncTenantCalls(
   tenantId: string,
-  opts: { maxPerWorkflow?: number; fetchTranscripts?: boolean; full?: boolean; storeRecordings?: boolean } = {},
+  opts: { maxPerWorkflow?: number; fetchTranscripts?: boolean; full?: boolean; storeRecordings?: boolean; since?: Date | null } = {},
 ): Promise<SyncStats> {
   const stats: SyncStats = { workflows: 0, runsSeen: 0, inserted: 0, updated: 0, leadsTouched: 0, transcriptMisses: 0, recordingsStored: 0, recordingMisses: 0, failedWorkflows: 0, errors: [] };
   // A client's own server keeps every recording there (JENAI_STORE_RECORDINGS=true; always in the police edition).
@@ -232,6 +248,7 @@ export async function syncTenantCalls(
     fetchTranscripts: opts.fetchTranscripts ?? true,
     storeRecordings: opts.storeRecordings ?? (process.env.JENAI_STORE_RECORDINGS === "true" || process.env.JENAI_EDITION === "police"),
     full: opts.full ?? false,
+    since: opts.since !== undefined ? opts.since : syncSinceFromEnv(),
   };
   const setup = await withTenant(tenantId, async (tx) => {
     const v = await voiceClient(tx, tenantId);

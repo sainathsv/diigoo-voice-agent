@@ -239,57 +239,83 @@ export function langOf(language: string | null | undefined): Lang {
   return language === "en" || language === "ne" ? language : "hi";
 }
 
+/**
+ * Every WhatsApp message goes in two languages at once: Hindi (Nepali for someone who
+ * writes in Nepali) and then English, so the complainant reads whichever they prefer.
+ */
+function both(text: (l: Lang) => string, language: string | null | undefined): string {
+  return `${text(langOf(language) === "ne" ? "ne" : "hi")}\n\n${text("en")}`;
+}
+
 export function questionFor(field: string, language: string | null | undefined): string {
-  return Q[field]?.[langOf(language)] ?? Q.how_it_happened![langOf(language)];
+  return both((l) => Q[field]?.[l] ?? Q.how_it_happened![l], language);
 }
 
 /** What to say before asking the same item again because the reply did not fit. */
 export function hintFor(field: string, language: string | null | undefined): string {
-  return HINT[field]?.[langOf(language)] ?? HINT_ANY[langOf(language)];
+  return both((l) => HINT[field]?.[l] ?? HINT_ANY[l], language);
 }
 
-export function openerText(department: string, caseNo: string, language: string | null | undefined): string {
-  const l = langOf(language);
+function openerTextIn(department: string, caseNo: string, l: Lang): string {
   if (l === "en") return `Hello, this is the ${department} cyber crime helpline, as agreed on your call. Your complaint number is ${caseNo}. We will ask the complaint form one question at a time; please reply here and send the screenshots here too.`;
   if (l === "ne") return `नमस्ते, यो ${department} साइबर क्राइम हेल्पलाइन हो, फोनमा भनेअनुसार। तपाईंको उजुरी नम्बर ${caseNo} हो। हामी उजुरी फारमका प्रश्न एक-एक गरी सोध्छौं; कृपया यहीँ जवाफ र स्क्रिनसट पठाउनुहोस्।`;
   return `नमस्ते, यह ${department} साइबर क्राइम हेल्पलाइन है, जैसा कॉल पर बात हुई। आपकी शिकायत संख्या ${caseNo} है। हम शिकायत फ़ॉर्म के सवाल एक-एक करके पूछेंगे; कृपया यहीं जवाब दें और स्क्रीनशॉट भी यहीं भेजें।`;
 }
 
+export function openerText(department: string, caseNo: string, language: string | null | undefined): string {
+  return both((l) => openerTextIn(department, caseNo, l), language);
+}
+
 /** For a complaint without money lost: the cyber team's own form. */
-export function formLinkText(department: string, caseNo: string, url: string, language: string | null | undefined): string {
-  const l = langOf(language);
+function formLinkTextIn(department: string, caseNo: string, url: string, l: Lang): string {
   if (l === "en") return `Hello, this is the ${department} cyber crime helpline, as agreed on your call. Your complaint number is ${caseNo}. Please fill in the complaint form here: ${url}\nYou can also send screenshots in reply to this message.`;
   if (l === "ne") return `नमस्ते, यो ${department} साइबर क्राइम हेल्पलाइन हो, फोनमा भनेअनुसार। तपाईंको उजुरी नम्बर ${caseNo} हो। कृपया यहाँ उजुरी फारम भर्नुहोस्: ${url}\nस्क्रिनसट यही सन्देशको जवाफमा पनि पठाउन सक्नुहुन्छ।`;
   return `नमस्ते, यह ${department} साइबर क्राइम हेल्पलाइन है, जैसा कॉल पर बात हुई। आपकी शिकायत संख्या ${caseNo} है। कृपया यह शिकायत फ़ॉर्म भरें: ${url}\nस्क्रीनशॉट इसी मैसेज के जवाब में भी भेज सकते हैं।`;
 }
 
-export function reminderText(caseNo: string, missing: string[], language: string | null | undefined): string {
-  const l = langOf(language);
+export function formLinkText(department: string, caseNo: string, url: string, language: string | null | undefined): string {
+  return both((l) => formLinkTextIn(department, caseNo, url, l), language);
+}
+
+function reminderTextIn(caseNo: string, missing: string[], l: Lang): string {
   const items = missing.map((k) => SHORT[k]?.[l] ?? FIELD_LABELS[k] ?? k).join(", ");
   if (l === "en") return `Reminder about complaint ${caseNo}: we still need ${items}. Your complaint goes to officers as soon as this is in. Please reply here.`;
   if (l === "ne") return `उजुरी ${caseNo} बारे सम्झना: अझै चाहिन्छ: ${items}। यो आएपछि उजुरी अधिकारीलाई पठाइन्छ। कृपया यहीँ जवाफ दिनुहोस्।`;
   return `शिकायत ${caseNo} के बारे में याद दिला रहे हैं: अभी भी चाहिए: ${items}। यह मिलते ही आपकी शिकायत अधिकारियों को भेज दी जाएगी। कृपया यहीं जवाब दें।`;
 }
 
-export function completeText(caseNo: string, language: string | null | undefined): string {
-  const l = langOf(language);
+export function reminderText(caseNo: string, missing: string[], language: string | null | undefined): string {
+  return both((l) => reminderTextIn(caseNo, missing, l), language);
+}
+
+function completeTextIn(caseNo: string, l: Lang): string {
   if (l === "en") return `Thank you. Complaint ${caseNo} is complete and has been handed to the cyber cell officers. An officer will contact you on this number. Please keep all chats and screenshots; do not delete them.`;
   if (l === "ne") return `धन्यवाद। उजुरी ${caseNo} पूरा भयो र साइबर सेलका अधिकारीलाई दिइयो। अधिकारीले यही नम्बरमा सम्पर्क गर्नुहुनेछ। सबै च्याट र स्क्रिनसट नमेटाउनुहोस्।`;
   return `धन्यवाद। शिकायत ${caseNo} पूरी हो गई है और साइबर सेल के अधिकारियों को सौंप दी गई है। अधिकारी इसी नंबर पर आपसे संपर्क करेंगे। सभी चैट और स्क्रीनशॉट संभाल कर रखें, डिलीट न करें।`;
 }
 
-export function receivedProofText(language: string | null | undefined): string {
-  const l = langOf(language);
+export function completeText(caseNo: string, language: string | null | undefined): string {
+  return both((l) => completeTextIn(caseNo, l), language);
+}
+
+function receivedProofTextIn(l: Lang): string {
   if (l === "en") return "Received, thank you. You can send more screenshots any time.";
   if (l === "ne") return "प्राप्त भयो, धन्यवाद। थप स्क्रिनसट जुनसुकै बेला पठाउन सक्नुहुन्छ।";
   return "मिल गया, धन्यवाद। आप और स्क्रीनशॉट कभी भी भेज सकते हैं।";
 }
 
-export function dangerText(language: string | null | undefined): string {
-  const l = langOf(language);
+export function receivedProofText(language: string | null | undefined): string {
+  return both((l) => receivedProofTextIn(l), language);
+}
+
+function dangerTextIn(l: Lang): string {
   if (l === "en") return "You are not at fault and you must not pay anyone. If anyone's life is in danger right now, call 112. We have marked your complaint urgent for an officer.";
   if (l === "ne") return "तपाईंको गल्ती होइन, कसैलाई पैसा नदिनुहोस्। कसैको ज्यान खतरामा छ भने अहिले नै 112 मा फोन गर्नुहोस्। तपाईंको उजुरी अधिकारीका लागि जरुरी भनेर राखिएको छ।";
   return "इसमें आपकी कोई गलती नहीं है, किसी को भी पैसे न दें। अगर किसी की जान को अभी खतरा है तो तुरंत 112 पर कॉल करें। आपकी शिकायत अधिकारी के लिए अर्जेंट मार्क कर दी गई है।";
+}
+
+export function dangerText(language: string | null | undefined): string {
+  return both((l) => dangerTextIn(l), language);
 }
 
 export function caseNumber(prefix: string, createdAt: Date, seq: number): string {

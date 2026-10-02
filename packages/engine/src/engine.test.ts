@@ -56,7 +56,7 @@ async function runQueued(model: SafetyModel) {
   return queued.length;
 }
 import { saveVoiceConnection, markConnection } from "./voice-conn";
-import { syncTenantCalls } from "./sync";
+import { syncSinceFromEnv, syncTenantCalls } from "./sync";
 import { addCarrierAccount, addPhoneNumber } from "./telephony";
 import { runDialerTick, SimulatedGateway, zoned } from "./dialer";
 import { entitlements, statement, usage, billingPeriod } from "./plans";
@@ -355,6 +355,23 @@ describe("calls sync", () => {
     expect(c!.extracted.concern).toBe("implant consultation"); // engine fields still fill gaps
   });
 
+  it("never imports calls from before the start date (test calls before going live)", async () => {
+    const old = new Date(Date.now() - 3_600_000).toISOString();
+    const fresh = new Date().toISOString();
+    fake.runs.set(2, [
+      ...(fake.runs.get(2) ?? []),
+      { id: 906, workflow_id: 2, is_completed: true, created_at: old, call_type: "inbound", cost_info: { call_duration_seconds: 30 }, initial_context: { caller_number: "919876500006" }, gathered_context: {} },
+      { id: 907, workflow_id: 2, is_completed: true, created_at: fresh, call_type: "inbound", cost_info: { call_duration_seconds: 30 }, initial_context: { caller_number: "919876500007" }, gathered_context: {} },
+    ]);
+    await syncTenantCalls(tenant, { since: new Date(Date.now() - 60_000) });
+    const ids = (await withTenant(tenant, (tx) => tx.select({ id: calls.externalRunId }).from(calls))).map((r) => r.id);
+    expect(ids).toContain("907");
+    expect(ids).not.toContain("906");
+    expect(() => syncSinceFromEnv({ JENAI_SYNC_SINCE: "yesterday-ish" })).toThrow(/not a date/);
+    expect(syncSinceFromEnv({ JENAI_SYNC_SINCE: "2026-10-03T00:00:00+05:30" })?.toISOString()).toBe("2026-10-02T18:30:00.000Z");
+    expect(syncSinceFromEnv({})).toBeNull();
+  });
+
   it("one broken agent does not switch syncing off for the workspace", async () => {
     const [extra] = await withTenant(tenant, (tx) =>
       tx.insert(agents).values({ tenantId: tenant, name: "Retired line", templateKey: "clinic_receptionist", templateVersion: 2, inboundWorkflowId: 777 }).returning(),
@@ -439,7 +456,7 @@ describe("plans", () => {
     const period = billingPeriod(new Date());
     const s = await withTenant(tenant, async (tx) => statement(await entitlements(tx, tenant), await usage(tx, tenant, period.from, period.to), period, 1));
     expect(s.usage.calls).toBeGreaterThanOrEqual(3);
-    expect(s.usage.minutes).toBe(4 + 1 + 2 + 4); // 184 s -> 4 started minutes, 1 s -> 1, 95 s -> 2, 240 s -> 4, unfinished -> 0
+    expect(s.usage.minutes).toBe(4 + 1 + 2 + 4 + 1 + 1); // 184 s -> 4 started minutes, 1 s -> 1, 95 s -> 2, 240 s -> 4, two 30 s calls -> 1 each, unfinished -> 0
     expect(s.fixedFeePaise).toBe(799_900);
     expect(s.billableMinutes).toBe(0); // inside the 1,200 included minutes
   });

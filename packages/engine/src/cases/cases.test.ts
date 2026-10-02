@@ -9,7 +9,7 @@ import { eq } from "drizzle-orm";
 import { caseEvidence, caseMessages, cases, organizations, platformDb, whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
 import { scamKeyFromText } from "../scams";
 import { caseFromCall, fieldsFromCall, handleInbound, parseRead, remindPending, type CaseReader, type ReadResult } from "./cases";
-import { missingFor } from "./catalog";
+import { missingFor, questionFor, reminderText } from "./catalog";
 import { processInbox, queueInbound } from "./inbox";
 import { SimulatedWhatsApp, parseOpenWaWebhook, validSignature, type QueuedMessage } from "./whatsapp";
 import { createHmac } from "node:crypto";
@@ -72,6 +72,19 @@ describe("case catalogue", () => {
     expect(has({ suspect_account_or_upi: "fraud@ybl" }, "fraudster_details")).toBe(true);
     expect(has({ fraudster_details: "not known" }, "fraudster_details")).toBe(true);
   });
+  it("writes every WhatsApp message in Hindi and English together (Nepali and English for a Nepali speaker)", () => {
+    const hi = questionFor("pincode", "hi");
+    expect(hi).toContain("आपके क्षेत्र का पिनकोड");
+    expect(hi).toContain("What is your PIN code");
+    expect(questionFor("pincode", "en")).toContain("आपके क्षेत्र का पिनकोड"); // English writers still get both
+    const ne = questionFor("pincode", "ne");
+    expect(ne).toContain("तपाईंको क्षेत्रको पिनकोड");
+    expect(ne).toContain("What is your PIN code");
+    expect(ne).not.toContain("आपके क्षेत्र का पिनकोड");
+    const r = reminderText("CY-2026-000001", ["pincode", "proof"], "hi");
+    expect(r).toContain("पिनकोड, सबूत (स्क्रीनशॉट)");
+    expect(r).toContain("PIN code, proof (screenshots)");
+  });
   it("never keeps more than the last 4 digits of a card", () => {
     expect(fieldsFromCall({ card_last4: "4111 1111 1111 1234" }).card_last4).toBe("1234");
     expect(parseRead('{"fields":{"card_last4":"4111111111111234"}}').fields).toEqual({ card_last4: "1234" });
@@ -97,6 +110,8 @@ describe("a money fraud from call to officers", () => {
     expect(wa.sent).toHaveLength(1);
     expect(wa.sent[0]!.body).toMatch(/शिकायत संख्या CY-\d{4}-000001/);
     expect(wa.sent[0]!.body).toContain("आपका पूरा नाम");
+    expect(wa.sent[0]!.body).toContain("What is your full name");
+    expect(wa.sent[0]!.body).toContain("Your complaint number is CY-");
   });
 
   it("a second call from the same person adds to the same case, without a second WhatsApp", async () => {
