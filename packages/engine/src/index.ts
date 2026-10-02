@@ -17,3 +17,6 @@ export * from "./call-analytics";
 export * from "./complaint-form";
 export * from "./cases/index";
 export * from "./telephone-line";
+export * from "./cy-agent";
+// For the command-line tools in @jenai/db, which do not depend on @jenai/voice directly.
+export { DograhClient } from "@jenai/voice";

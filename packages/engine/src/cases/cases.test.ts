@@ -99,18 +99,20 @@ describe("a money fraud from call to officers", () => {
   const wa = new SimulatedWhatsApp();
   const call = (extracted: Record<string, unknown>, who = phone) => withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id: randomUUID(), phone: who, contactId: null, branchId: null, extracted }, wa));
 
-  it("opens a case after the call and, with the caller's yes, asks the form's first line on WhatsApp", async () => {
+  it("opens a case after the call and asks on WhatsApp only what the call did not take", async () => {
     const c = await call({ complaint_type: "UPI/bank/card fraud", how_it_happened: "Clicked a loan link, 40000 went by UPI", money_lost: "40000", complainant_name: "Sainath", call_language: "hindi", whatsapp_consent: "yes" });
     expect(c!.status).toBe("collecting");
     expect(c!.scamType).toBe("upi_bank_card");
     expect(c!.fields.followup).toBe("questions");
-    expect(c!.fields.complainant_name).toBeUndefined(); // asked again in writing
-    expect(c!.missing[0]).toBe("complainant_name");
-    expect(c!.missing).toHaveLength(15);
+    expect(c!.fields.complainant_name).toBe("Sainath"); // confirmed on the call, not asked again
+    expect(c!.missing[0]).toBe("father_or_husband_name");
+    expect(c!.missing).not.toContain("complainant_name");
+    expect(c!.missing).not.toContain("how_it_happened");
+    expect(c!.missing).toHaveLength(12);
     expect(wa.sent).toHaveLength(1);
     expect(wa.sent[0]!.body).toMatch(/शिकायत संख्या CY-\d{4}-000001/);
-    expect(wa.sent[0]!.body).toContain("आपका पूरा नाम");
-    expect(wa.sent[0]!.body).toContain("What is your full name");
+    expect(wa.sent[0]!.body).toContain("पिता या पति");
+    expect(wa.sent[0]!.body).toContain("father's or husband's name");
     expect(wa.sent[0]!.body).toContain("Your complaint number is CY-");
   });
 
@@ -140,15 +142,15 @@ describe("a money fraud from call to officers", () => {
       "no": { fields: { apk_or_link: "no" } },
     });
     const say = (text: string) => handleInbound(tenant, { from: phone, id: randomUUID(), at: new Date(), text }, reader, wa);
-    await say("Sainath Tangallapalli");
-    expect(wa.sent.at(-1)!.body).toContain("पिता या पति");
-    for (const t of ["Sadanandam", "15/08/1990", "12-4", "Shanti Vihar, Rishikesh", "Rishikesh thana", "Dehradun"]) await say(t);
+    await say("Sadanandam");
+    expect(wa.sent.at(-1)!.body).toContain("जन्म तिथि");
+    for (const t of ["15/08/1990", "12-4", "Shanti Vihar, Rishikesh", "Rishikesh thana", "Dehradun"]) await say(t);
     expect(wa.sent.at(-1)!.body).toContain("पिनकोड");
     await say("24920"); // five digits
     expect(wa.sent.at(-1)!.body).toContain("6 अंकों");
     expect(wa.sent.at(-1)!.body).toContain("8. आपके क्षेत्र का पिनकोड");
-    for (const t of ["249201", "SBI 30012345678", "UTR 412345678901, 40000, 28 Sep", "40000", "Clicked a loan link and paid by UPI"]) await say(t);
-    // The fraudster's number came from the second call; next is the APK question.
+    for (const t of ["249201", "SBI 30012345678", "UTR 412345678901, 40000, 28 Sep"]) await say(t);
+    // The amount and what happened came from the call, the fraudster's number from the second call: next is the APK question.
     expect(wa.sent.at(-1)!.body).toContain("APK");
     await say("no");
     expect(wa.sent.at(-1)!.body).toContain("सबूत");
@@ -177,6 +179,14 @@ describe("a money fraud from call to officers", () => {
 });
 
 describe("without a yes, or without money lost", () => {
+  it("writes to the WhatsApp number the caller gave when it differs from the calling number", async () => {
+    const wa = new SimulatedWhatsApp();
+    const c = await withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id: randomUUID(), phone: "+919800000021", contactId: null, branchId: null, extracted: { complaint_type: "UPI fraud", money_lost: "2000", complainant_name: "Hema", how_it_happened: "UPI collect request approved by mistake", whatsapp_consent: "yes", whatsapp_number: "98000 00022" } }, wa));
+    expect(c!.complainantE164).toBe("+919800000022");
+    expect(c!.fields.caller_number).toBe("+919800000021");
+    expect(wa.sent[0]!.to).toBe("+919800000022");
+  });
+
   it("sends nothing when the caller did not agree, and gives officers what the call took", async () => {
     const wa = new SimulatedWhatsApp();
     const who = "+919800000011";

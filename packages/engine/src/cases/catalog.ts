@@ -257,9 +257,9 @@ export function hintFor(field: string, language: string | null | undefined): str
 }
 
 function openerTextIn(department: string, caseNo: string, l: Lang): string {
-  if (l === "en") return `Hello, this is the ${department} cyber crime helpline, as agreed on your call. Your complaint number is ${caseNo}. We will ask the complaint form one question at a time; please reply here and send the screenshots here too.`;
-  if (l === "ne") return `नमस्ते, यो ${department} साइबर क्राइम हेल्पलाइन हो, फोनमा भनेअनुसार। तपाईंको उजुरी नम्बर ${caseNo} हो। हामी उजुरी फारमका प्रश्न एक-एक गरी सोध्छौं; कृपया यहीँ जवाफ र स्क्रिनसट पठाउनुहोस्।`;
-  return `नमस्ते, यह ${department} साइबर क्राइम हेल्पलाइन है, जैसा कॉल पर बात हुई। आपकी शिकायत संख्या ${caseNo} है। हम शिकायत फ़ॉर्म के सवाल एक-एक करके पूछेंगे; कृपया यहीं जवाब दें और स्क्रीनशॉट भी यहीं भेजें।`;
+  if (l === "en") return `Hello, this is the ${department} helpline, as agreed on your call. Your complaint number is ${caseNo}. We will ask the complaint form one question at a time; please reply here and send the screenshots here too.`;
+  if (l === "ne") return `नमस्ते, यो ${department} को हेल्पलाइन हो, फोनमा भनेअनुसार। तपाईंको उजुरी नम्बर ${caseNo} हो। हामी उजुरी फारमका प्रश्न एक-एक गरी सोध्छौं; कृपया यहीँ जवाफ र स्क्रिनसट पठाउनुहोस्।`;
+  return `नमस्ते, यह ${department} की हेल्पलाइन है, जैसा कॉल पर बात हुई। आपकी शिकायत संख्या ${caseNo} है। हम शिकायत फ़ॉर्म के सवाल एक-एक करके पूछेंगे; कृपया यहीं जवाब दें और स्क्रीनशॉट भी यहीं भेजें।`;
 }
 
 export function openerText(department: string, caseNo: string, language: string | null | undefined): string {
@@ -268,9 +268,9 @@ export function openerText(department: string, caseNo: string, language: string 
 
 /** For a complaint without money lost: the cyber team's own form. */
 function formLinkTextIn(department: string, caseNo: string, url: string, l: Lang): string {
-  if (l === "en") return `Hello, this is the ${department} cyber crime helpline, as agreed on your call. Your complaint number is ${caseNo}. Please fill in the complaint form here: ${url}\nYou can also send screenshots in reply to this message.`;
-  if (l === "ne") return `नमस्ते, यो ${department} साइबर क्राइम हेल्पलाइन हो, फोनमा भनेअनुसार। तपाईंको उजुरी नम्बर ${caseNo} हो। कृपया यहाँ उजुरी फारम भर्नुहोस्: ${url}\nस्क्रिनसट यही सन्देशको जवाफमा पनि पठाउन सक्नुहुन्छ।`;
-  return `नमस्ते, यह ${department} साइबर क्राइम हेल्पलाइन है, जैसा कॉल पर बात हुई। आपकी शिकायत संख्या ${caseNo} है। कृपया यह शिकायत फ़ॉर्म भरें: ${url}\nस्क्रीनशॉट इसी मैसेज के जवाब में भी भेज सकते हैं।`;
+  if (l === "en") return `Hello, this is the ${department} helpline, as agreed on your call. Your complaint number is ${caseNo}. Please fill in the complaint form here: ${url}\nYou can also send screenshots in reply to this message.`;
+  if (l === "ne") return `नमस्ते, यो ${department} को हेल्पलाइन हो, फोनमा भनेअनुसार। तपाईंको उजुरी नम्बर ${caseNo} हो। कृपया यहाँ उजुरी फारम भर्नुहोस्: ${url}\nस्क्रिनसट यही सन्देशको जवाफमा पनि पठाउन सक्नुहुन्छ।`;
+  return `नमस्ते, यह ${department} की हेल्पलाइन है, जैसा कॉल पर बात हुई। आपकी शिकायत संख्या ${caseNo} है। कृपया यह शिकायत फ़ॉर्म भरें: ${url}\nस्क्रीनशॉट इसी मैसेज के जवाब में भी भेज सकते हैं।`;
 }
 
 export function formLinkText(department: string, caseNo: string, url: string, language: string | null | undefined): string {

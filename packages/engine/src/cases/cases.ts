@@ -3,6 +3,7 @@ import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-r
 import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import { z } from "zod";
 import { audit, caseEvidence, caseMessages, cases, organizations, withTenant, type Case, type Tx, type WhatsappChannel } from "@jenai/db";
+import { toE164 } from "@jenai/voice";
 import { SCAM_TYPES, scamKeyFromText } from "../scams";
 import { isOnOwnNetwork } from "../own-network";
 import {
@@ -77,9 +78,6 @@ const CALL_KEYS = [
   "type_details",
   "complaint_type",
 ] as const;
-/** What decides which way a case goes; kept even when WhatsApp asks the form again. */
-const CONTEXT_KEYS = new Set(["complaint_type", "type_details", "happened_when"]);
-
 const clean = (v: unknown) => {
   const t = v === null || v === undefined ? "" : String(v).trim();
   return /^(null|none|unknown|n\/a)$/i.test(t) ? "" : t;
@@ -213,9 +211,10 @@ async function askNext(tx: Tx, tenantId: string, c: Case, wa: Wa, prefix?: strin
 
 /**
  * After a cyber crime call is analysed: open (or add to) the complainant's case.
- * If the caller agreed on the call, WhatsApp follows: the department's form one
- * question at a time for a money fraud, the cyber team's form link otherwise.
- * Without that yes nothing is sent, and officers get what the call took.
+ * When the caller has WhatsApp, WhatsApp follows: for a money fraud the rest of the
+ * department's form, one question at a time (what the call already took is not asked
+ * again); otherwise the cyber team's form link. A caller with no WhatsApp gets nothing,
+ * and officers get what the call took.
  */
 export async function caseFromCall(
   tx: Tx,
@@ -223,23 +222,27 @@ export async function caseFromCall(
   call: { id: string; phone: string | null; contactId: string | null; branchId: string | null; extracted: Record<string, unknown> },
   sender?: WhatsAppSender,
 ): Promise<Case | null> {
-  if (!call.phone) return null;
+  // The follow-up goes to the WhatsApp number the caller gave, else to the number that called.
+  const whatsapp = toE164(clean(call.extracted.whatsapp_number));
+  const phone = whatsapp && whatsapp.replace(/\D/g, "").length >= 10 ? whatsapp : call.phone;
+  if (!phone) return null;
   const incoming = fieldsFromCall(call.extracted);
   const scam = scamKeyFromText(clean(call.extracted.complaint_type)) ?? null;
   if (scam === null && !incoming.how_it_happened && !FRAUDSTER_KEYS.some((k) => incoming[k])) return null; // nothing to open a case on
   const language = langKey(call.extracted.call_language);
   const agreed = agreedOnCall(call.extracted);
   const money = isFinancial(incoming, scam);
-  let c = await openCaseFor(tx, call.phone);
+  let c = await openCaseFor(tx, phone);
   const fresh = !c;
   if (!c) {
-    // With the caller's yes, WhatsApp asks the whole form again in writing, where nothing is misheard; the call's
-    // answers stay on the call and fill any line left empty. Without it, the case holds what the call took.
-    const fields: Record<string, string> = agreed ? Object.fromEntries(Object.entries(incoming).filter(([k]) => CONTEXT_KEYS.has(k))) : { ...incoming };
+    // The case holds what the call took (name, mobile, what happened, anything more the caller said);
+    // WhatsApp asks only what is still missing.
+    const fields: Record<string, string> = { ...incoming };
     fields.followup = !agreed ? "none" : scam && !money ? "form_link" : "questions";
     if (agreed) fields.whatsapp_consent = "yes";
     if (money) fields.financial = "yes";
-    c = await newCase(tx, tenantId, { phone: call.phone, contactId: call.contactId, callId: call.id, branchId: call.branchId, fields, scamType: scam, language });
+    if (phone !== call.phone && call.phone) fields.caller_number = call.phone;
+    c = await newCase(tx, tenantId, { phone, contactId: call.contactId, callId: call.id, branchId: call.branchId, fields, scamType: scam, language });
   } else {
     // A second call adds what is new; what the complainant already wrote stays.
     const merged = { ...incoming, ...c.fields };
