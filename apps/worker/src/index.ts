@@ -24,6 +24,8 @@
  * The WhatsApp loop is ON by default (JENAI_WHATSAPP=false turns it off) and idle until a
  * workspace has a WhatsApp channel: it reads queued replies in order with the configured
  * model and sends reminders (every 6 hours, 9 am to 9 pm, until the form is complete).
+ * The first WhatsApp message after a cyber crime call goes from the sync loop, as soon as
+ * the call is copied, from what the voice engine took on the call (no model needed).
  *
  * The telephone line monitor runs when JENAI_TEL_IFACE names the port of the government
  * cable (or "auto"): every minute it checks the cable, the address on that port, the
@@ -45,6 +47,7 @@ import {
   checkLine,
   lineConfigFromEnv,
   readNetFacts,
+  followUpCalls,
   processInbox,
   remindPending,
   claimDeliveries,
@@ -112,6 +115,13 @@ async function syncLoop() {
           log("sync.tenant", { tenant: t.id.slice(0, 8), ...s, errors: s.errors.length, firstError: s.errors[0]?.slice(0, 160) });
         } catch (e) {
           log("sync.error", { tenant: t.id.slice(0, 8), message: (e as Error).message });
+        }
+        // A finished complaint call opens its case and starts WhatsApp now, not after the local AI.
+        try {
+          const n = await followUpCalls(t.id);
+          if (n) log("cases.followed_up", { tenant: t.id.slice(0, 8), calls: n });
+        } catch (e) {
+          log("cases.followup_error", { tenant: t.id.slice(0, 8), message: (e as Error).message });
         }
       }
     } catch (e) {

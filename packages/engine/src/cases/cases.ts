@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
-import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lt, sql } from "drizzle-orm";
 import { z } from "zod";
-import { audit, caseEvidence, caseMessages, cases, organizations, withTenant, type Case, type Tx, type WhatsappChannel } from "@jenai/db";
-import { toE164 } from "@jenai/voice";
-import { SCAM_TYPES, scamKeyFromText } from "../scams";
+import { agents, audit, calls, caseCalls, caseEvidence, caseMessages, cases, organizations, withTenant, type Case, type Tx, type WhatsappChannel } from "@jenai/db";
+import { CYBER_INTAKE_DOMAIN, toE164 } from "@jenai/voice";
+import { SCAM_TYPES, categoryOf, isNotCyberCrime, scamKeyFromText } from "../scams";
 import { isOnOwnNetwork } from "../own-network";
 import {
   FIELD_LABELS,
   FRAUDSTER_KEYS,
+  callAgainText,
   caseNumber,
   completeText,
   dangerText,
@@ -94,8 +95,11 @@ export function fieldsFromCall(x: Record<string, unknown>): Record<string, strin
   return out;
 }
 
-/** The caller said yes on the call to continue on WhatsApp. */
-const agreedOnCall = (x: Record<string, unknown>) => /^(yes|haan|han|ha|ho)\b/i.test(clean(x.whatsapp_consent));
+/**
+ * The caller said they have no WhatsApp at all. The call tells callers WhatsApp is coming
+ * rather than asking, so anything else (yes, a WhatsApp number, not discussed) gets it.
+ */
+const noWhatsApp = (x: Record<string, unknown>) => /^(no|nahi|nahin|nahi hai|chhaina|false)\b/i.test(clean(x.whatsapp_consent));
 
 async function evidenceCount(tx: Tx, caseId: string): Promise<number> {
   const [r] = await tx.select({ n: sql<number>`count(*)::int` }).from(caseEvidence).where(eq(caseEvidence.caseId, caseId));
@@ -104,7 +108,7 @@ async function evidenceCount(tx: Tx, caseId: string): Promise<number> {
 
 /**
  * Recomputes what is missing and hands the case to officers ("ready") when WhatsApp
- * has nothing left to collect, or is not collecting at all (the caller said no).
+ * has nothing left to collect, or is not collecting at all (the caller has no WhatsApp).
  */
 async function settle(tx: Tx, tenantId: string, c: Case): Promise<Case> {
   const missing = missingFor(c.fields, c.scamType, await evidenceCount(tx, c.id));
@@ -130,7 +134,7 @@ async function settle(tx: Tx, tenantId: string, c: Case): Promise<Case> {
       action: "case.ready",
       targetType: "case",
       targetId: c.id,
-      summary: missing.length ? `Case ${no} handed to officers without a WhatsApp follow-up (the caller did not agree)` : `Case ${no} has everything WhatsApp collects; handed to officers`,
+      summary: missing.length ? `Case ${no} handed to officers without a WhatsApp follow-up (the caller has no WhatsApp)` : `Case ${no} has everything WhatsApp collects; handed to officers`,
     });
   }
   return u!;
@@ -159,15 +163,34 @@ async function newCase(tx: Tx, tenantId: string, input: { phone: string; contact
   return c!;
 }
 
-/** The complainant's case still being worked on, if any. */
+/** The complainant's case still being worked on, if any; one still being filled in on WhatsApp comes first. */
 async function openCaseFor(tx: Tx, phone: string): Promise<Case | null> {
   const [c] = await tx
     .select()
     .from(cases)
     .where(and(eq(cases.complainantE164, phone), inArray(cases.status, ["collecting", "ready", "taken_up"])))
-    .orderBy(desc(cases.updatedAt))
+    .orderBy(sql`(${cases.status} = 'collecting') desc`, desc(cases.updatedAt))
     .limit(1);
   return c ?? null;
+}
+
+/** The case a call already opened or added to, when the call is read a second time. */
+async function caseOfCall(tx: Tx, callId: string): Promise<Case | null> {
+  const [link] = await tx.select({ caseId: caseCalls.caseId }).from(caseCalls).where(eq(caseCalls.callId, callId)).limit(1);
+  const [c] = link ? await tx.select().from(cases).where(eq(cases.id, link.caseId)) : await tx.select().from(cases).where(eq(cases.firstCallId, callId)).limit(1);
+  return c ?? null;
+}
+
+/**
+ * A call continues the complainant's case while it is still being filled in and is about
+ * the same kind of complaint (money fraud, social media, frozen account); a different kind
+ * is a new complaint with its own case. A type not known yet on either side continues.
+ */
+function continues(open: Case, scam: string | null): boolean {
+  if (open.status !== "collecting") return false;
+  const kind = (s: string | null) => (s && s !== "other" ? categoryOf(s) : null);
+  const [was, now] = [kind(open.scamType), kind(scam)];
+  return !was || !now || was === now;
 }
 
 async function record(tx: Tx, tenantId: string, caseId: string, m: { direction: "in" | "out"; body?: string | null; evidenceId?: string | null; externalId?: string | null; status?: string; error?: string | null }) {
@@ -209,59 +232,130 @@ async function askNext(tx: Tx, tenantId: string, c: Case, wa: Wa, prefix?: strin
   await send(tx, tenantId, c, wa.sender, [prefix, questionFor(next, c.language)].filter(Boolean).join("\n\n"), next);
 }
 
+async function markUrgent(tx: Tx, c: Case, extracted: Record<string, unknown>): Promise<Case> {
+  if (!clean(extracted.danger).toLowerCase().startsWith("yes") || c.fields.urgent === "yes") return c;
+  return one(await tx.update(cases).set({ fields: { ...c.fields, urgent: "yes" } }).where(eq(cases.id, c.id)).returning());
+}
+
 /**
- * After a cyber crime call is analysed: open (or add to) the complainant's case.
- * When the caller has WhatsApp, WhatsApp follows: for a money fraud the rest of the
- * department's form, one question at a time (what the call already took is not asked
- * again); otherwise the cyber team's form link. A caller with no WhatsApp gets nothing,
- * and officers get what the call took.
+ * After a cyber crime call: open the complainant's case, or add to the one still being
+ * filled in on WhatsApp. Unless the caller said they have no WhatsApp, WhatsApp follows:
+ * for a money fraud the rest of the department's form, one question at a time (what the
+ * call already took is not asked again); otherwise the cyber team's form link. A caller
+ * who called again about the case in progress is picked up where WhatsApp left off.
+ *
+ * A call is read twice: first with what the voice engine took on the call (as soon as it
+ * ends), then by the local AI. Only the first reading messages; the second fills in what
+ * is new. `message: false` (a call read long after it happened) only fills in the case.
  */
 export async function caseFromCall(
   tx: Tx,
   tenantId: string,
   call: { id: string; phone: string | null; contactId: string | null; branchId: string | null; extracted: Record<string, unknown> },
   sender?: WhatsAppSender,
+  opts: { message?: boolean } = {},
 ): Promise<Case | null> {
+  // One reading of a call at a time, so the engine's and the AI's readings never both message.
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`call:${call.id}`}))`);
+  const incoming = fieldsFromCall(call.extracted);
+  const scam = scamKeyFromText(clean(call.extracted.complaint_type)) ?? null;
+  const language = langKey(call.extracted.call_language);
+  const known = await caseOfCall(tx, call.id);
+  if (known) {
+    // Read again: what is new fills the gaps; what the case already holds stays.
+    const c = one(await tx.update(cases).set({ fields: { ...incoming, ...known.fields }, scamType: known.scamType ?? scam, language: known.language ?? language, updatedAt: new Date() }).where(eq(cases.id, known.id)).returning());
+    return settle(tx, tenantId, await markUrgent(tx, c, call.extracted));
+  }
+
   // The follow-up goes to the WhatsApp number the caller gave, else to the number that called.
   const whatsapp = toE164(clean(call.extracted.whatsapp_number));
   const phone = whatsapp && whatsapp.replace(/\D/g, "").length >= 10 ? whatsapp : call.phone;
   if (!phone) return null;
-  const incoming = fieldsFromCall(call.extracted);
-  const scam = scamKeyFromText(clean(call.extracted.complaint_type)) ?? null;
   if (scam === null && !incoming.how_it_happened && !FRAUDSTER_KEYS.some((k) => incoming[k])) return null; // nothing to open a case on
-  const language = langKey(call.extracted.call_language);
-  const agreed = agreedOnCall(call.extracted);
+  const wantsWhatsApp = !noWhatsApp(call.extracted);
   const money = isFinancial(incoming, scam);
-  let c = await openCaseFor(tx, phone);
-  const fresh = !c;
-  if (!c) {
+  const followup = !wantsWhatsApp ? "none" : scam && !money ? "form_link" : "questions";
+  const open = await openCaseFor(tx, phone);
+  const was = open && continues(open, scam) ? open : null;
+  const fresh = !was;
+  let c: Case;
+  if (!was) {
     // The case holds what the call took (name, mobile, what happened, anything more the caller said);
     // WhatsApp asks only what is still missing.
-    const fields: Record<string, string> = { ...incoming };
-    fields.followup = !agreed ? "none" : scam && !money ? "form_link" : "questions";
-    if (agreed) fields.whatsapp_consent = "yes";
+    const fields: Record<string, string> = { ...incoming, followup };
+    if (wantsWhatsApp) fields.whatsapp_consent = "yes";
     if (money) fields.financial = "yes";
     if (phone !== call.phone && call.phone) fields.caller_number = call.phone;
     c = await newCase(tx, tenantId, { phone, contactId: call.contactId, callId: call.id, branchId: call.branchId, fields, scamType: scam, language });
   } else {
-    // A second call adds what is new; what the complainant already wrote stays.
-    const merged = { ...incoming, ...c.fields };
-    c = one(await tx.update(cases).set({ fields: merged, scamType: c.scamType ?? scam, language: c.language ?? language, updatedAt: new Date() }).where(eq(cases.id, c.id)).returning());
+    // A call about the case in progress adds what is new; what the complainant already wrote stays.
+    const fields = { ...incoming, ...was.fields };
+    if (was.fields.followup === "none" && wantsWhatsApp) Object.assign(fields, { followup, whatsapp_consent: "yes" });
+    if (money) fields.financial = "yes";
+    c = one(
+      await tx
+        .update(cases)
+        .set({ fields, scamType: was.scamType ?? scam, language: was.language ?? language, firstCallId: was.firstCallId ?? call.id, contactId: was.contactId ?? call.contactId, updatedAt: new Date() })
+        .where(eq(cases.id, was.id))
+        .returning(),
+    );
   }
-  if (clean(call.extracted.danger).toLowerCase().startsWith("yes")) {
-    c = one(await tx.update(cases).set({ fields: { ...c!.fields, urgent: "yes" } }).where(eq(cases.id, c!.id)).returning());
-  }
-  c = await settle(tx, tenantId, c!);
-  if (!fresh || c.fields.followup === "none") return c;
+  await tx.insert(caseCalls).values({ tenantId, callId: call.id, caseId: c.id }).onConflictDoNothing();
+  c = await settle(tx, tenantId, await markUrgent(tx, c, call.extracted));
+  if (c.fields.followup === "none" || opts.message === false) return c;
 
   const wa = await whatsappFor(tx, tenantId, sender);
   if (!wa) return c;
   if (c.fields.followup === "form_link") {
-    await sendFormLink(tx, tenantId, c, wa);
+    if (c.asking !== "__form__") await sendFormLink(tx, tenantId, c, wa);
     return c;
   }
-  await askNext(tx, tenantId, c, wa, openerText(await departmentName(tx, tenantId), await caseNo(tx, tenantId, c), c.language));
+  const [department, no] = [await departmentName(tx, tenantId), await caseNo(tx, tenantId, c)];
+  await askNext(tx, tenantId, c, wa, fresh ? openerText(department, no, c.language) : callAgainText(department, no, c.language));
   return c;
+}
+
+/** A call this recent is followed on WhatsApp; one read later than this (a backlog, a re-read) only fills in its case. */
+export const FOLLOWUP_WINDOW_MS = 24 * 3_600_000;
+
+/**
+ * Right after calls are copied from the voice engine: what the engine took on the call
+ * (name, number, what happened, money lost, WhatsApp) opens the case and starts WhatsApp
+ * within a minute of the call ending, instead of after the local AI has read the whole call
+ * (several minutes on a server without a graphics card). The AI's reading later fills in
+ * the case without messaging again. Returns the number of calls handled.
+ */
+export async function followUpCalls(tenantId: string, opts: { sender?: WhatsAppSender; now?: Date; withinMs?: number } = {}): Promise<number> {
+  const now = opts.now ?? new Date();
+  const due = await withTenant(tenantId, (tx) =>
+    tx
+      .select({ c: calls })
+      .from(calls)
+      .innerJoin(agents, eq(agents.id, calls.agentId))
+      .leftJoin(caseCalls, and(eq(caseCalls.tenantId, calls.tenantId), eq(caseCalls.callId, calls.id)))
+      .where(
+        and(
+          eq(agents.domain, CYBER_INTAKE_DOMAIN),
+          eq(calls.status, "completed"),
+          isNull(calls.analyzedAt),
+          isNull(caseCalls.callId),
+          gte(calls.startedAt, new Date(now.getTime() - (opts.withinMs ?? 2 * 3_600_000))),
+          // The engine's own reading of the call is in: it says what kind of complaint this was.
+          sql`coalesce(${calls.extracted}->>'complaint_type', '') <> ''`,
+        ),
+      )
+      .orderBy(desc(calls.startedAt))
+      .limit(50),
+  );
+  let handled = 0;
+  for (const { c } of due) {
+    if (isNotCyberCrime(String(c.extracted.complaint_type ?? ""))) continue;
+    const k = await withTenant(tenantId, (tx) =>
+      caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: c.extracted }, opts.sender),
+    );
+    if (k) handled++;
+  }
+  return handled;
 }
 
 // ------------------------------------------------------------------ reading replies

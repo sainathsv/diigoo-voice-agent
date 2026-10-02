@@ -6,9 +6,10 @@ import "@jenai/db/env";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { caseEvidence, caseMessages, cases, organizations, platformDb, whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
+import { agents, calls, caseCalls, caseEvidence, caseMessages, cases, organizations, platformDb, whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
+import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { scamKeyFromText } from "../scams";
-import { caseFromCall, fieldsFromCall, handleInbound, parseRead, remindPending, type CaseReader, type ReadResult } from "./cases";
+import { caseFromCall, fieldsFromCall, followUpCalls, handleInbound, parseRead, remindPending, type CaseReader, type ReadResult } from "./cases";
 import { missingFor, questionFor, reminderText } from "./catalog";
 import { processInbox, queueInbound } from "./inbox";
 import { SimulatedWhatsApp, parseOpenWaWebhook, validSignature, type QueuedMessage } from "./whatsapp";
@@ -116,12 +117,15 @@ describe("a money fraud from call to officers", () => {
     expect(wa.sent[0]!.body).toContain("Your complaint number is CY-");
   });
 
-  it("a second call from the same person adds to the same case, without a second WhatsApp", async () => {
+  it("a second call about the case in progress adds to it, and WhatsApp picks up where it left off", async () => {
     await call({ complaint_type: "UPI fraud", fraudster_mobile: "9000000001", whatsapp_consent: "yes" });
     const all = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.complainantE164, phone)));
     expect(all).toHaveLength(1);
     expect(all[0]!.fields.fraudster_mobile).toBe("9000000001");
-    expect(wa.sent).toHaveLength(1);
+    expect(wa.sent).toHaveLength(2);
+    expect(wa.sent[1]!.body).toMatch(/शिकायत CY-\d{4}-000001 के बारे में आपकी कॉल मिल गई/);
+    expect(wa.sent[1]!.body).toContain("We have received your call about complaint CY-");
+    expect(wa.sent[1]!.body).toContain("father's or husband's name"); // the question still waiting for an answer
   });
 
   it("takes the form one line at a time, re-asks an answer in the wrong shape, stores proof, and hands the case over", async () => {
@@ -226,6 +230,94 @@ describe("without a yes, or without money lost", () => {
     const msgs = await withTenant(tenant, (tx) => tx.select().from(caseMessages).where(eq(caseMessages.caseId, c!.id)));
     expect(msgs[0]!.status).toBe("failed");
     expect(msgs[0]!.error).toMatch(/form link/);
+  });
+});
+
+describe("each call is followed once", () => {
+  const at = (who: string, extracted: Record<string, unknown>, wa: SimulatedWhatsApp, opts?: { message?: boolean }, id: string = randomUUID()) =>
+    withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id, phone: who, contactId: null, branchId: null, extracted }, wa, opts));
+
+  it("reads a call twice (the engine's details at once, the local AI later) and messages only once", async () => {
+    const wa = new SimulatedWhatsApp();
+    const id = randomUUID();
+    const first = await at("+919800000031", { complaint_type: "UPI/bank/card fraud", money_lost: "15000", complainant_name: "Asha Negi", whatsapp_consent: "yes" }, wa, undefined, id);
+    expect(wa.sent).toHaveLength(1);
+    const again = await at("+919800000031", { complaint_type: "UPI/bank/card fraud", complainant_name: "Asha N", district: "Dehradun", danger: "yes" }, wa, undefined, id);
+    expect(again!.id).toBe(first!.id);
+    expect(wa.sent).toHaveLength(1);
+    expect(again!.fields.complainant_name).toBe("Asha Negi"); // what the case holds stays
+    expect(again!.fields.district).toBe("Dehradun"); // what is new fills the gap
+    expect(again!.fields.urgent).toBe("yes");
+    expect(again!.missing).not.toContain("district");
+  });
+
+  it("follows a call on WhatsApp unless the caller said they have no WhatsApp", async () => {
+    const wa = new SimulatedWhatsApp();
+    const c = await at("+919800000032", { complaint_type: "digital arrest", money_lost: "90000", how_it_happened: "Fake CBI officer on a video call" }, wa);
+    expect(c!.fields.followup).toBe("questions");
+    expect(wa.sent).toHaveLength(1);
+    const none = await at("+919800000035", { complaint_type: "digital arrest", money_lost: "90000", whatsapp_consent: "no" }, wa);
+    expect(none!.fields.followup).toBe("none");
+    expect(wa.sent).toHaveLength(1);
+  });
+
+  it("opens a new case for a different kind of complaint, or when the earlier one is with officers", async () => {
+    await withTenant(tenant, (tx) => tx.update(whatsappChannels).set({ formUrl: "https://forms.example.gov.in/cy-complaint" }));
+    const wa = new SimulatedWhatsApp();
+    const who = "+919800000033";
+    const money = await at(who, { complaint_type: "UPI fraud", money_lost: "3000", how_it_happened: "Paid a fake seller" }, wa);
+    const threats = await at(who, { complaint_type: "online harassment", how_it_happened: "Threats on Instagram" }, wa);
+    expect(threats!.id).not.toBe(money!.id);
+    expect(wa.sent).toHaveLength(2);
+    expect(wa.sent[1]!.body).toContain("https://forms.example.gov.in/cy-complaint");
+    // A reply goes to the case still being filled in.
+    await handleInbound(tenant, { from: who, id: randomUUID(), at: new Date(), text: "F: Mohan" }, new ScriptedReader({ "F: Mohan": { fields: { father_or_husband_name: "F: Mohan" } } }), wa);
+    const [m] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.id, money!.id)));
+    expect(m!.fields.father_or_husband_name).toBe("F: Mohan");
+    // Once that case is with officers, a new call is a new complaint.
+    await withTenant(tenant, (tx) => tx.update(cases).set({ status: "taken_up" }).where(eq(cases.id, money!.id)));
+    const later = await at(who, { complaint_type: "UPI fraud", money_lost: "800", how_it_happened: "Another fake seller" }, wa);
+    expect(later!.id).not.toBe(money!.id);
+    expect(wa.sent.at(-1)!.body).toContain("Your complaint number is CY-");
+    await withTenant(tenant, (tx) => tx.update(whatsappChannels).set({ formUrl: null }));
+  });
+
+  it("does not message about a call read long after it happened", async () => {
+    const wa = new SimulatedWhatsApp();
+    const c = await at("+919800000034", { complaint_type: "loan app harassment", how_it_happened: "Loan app threats" }, wa, { message: false });
+    expect(c).not.toBeNull();
+    expect(wa.sent).toHaveLength(0);
+  });
+
+  it("starts WhatsApp right after the call from what the engine took, once per call", async () => {
+    const wa = new SimulatedWhatsApp();
+    const who = "+919800000041";
+    const [agent] = await withTenant(tenant, (tx) => tx.insert(agents).values({ tenantId: tenant, name: "CY line", templateKey: "clinic_receptionist", templateVersion: 2, domain: CYBER_INTAKE_DOMAIN }).returning());
+    const row = (extracted: Record<string, unknown>, startedAt = new Date(), status: "completed" | "in_progress" = "completed") => ({
+      tenantId: tenant, agentId: agent!.id, direction: "inbound" as const, status, externalRunId: randomUUID(), fromE164: who, toE164: "+919262102414", startedAt, extracted,
+    });
+    const [fresh] = await withTenant(tenant, (tx) =>
+      tx
+        .insert(calls)
+        .values([
+          row({ complaint_type: "UPI/bank/card fraud", money_lost: "12000", complainant_name: "Ravi Bisht", whatsapp_consent: "yes", call_language: "hindi" }),
+          row({}), // the engine has not read it yet
+          row({ complaint_type: "UPI fraud" }, new Date(), "in_progress"), // still on the line
+          row({ complaint_type: "UPI fraud", money_lost: "500" }, new Date(Date.now() - 5 * 3_600_000)), // hours ago: not messaged now
+          row({ complaint_type: "not cyber crime", how_it_happened: "Bicycle stolen" }),
+        ])
+        .returning(),
+    );
+    expect(await followUpCalls(tenant, { sender: wa })).toBe(1);
+    expect(wa.sent).toHaveLength(1);
+    expect(wa.sent[0]!.to).toBe(who);
+    expect(wa.sent[0]!.body).toContain("Your complaint number is CY-");
+    expect(await followUpCalls(tenant, { sender: wa })).toBe(0);
+    // The local AI reads the same call later: it fills in and does not message again.
+    const k = await at(who, { complaint_type: "UPI/bank/card fraud", money_lost: "12000", district: "Almora" }, wa, undefined, fresh!.id);
+    expect(wa.sent).toHaveLength(1);
+    expect(k!.fields.district).toBe("Almora");
+    expect(await withTenant(tenant, (tx) => tx.select().from(caseCalls).where(eq(caseCalls.callId, fresh!.id)))).toHaveLength(1);
   });
 });
 

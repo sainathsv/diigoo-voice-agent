@@ -1,6 +1,6 @@
 import "server-only";
 import { and, asc, desc, eq, gte, lte } from "drizzle-orm";
-import { calls, caseEvidence, cases, withTenant, type Case } from "@jenai/db";
+import { calls, caseCalls, caseEvidence, cases, withTenant, type Case } from "@jenai/db";
 import { scamLabel, withWhatsApp } from "@jenai/engine";
 
 export interface SheetEvidence {
@@ -29,6 +29,10 @@ export async function loadComplaint(tenantId: string, ref: { callId: string } | 
       if (!call) return null;
       [kase] = await tx.select().from(cases).where(eq(cases.firstCallId, call.id)).limit(1);
       // A second call from the same person adds to the case the first call opened.
+      if (!kase) {
+        const [link] = await tx.select({ caseId: caseCalls.caseId }).from(caseCalls).where(eq(caseCalls.callId, call.id)).limit(1);
+        if (link) [kase] = await tx.select().from(cases).where(eq(cases.id, link.caseId));
+      }
       const phone = call.direction === "inbound" ? call.fromE164 : call.toE164;
       if (!kase && phone)
         [kase] = await tx

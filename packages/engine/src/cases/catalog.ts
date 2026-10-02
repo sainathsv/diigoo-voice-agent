@@ -266,6 +266,17 @@ export function openerText(department: string, caseNo: string, language: string 
   return both((l) => openerTextIn(department, caseNo, l), language);
 }
 
+/** Someone whose complaint is still being filled in called again: WhatsApp picks up where it was. */
+function callAgainTextIn(department: string, caseNo: string, l: Lang): string {
+  if (l === "en") return `Hello, this is the ${department} helpline. We have received your call about complaint ${caseNo}. Let us continue it here.`;
+  if (l === "ne") return `नमस्ते, यो ${department} को हेल्पलाइन हो। उजुरी ${caseNo} बारे तपाईंको फोन प्राप्त भयो। यसलाई यहीँ अगाडि बढाऔं।`;
+  return `नमस्ते, यह ${department} की हेल्पलाइन है। शिकायत ${caseNo} के बारे में आपकी कॉल मिल गई। आइए इसे यहीं आगे बढ़ाते हैं।`;
+}
+
+export function callAgainText(department: string, caseNo: string, language: string | null | undefined): string {
+  return both((l) => callAgainTextIn(department, caseNo, l), language);
+}
+
 /** For a complaint without money lost: the cyber team's own form. */
 function formLinkTextIn(department: string, caseNo: string, url: string, l: Lang): string {
   if (l === "en") return `Hello, this is the ${department} helpline, as agreed on your call. Your complaint number is ${caseNo}. Please fill in the complaint form here: ${url}\nYou can also send screenshots in reply to this message.`;

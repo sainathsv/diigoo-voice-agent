@@ -1,5 +1,5 @@
 import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
-import { agents, calls, cases, withTenant, type Case } from "@jenai/db";
+import { agents, calls, caseCalls, cases, withTenant, type Case } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { withWhatsApp } from "./complaint-form";
 import { SCAM_CATEGORIES, categoryOf, isNotCyberCrime, scamKeyFromText, type ScamCategory, type ScamType } from "./scams";
@@ -97,6 +97,13 @@ export async function callAnalytics(tenantId: string, days = 30, opts: { branche
   );
   const progress = (k: Case, proofs: number): WhatsAppProgress => ({ caseId: k.id, status: k.status, followup: k.fields.followup ?? "questions", stillNeeded: k.missing.length, proofs });
   const caseByCall = new Map(caseRows.filter((r) => r.k.firstCallId).map((r) => [r.k.firstCallId!, r]));
+  // A later call about the same complaint shows that case's WhatsApp too.
+  const caseById = new Map(caseRows.map((r) => [r.k.id, r]));
+  const links = await withTenant(tenantId, (tx) => tx.select({ callId: caseCalls.callId, caseId: caseCalls.caseId }).from(caseCalls).where(gte(caseCalls.linkedAt, since)).limit(10_000));
+  for (const l of links) {
+    const r = caseById.get(l.caseId);
+    if (r && !caseByCall.has(l.callId)) caseByCall.set(l.callId, r);
+  }
 
   const toComplaint = (x: Record<string, unknown>, base: { callId: string | null; branchId: string | null; at: Date; durationS: number | null; phone: string | null; summary: string | null }, wa: WhatsAppProgress | null): Complaint => {
     const fraudster = [x.fraudster_mobile, x.fraudster_whatsapp, x.suspect_account_or_upi, x.suspect_social_media, x.suspect_email, x.fraudster_identifiers]

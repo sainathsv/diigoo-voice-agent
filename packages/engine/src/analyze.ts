@@ -16,7 +16,7 @@ import { CY_POLICE_PROGRAM, latestProgramVersion, programExtraction } from "./pr
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { emitAppointmentBooked, emitCallCompleted, emitDoNotCall } from "./integrations/events";
 import { appointmentFromCall } from "./calendar";
-import { caseFromCall } from "./cases/cases";
+import { FOLLOWUP_WINDOW_MS, caseFromCall } from "./cases/cases";
 import type { WhatsAppSender } from "./cases/whatsapp";
 import { isNotCyberCrime } from "./scams";
 
@@ -275,9 +275,12 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
         }
         // A complaint is not a sales lead: it opens (or adds to) the complainant's case, and
         // WhatsApp collects what the call did not. A call that was not a cyber crime opens nothing.
+        // Usually the case is already open from the engine's reading; this fills in what the AI found.
         if (cyber) {
           if (!isNotCyberCrime(String(merged.complaint_type ?? "")))
-            await caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: merged }, opts.whatsapp);
+            await caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: merged }, opts.whatsapp, {
+              message: Date.now() - c.startedAt.getTime() < FOLLOWUP_WINDOW_MS,
+            });
         } else if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
         // A booking goes straight into the calendar, so the front desk sees it without asking.
         if (merged.next_step === "booked" && typeof merged.preferred_time === "string") {

@@ -1150,6 +1150,18 @@ export const cases = pgTable(
 );
 export type Case = typeof cases.$inferSelect;
 
+/** Which case each call opened or added to (0021): WhatsApp follows a call once. */
+export const caseCalls = pgTable(
+  "case_calls",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    callId: uuid("call_id").notNull(),
+    caseId: uuid("case_id").notNull(),
+    linkedAt: ts("linked_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.callId] })],
+);
+
 export const caseEvidence = pgTable(
   "case_evidence",
   {
