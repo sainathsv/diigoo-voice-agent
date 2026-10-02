@@ -4,13 +4,14 @@
  */
 import "@jenai/db/env";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import {
   agentTemplates,
   agentVersions,
   agents,
   branches,
+  callRecordings,
   calls,
   campaignTargets,
   campaigns,
@@ -22,7 +23,7 @@ import {
   platformDb,
   subscriptions,
   suppressions,
-  withTenant, phoneNumbers } from "@jenai/db";
+  withTenant, phoneNumbers, voiceConnections } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN, render } from "@jenai/voice";
 import { addWorkflow, startFakeDograh, type FakeDograh } from "@jenai/voice/testing";
 import { createVersion, importAgent, publishVersion, checkDrift, PublishBlocked } from "./agents";
@@ -283,6 +284,94 @@ describe("calls sync", () => {
     // The in-progress call is re-read until it finishes.
     expect(s2.updated).toBe(1);
   });
+
+  it("fetches a transcript it was refused earlier, once the engine allows it", async () => {
+    const at = new Date().toISOString();
+    fake.runs.set(2, [
+      ...(fake.runs.get(2) ?? []),
+      { id: 904, workflow_id: 2, is_completed: true, created_at: at, call_type: "inbound", cost_info: { call_duration_seconds: 95 }, initial_context: { caller_number: "919876500004" }, gathered_context: {}, transcript_public_url: `${fake.url}/api/v1/public/download/workflow/t904/transcript`, recording_public_url: `${fake.url}/api/v1/public/download/workflow/t904/recording` },
+    ]);
+    fake.refuseArtifacts = true;
+    const s1 = await syncTenantCalls(tenant);
+    expect(s1.transcriptMisses).toBe(1);
+    const row = async () => (await withTenant(tenant, (tx) => tx.select().from(calls).where(eq(calls.externalRunId, "904"))))[0]!;
+    expect((await row()).status).toBe("completed");
+    expect((await row()).transcript).toBeNull();
+    const [conn] = await withTenant(tenant, (tx) => tx.select().from(voiceConnections));
+    expect(conn!.status).toBe("ok"); // a refused download is not a broken connection
+
+    fake.refuseArtifacts = false;
+    const s2 = await syncTenantCalls(tenant);
+    expect(s2.transcriptMisses).toBe(0);
+    expect((await row()).transcript).toBe("transcript for t904");
+  });
+
+  it("keeps its own copy of each recording when told to, retrying one it was refused", async () => {
+    const at = new Date().toISOString();
+    fake.runs.set(2, [
+      ...(fake.runs.get(2) ?? []),
+      { id: 905, workflow_id: 2, is_completed: true, created_at: at, call_type: "inbound", cost_info: { call_duration_seconds: 240 }, initial_context: { caller_number: "919876500005" }, gathered_context: {}, transcript_public_url: `${fake.url}/api/v1/public/download/workflow/t905/transcript`, recording_public_url: `${fake.url}/api/v1/public/download/workflow/t905/recording` },
+    ]);
+    const held = async () =>
+      (await withTenant(tenant, (tx) => tx.select({ r: callRecordings }).from(callRecordings).innerJoin(calls, eq(calls.id, callRecordings.callId)).where(eq(calls.externalRunId, "905"))))[0]?.r;
+    const downloads = () => fake.requests.filter((r) => r.endsWith("/t905/recording")).length;
+
+    fake.refuseArtifacts = true;
+    const s1 = await syncTenantCalls(tenant, { storeRecordings: true });
+    expect(s1.recordingMisses).toBeGreaterThan(0);
+    expect(s1.errors.join(" ")).toMatch(/recording not copied \(download refused \(403\)\)/);
+    expect(await held()).toBeUndefined();
+
+    fake.refuseArtifacts = false;
+    const s2 = await syncTenantCalls(tenant, { storeRecordings: true });
+    expect(s2.recordingMisses).toBe(0);
+    expect(s2.recordingsStored).toBeGreaterThan(0);
+    const r = (await held())!;
+    expect(r.bytes.toString()).toBe("RIFF");
+    expect(r.mime).toBe("audio/wav");
+    expect(r.sizeBytes).toBe(4);
+    expect(r.sha256).toBe(createHash("sha256").update("RIFF").digest("hex"));
+
+    // Held here now: a later sync neither re-reads the call nor downloads it again.
+    const before = downloads();
+    const s3 = await syncTenantCalls(tenant, { storeRecordings: true });
+    expect(s3.recordingsStored).toBe(0);
+    expect(downloads()).toBe(before);
+  });
+
+  it("keeps what the analyser found when a call is read again", async () => {
+    await withTenant(tenant, (tx) =>
+      tx
+        .update(calls)
+        .set({ extracted: sql`${calls.extracted} || '{"complaint_type":"UPI fraud","caller_name":"Analysed Name"}'::jsonb`, summary: "Analysed summary", analyzedAt: new Date(), status: "in_progress" })
+        .where(eq(calls.externalRunId, "901")),
+    );
+    await syncTenantCalls(tenant); // re-reads 901: the engine's gathered context says caller_name "Ravi"
+    const [c] = await withTenant(tenant, (tx) => tx.select().from(calls).where(eq(calls.externalRunId, "901")));
+    expect(c!.status).toBe("completed");
+    expect(c!.summary).toBe("Analysed summary");
+    expect(c!.extracted.complaint_type).toBe("UPI fraud");
+    expect(c!.extracted.caller_name).toBe("Analysed Name");
+    expect(c!.extracted.concern).toBe("implant consultation"); // engine fields still fill gaps
+  });
+
+  it("one broken agent does not switch syncing off for the workspace", async () => {
+    const [extra] = await withTenant(tenant, (tx) =>
+      tx.insert(agents).values({ tenantId: tenant, name: "Retired line", templateKey: "clinic_receptionist", templateVersion: 2, inboundWorkflowId: 777 }).returning(),
+    );
+    fake.failRuns.add(777);
+    try {
+      const s = await syncTenantCalls(tenant);
+      expect(s.failedWorkflows).toBe(1);
+      expect(s.errors[0]).toMatch(/workflow 777/);
+      const [conn] = await withTenant(tenant, (tx) => tx.select().from(voiceConnections));
+      expect(conn!.status).toBe("ok");
+      expect(conn!.lastError).toMatch(/workflow 777/);
+    } finally {
+      fake.failRuns.delete(777);
+      await withTenant(tenant, (tx) => tx.delete(agents).where(eq(agents.id, extra!.id)));
+    }
+  });
 });
 
 describe("dialer", () => {
@@ -350,7 +439,7 @@ describe("plans", () => {
     const period = billingPeriod(new Date());
     const s = await withTenant(tenant, async (tx) => statement(await entitlements(tx, tenant), await usage(tx, tenant, period.from, period.to), period, 1));
     expect(s.usage.calls).toBeGreaterThanOrEqual(3);
-    expect(s.usage.minutes).toBe(4 + 1); // 184 s -> 4 started minutes, 1 s -> 1 minute, unfinished -> 0
+    expect(s.usage.minutes).toBe(4 + 1 + 2 + 4); // 184 s -> 4 started minutes, 1 s -> 1, 95 s -> 2, 240 s -> 4, unfinished -> 0
     expect(s.fixedFeePaise).toBe(799_900);
     expect(s.billableMinutes).toBe(0); // inside the 1,200 included minutes
   });

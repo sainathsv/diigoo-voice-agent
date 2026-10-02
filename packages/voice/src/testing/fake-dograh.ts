@@ -25,6 +25,10 @@ export interface FakeDograh {
   workflows: Map<number, Wf>;
   runs: Map<number, DograhRun[]>;
   failPublish: Set<number>;
+  /** Workflows whose run listing fails (500), like an archived or broken agent. */
+  failRuns: Set<number>;
+  /** When true, transcript and recording downloads are refused (403), like a locked media store. */
+  refuseArtifacts: boolean;
   triggered: Array<{ uuid: string; body: unknown }>;
   requests: string[];
   /** What a caller dialling in hears: the published start prompt. */
@@ -54,6 +58,8 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
   const workflows = new Map<number, Wf>();
   const runs = new Map<number, DograhRun[]>();
   const failPublish = new Set<number>();
+  const failRuns = new Set<number>();
+  const state = { refuseArtifacts: false };
   const triggered: FakeDograh["triggered"] = [];
   const requests: string[] = [];
   let versionSeq = 100;
@@ -70,6 +76,7 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
     requests.push(`${req.method} ${p}`);
     try {
       if (req.method === "GET" && (m0 = p.match(/^\/public\/download\/workflow\/([^/]+)\/(transcript|recording)$/))) {
+        if (state.refuseArtifacts) return send(403, { detail: "forbidden" });
         res.writeHead(200, { "Content-Type": m0[2] === "transcript" ? "text/plain" : "audio/wav" });
         return res.end(m0[2] === "transcript" ? `transcript for ${m0[1]}` : "RIFF");
       }
@@ -117,6 +124,7 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
         return send(200, w.versions.slice(0, Number(url.searchParams.get("limit") ?? 50)));
       }
       if (req.method === "GET" && (m = p.match(/^\/workflow\/(\d+)\/runs$/))) {
+        if (failRuns.has(Number(m[1]))) return send(500, { detail: "workflow unavailable" });
         const all = runs.get(Number(m[1])) ?? [];
         const page = Number(url.searchParams.get("page") ?? 1);
         const limit = Number(url.searchParams.get("limit") ?? 50);
@@ -150,6 +158,13 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
     workflows,
     runs,
     failPublish,
+    failRuns,
+    get refuseArtifacts() {
+      return state.refuseArtifacts;
+    },
+    set refuseArtifacts(v: boolean) {
+      state.refuseArtifacts = v;
+    },
     triggered,
     requests,
     inboundHears: (id) => String(workflows.get(id)!.published.nodes.find((n) => n.type === "startCall")!.data!.prompt),

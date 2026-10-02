@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { holdsAnywhere, type Permission } from "@jenai/authz";
+import { POLICE_PAGES, editionFrom, holdsAnywhere, type Permission } from "@jenai/authz";
 import { Avatar, Logo, StatusBadge, fmtDate } from "@/components/ui";
 import { NavLink } from "@/components/client";
 import { SignOutButton } from "@/components/sign-out";
@@ -12,12 +12,14 @@ const NAV: Array<{ href: string; label: string; perm?: Permission; group?: strin
   { href: "/calls", label: "Calls", perm: "calls:view" },
   { href: "/leads", label: "Leads", perm: "contacts:view", group: "sales" },
   { href: "/analytics", label: "Analytics", perm: "calls:view", group: "cases" },
+  { href: "/cases", label: "Cases", perm: "calls:view", group: "cases" },
   { href: "/calendar", label: "Calendar", perm: "calendar:view", group: "sales" },
   { href: "/programs", label: "Call programs", perm: "agents:view" },
   { href: "/campaigns", label: "Campaigns", perm: "campaigns:view" },
   { href: "/agents", label: "AI agents", perm: "agents:view" },
   { href: "/numbers", label: "Phone numbers", perm: "numbers:view" },
   { href: "/integrations", label: "Your systems", perm: "integrations:manage" },
+  { href: "/whatsapp", label: "WhatsApp", perm: "integrations:manage", group: "cases" },
   { href: "/plan", label: "Plan and usage", perm: "billing:view" },
   { href: "/team", label: "Team", perm: "users:view" },
   { href: "/roles", label: "Roles and access", perm: "users:view" },
@@ -32,7 +34,12 @@ export default async function WorkspaceLayout({ children, params }: { children: 
   const base = `/w/${slug}`;
   // A cyber crime helpline works from Analytics; sales leads and a booking calendar mean nothing there.
   const caseMode = await isCaseWorkspace(ctx.org.id);
-  const visible = NAV.filter((n) => (n.group === "sales" ? !caseMode : n.group === "cases" ? caseMode : true)).filter(
+  // A police department's own server offers its complaint portal only, Analytics first.
+  const offered =
+    editionFrom(process.env.JENAI_EDITION) === "police"
+      ? POLICE_PAGES.flatMap((p) => NAV.filter((n) => n.href === p))
+      : NAV.filter((n) => (n.group === "sales" ? !caseMode : n.group === "cases" ? caseMode : true));
+  const visible = offered.filter(
     (n) => !n.perm || holdsAnywhere(ctx.access, n.perm) || (n.perm === "org:manage" && holdsAnywhere(ctx.access, "support_access:grant")),
   );
 

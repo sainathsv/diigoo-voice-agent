@@ -54,7 +54,7 @@
     {
       "name": "complainant_mobile",
       "type": "string",
-      "prompt": "The complainant's own mobile number as digits, e.g. '9876543210'. Null if not said."
+      "prompt": "The complainant's OWN mobile number as digits, ONLY if they said a number that is theirs and different from the number they are calling from. NEVER a number they gave for the fraudster, a UPI ID, or an account. Null if they only confirmed the calling number or said nothing."
     },
     {
       "name": "complainant_name",

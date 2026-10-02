@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
 import { useFormStatus } from "react-dom";
 
 export function NavLink({ href, children, exact = false }: { href: string; children: React.ReactNode; exact?: boolean }) {
@@ -59,4 +59,14 @@ export function ConfirmButton({ children, message, className = "btn btn-danger b
       {children}
     </button>
   );
+}
+
+/** Re-reads the page every few seconds while something outside it changes, such as a QR code waiting to be scanned. */
+export function AutoRefresh({ seconds }: { seconds: number }) {
+  const router = useRouter();
+  useEffect(() => {
+    const t = setInterval(() => router.refresh(), seconds * 1000);
+    return () => clearInterval(t);
+  }, [router, seconds]);
+  return null;
 }

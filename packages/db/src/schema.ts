@@ -5,6 +5,7 @@
 import {
   bigint,
   boolean,
+  customType,
   integer,
   jsonb,
   pgEnum,
@@ -16,6 +17,7 @@ import {
 } from "drizzle-orm/pg-core";
 
 const ts = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({ dataType: () => "bytea" });
 
 // ---------------------------------------------------------------- auth (Better Auth)
 export const user = pgTable("user", {
@@ -1098,3 +1100,136 @@ export const tenantDatabases = pgTable("tenant_databases", {
   updatedAt: ts("updated_at").notNull().defaultNow(),
 });
 
+// ---------------------------------------------------- recordings kept locally (0018)
+/** A call's recording held on this server (on-premise deployments set JENAI_STORE_RECORDINGS=true). */
+export const callRecordings = pgTable(
+  "call_recordings",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    callId: uuid("call_id").notNull(),
+    mime: text("mime").notNull().default("audio/wav"),
+    bytes: bytea("bytes").notNull(),
+    sizeBytes: integer("size_bytes").notNull(),
+    sha256: text("sha256").notNull(),
+    fetchedAt: ts("fetched_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.callId] })],
+);
+
+// ---------------------------------------------------------------- cases and WhatsApp (0019)
+export const caseStatus = pgEnum("case_status", ["collecting", "ready", "taken_up", "closed"]);
+
+export const cases = pgTable(
+  "cases",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    seq: integer("seq").notNull(),
+    branchId: uuid("branch_id"),
+    status: caseStatus("status").notNull().default("collecting"),
+    complainantE164: text("complainant_e164").notNull(),
+    contactId: uuid("contact_id"),
+    firstCallId: uuid("first_call_id"),
+    scamType: text("scam_type"),
+    fields: jsonb("fields").$type<Record<string, string>>().notNull().default({}),
+    missing: text("missing").array().notNull(),
+    language: text("language"),
+    amountLostPaise: bigint("amount_lost_paise", { mode: "number" }),
+    district: text("district"),
+    asking: text("asking"),
+    lastInboundAt: ts("last_inbound_at"),
+    lastOutboundAt: ts("last_outbound_at"),
+    remindersSent: integer("reminders_sent").notNull().default(0),
+    readyAt: ts("ready_at"),
+    assignedMembershipId: uuid("assigned_membership_id"),
+    officerNote: text("officer_note"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type Case = typeof cases.$inferSelect;
+
+export const caseEvidence = pgTable(
+  "case_evidence",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    caseId: uuid("case_id").notNull(),
+    kind: text("kind").notNull(),
+    mime: text("mime").notNull(),
+    filename: text("filename"),
+    caption: text("caption"),
+    bytes: bytea("bytes"),
+    sizeBytes: integer("size_bytes").notNull().default(0),
+    sha256: text("sha256"),
+    source: text("source").notNull().default("whatsapp"),
+    externalId: text("external_id"),
+    receivedAt: ts("received_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const caseMessages = pgTable(
+  "case_messages",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    caseId: uuid("case_id").notNull(),
+    direction: text("direction").notNull(),
+    channel: text("channel").notNull().default("whatsapp"),
+    body: text("body"),
+    evidenceId: uuid("evidence_id"),
+    externalId: text("external_id"),
+    status: text("status").notNull().default("sent"),
+    error: text("error"),
+    at: ts("at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+export const whatsappChannels = pgTable(
+  "whatsapp_channels",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    mode: text("mode").notNull().default("simulated"),
+    displayE164: text("display_e164"),
+    openwaUrl: text("openwa_url"),
+    openwaSession: text("openwa_session"),
+    /** Sealed with sealSecret(tenantId, "whatsapp"): { apiKey, webhookSecret }. */
+    credentials: text("credentials"),
+    linkStatus: text("link_status"),
+    /** The cyber team's form, sent on WhatsApp for complaints without money lost. */
+    formUrl: text("form_url"),
+    status: text("status").notNull().default("active"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type WhatsappChannel = typeof whatsappChannels.$inferSelect;
+
+/** Inbound WhatsApp messages waiting for the worker (the webhook only queues them). */
+export const whatsappInbox = pgTable(
+  "whatsapp_inbox",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    externalId: text("external_id").notNull(),
+    message: jsonb("message").$type<Record<string, unknown>>().notNull(),
+    receivedAt: ts("received_at").notNull().defaultNow(),
+    processedAt: ts("processed_at"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+
+// ---------------------------------------------------------------- telephone line (0020)
+/** This server's government telephone line status (one row), written by the worker. */
+export const telephoneLineStatus = pgTable("telephone_line_status", {
+  id: text("id").primaryKey().default("line"),
+  status: jsonb("status").$type<Record<string, unknown>>().notNull(),
+  checkedAt: ts("checked_at").notNull().defaultNow(),
+});

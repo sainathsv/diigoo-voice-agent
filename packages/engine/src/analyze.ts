@@ -11,10 +11,14 @@ import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
 import { agents, calls, leads, suppressions, withTenant } from "@jenai/db";
 import { deriveLead, parsePreferredTime } from "./leads";
+import { isOnOwnNetwork } from "./own-network";
 import { CY_POLICE_PROGRAM, latestProgramVersion, programExtraction } from "./programs";
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { emitAppointmentBooked, emitCallCompleted, emitDoNotCall } from "./integrations/events";
 import { appointmentFromCall } from "./calendar";
+import { caseFromCall } from "./cases/cases";
+import type { WhatsAppSender } from "./cases/whatsapp";
+import { isNotCyberCrime } from "./scams";
 
 export const extractionSchema = z.object({
   caller_name: z.string().trim().min(1).max(80).nullable(),
@@ -131,6 +135,60 @@ export class BedrockExtractor implements Extractor {
   }
 }
 
+/**
+ * A model running on the client's own server (Ollama, vLLM, llama.cpp, LM Studio: anything
+ * with an OpenAI-compatible /chat/completions). For deployments where transcripts may not
+ * leave the premises, such as a police department's private server.
+ */
+export class LocalModelExtractor implements Extractor {
+  constructor(
+    readonly model: string,
+    private readonly baseUrl: string,
+    private readonly apiKey: string | null = null,
+    private readonly timeoutMs = 180_000,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {}
+  async extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }) {
+    const r = await this.fetchImpl(`${this.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}) },
+      body: JSON.stringify({
+        model: this.model,
+        messages: [{ role: "user", content: prompt(input) }],
+        temperature: 0,
+        max_tokens: input.program ? 900 : 600,
+        response_format: { type: "json_object" },
+      }),
+      // A local model on modest hardware can take a while; a stuck one must not hold the worker.
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    const j = (await r.json().catch(() => ({}))) as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } | string };
+    if (!r.ok) throw new Error(`Local model refused (${r.status}): ${typeof j.error === "string" ? j.error : (j.error?.message ?? "no detail")}`);
+    return j.choices?.[0]?.message?.content ?? "";
+  }
+}
+
+/**
+ * The analyser this server is configured for:
+ *   JENAI_ANALYZER_PROVIDER=local  + JENAI_ANALYZER_BASE_URL (e.g. http://127.0.0.1:11434/v1) + JENAI_ANALYZER_MODEL
+ *   JENAI_ANALYZER_PROVIDER=bedrock (default) + JENAI_ANALYZER_REGION / JENAI_ANALYZER_MODEL
+ * The police edition (JENAI_EDITION=police) reads calls only with a model on its own network.
+ */
+export function extractorFromEnv(env: Record<string, string | undefined> = process.env): Extractor {
+  const police = env.JENAI_EDITION === "police";
+  const provider = (env.JENAI_ANALYZER_PROVIDER ?? (police ? "local" : "bedrock")).toLowerCase();
+  if (provider === "local" || provider === "openai") {
+    const baseUrl = env.JENAI_ANALYZER_BASE_URL;
+    const model = env.JENAI_ANALYZER_MODEL;
+    if (!baseUrl || !model) throw new Error("JENAI_ANALYZER_PROVIDER=local needs JENAI_ANALYZER_BASE_URL and JENAI_ANALYZER_MODEL");
+    if (police && !isOnOwnNetwork(baseUrl)) throw new Error("The police edition keeps transcripts on its own network: JENAI_ANALYZER_BASE_URL must be this server or a private address");
+    return new LocalModelExtractor(model, baseUrl, env.JENAI_ANALYZER_API_KEY ?? null, Number(env.JENAI_ANALYZER_TIMEOUT_MS ?? 180_000));
+  }
+  if (provider !== "bedrock") throw new Error(`Unknown JENAI_ANALYZER_PROVIDER "${provider}" (use local or bedrock)`);
+  if (police) throw new Error("The police edition keeps transcripts on this server: use JENAI_ANALYZER_PROVIDER=local");
+  return new BedrockExtractor(env.JENAI_ANALYZER_MODEL ?? "deepseek.v3.2", env.JENAI_ANALYZER_REGION ?? "ap-south-1");
+}
+
 export interface AnalyzeStats {
   analyzed: number;
   leads: number;
@@ -162,7 +220,7 @@ function cleanProgramFields(raw: unknown, p: ProgramAsk): Record<string, string>
 }
 
 /** Analyse finished calls that have a transcript and have not been analysed yet. */
-export async function analyzeCalls(tenantId: string, extractor: Extractor, opts: { limit?: number } = {}): Promise<AnalyzeStats> {
+export async function analyzeCalls(tenantId: string, extractor: Extractor, opts: { limit?: number; whatsapp?: WhatsAppSender } = {}): Promise<AnalyzeStats> {
   const stats: AnalyzeStats = { analyzed: 0, leads: 0, optOuts: 0, failed: 0 };
   const todo = await withTenant(tenantId, (tx) =>
     tx
@@ -198,11 +256,14 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
       const extra = program ? cleanProgramFields(raw, program) : {};
       await withTenant(tenantId, async (tx) => {
         const merged: Record<string, unknown> = { ...c.extracted };
-        if (x) for (const [k, v] of Object.entries(x)) if (v !== null && (merged[k] === undefined || merged[k] === null || merged[k] === "")) merged[k] = v;
+        // A police complaint keeps only the general answers; clinic questions (interest, booking,
+        // treatment history) mean nothing on a cyber crime report.
+        const keep = cyber ? new Set(["caller_name", "summary", "do_not_call", "urgent"]) : null;
+        if (x) for (const [k, v] of Object.entries(x)) if (v !== null && (!keep || keep.has(k)) && (merged[k] === undefined || merged[k] === null || merged[k] === "")) merged[k] = v;
         for (const [k, v] of Object.entries(extra)) merged[k] = v;
         await tx
           .update(calls)
-          .set({ extracted: merged, summary: x?.summary ?? c.summary, disposition: (x?.next_step as string) ?? c.disposition, analyzedAt: new Date(), analysisModel: extractor.model })
+          .set({ extracted: merged, summary: x?.summary ?? c.summary, disposition: cyber ? c.disposition : ((x?.next_step as string) ?? c.disposition), analyzedAt: new Date(), analysisModel: extractor.model })
           .where(eq(calls.id, c.id));
         if (x?.do_not_call && c.contactId) {
           const phone = c.direction === "inbound" ? c.fromE164 : c.toE164;
@@ -212,8 +273,12 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
             stats.optOuts++;
           }
         }
-        // A complaint is not a sales lead: cyber crime calls feed Analytics, not Leads.
-        if (!cyber && c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
+        // A complaint is not a sales lead: it opens (or adds to) the complainant's case, and
+        // WhatsApp collects what the call did not. A call that was not a cyber crime opens nothing.
+        if (cyber) {
+          if (!isNotCyberCrime(String(merged.complaint_type ?? "")))
+            await caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: merged }, opts.whatsapp);
+        } else if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
         // A booking goes straight into the calendar, so the front desk sees it without asking.
         if (merged.next_step === "booked" && typeof merged.preferred_time === "string") {
           const when = parsePreferredTime(merged.preferred_time);

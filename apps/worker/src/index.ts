@@ -4,7 +4,7 @@
  * Safety switches (all default OFF):
  *   JENAI_REAL_DIALS=true   place real calls (still only for clients in managed mode with an API key)
  *   JENAI_SYNC=true         pull calls from the voice engine every JENAI_SYNC_SECONDS (default 300)
- *   JENAI_ANALYZE=true      read new transcripts with the analyzer (Bedrock Mumbai) after each sync
+ *   JENAI_ANALYZE=true      read new transcripts with the analyzer (Bedrock Mumbai, or a local model)
  * Without them the dialer uses the simulated carrier and nothing touches the live engine.
  *
  * The AI safety loop is ON by default (JENAI_SAFETY=false turns it off): it runs
@@ -20,14 +20,33 @@
  * The security loop is ON by default (JENAI_SECURITY=false turns it off): the
  * detector every minute, audit-log integrity and retention every hour. High and
  * critical alerts go to JENAI_ALERT_SNS_TOPIC_ARN when set, else to this log.
+ *
+ * The WhatsApp loop is ON by default (JENAI_WHATSAPP=false turns it off) and idle until a
+ * workspace has a WhatsApp channel: it reads queued replies in order with the configured
+ * model and sends reminders (every 6 hours, 9 am to 9 pm, until the form is complete).
+ *
+ * The telephone line monitor runs when JENAI_TEL_IFACE names the port of the government
+ * cable (or "auto"): every minute it checks the cable, the address on that port, the
+ * telecom team's SIP system (JENAI_TEL_SIP_PEER) and our gateway, for the home page.
+ *
+ * The police edition (JENAI_EDITION=police) runs on a department's own server and
+ * sends nothing elsewhere: no AI safety loop (it uses Bedrock), no integrations,
+ * alerts only to this log, recordings kept here, and calls read by a model on its
+ * own network (the analyser refuses any other).
  */
 import "@jenai/db/env";
-import { eq } from "drizzle-orm";
-import { platformDb, voiceConnections } from "@jenai/db";
+import { eq, inArray } from "drizzle-orm";
+import { platformDb, telephoneLineStatus, voiceConnections, whatsappChannels } from "@jenai/db";
 import {
-  BedrockExtractor,
+  extractorFromEnv,
   BedrockSafetyModel,
   analyzeCalls,
+  caseReaderFromEnv,
+  checkLine,
+  lineConfigFromEnv,
+  readNetFacts,
+  processInbox,
+  remindPending,
   claimDeliveries,
   claimSafetyChecks,
   deliver,
@@ -46,21 +65,24 @@ import {
   type Notifier,
 } from "@jenai/engine";
 
-const REAL = process.env.JENAI_REAL_DIALS === "true";
+const POLICE = process.env.JENAI_EDITION === "police";
+const REAL = !POLICE && process.env.JENAI_REAL_DIALS === "true"; // a police server never places calls
 const SYNC = process.env.JENAI_SYNC === "true";
 const ANALYZE = process.env.JENAI_ANALYZE === "true";
 const SECURITY = process.env.JENAI_SECURITY !== "false";
-const ALERT_TOPIC = process.env.JENAI_ALERT_SNS_TOPIC_ARN ?? "";
-const SAFETY = process.env.JENAI_SAFETY !== "false";
+const ALERT_TOPIC = POLICE ? "" : (process.env.JENAI_ALERT_SNS_TOPIC_ARN ?? "");
+const SAFETY = !POLICE && process.env.JENAI_SAFETY !== "false";
 const SAFETY_PARALLEL = Math.max(1, Number(process.env.JENAI_SAFETY_PARALLEL ?? 2));
 const SWEEP_PER_HOUR = Math.max(0, Number(process.env.JENAI_SAFETY_SWEEP_PER_HOUR ?? 100));
 const RECHECK_DAYS = Math.max(1, Number(process.env.JENAI_SAFETY_RECHECK_DAYS ?? 90));
-const INTEGRATIONS = process.env.JENAI_INTEGRATIONS !== "false";
+const INTEGRATIONS = !POLICE && process.env.JENAI_INTEGRATIONS !== "false";
+const WHATSAPP = process.env.JENAI_WHATSAPP !== "false";
 const DELIVERY_BATCH = Math.max(1, Number(process.env.JENAI_INTEGRATIONS_BATCH ?? 10));
 const SYNC_MS = Math.max(60, Number(process.env.JENAI_SYNC_SECONDS ?? 300)) * 1000;
 const TICK_MS = 3000;
 let stopping = false;
-const extractor = new BedrockExtractor();
+// Bedrock by default; JENAI_ANALYZER_PROVIDER=local keeps transcripts on this server.
+const extractor = ANALYZE ? extractorFromEnv() : null;
 
 const log = (event: string, data: Record<string, unknown> = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), event, ...data }));
 
@@ -76,23 +98,101 @@ async function dialerLoop() {
   }
 }
 
+// "error" connections are retried too: a Dograh outage or a refused key must not stop a
+// workspace's calls for good once it recovers.
+const connectedTenants = () => platformDb().select({ id: voiceConnections.tenantId }).from(voiceConnections).where(inArray(voiceConnections.status, ["ok", "error"]));
+
 async function syncLoop() {
   while (!stopping) {
-    const tenants = await platformDb().select({ id: voiceConnections.tenantId }).from(voiceConnections).where(eq(voiceConnections.status, "ok"));
-    for (const t of tenants) {
-      if (stopping) break;
-      try {
-        const s = await syncTenantCalls(t.id, { maxPerWorkflow: 100 });
-        log("sync.tenant", { tenant: t.id.slice(0, 8), ...s, errors: s.errors.length });
-        if (ANALYZE) {
-          const a = await analyzeCalls(t.id, extractor, { limit: 50 });
-          if (a.analyzed || a.failed) log("analyze.tenant", { tenant: t.id.slice(0, 8), ...a });
+    try {
+      for (const t of await connectedTenants()) {
+        if (stopping) break;
+        try {
+          const s = await syncTenantCalls(t.id, { maxPerWorkflow: 100 });
+          log("sync.tenant", { tenant: t.id.slice(0, 8), ...s, errors: s.errors.length, firstError: s.errors[0]?.slice(0, 160) });
+        } catch (e) {
+          log("sync.error", { tenant: t.id.slice(0, 8), message: (e as Error).message });
         }
-      } catch (e) {
-        log("sync.error", { tenant: t.id.slice(0, 8), message: (e as Error).message });
       }
+    } catch (e) {
+      log("sync.error", { message: (e as Error).message });
     }
     await new Promise((r) => setTimeout(r, SYNC_MS));
+  }
+}
+
+/**
+ * Reads new transcripts apart from the sync, so a slow model (one on the client's own
+ * server can take minutes a call) never holds up copying new calls. A call that fails
+ * is tried again after the pause.
+ */
+async function analyzeLoop() {
+  while (!stopping) {
+    let progressed = false;
+    try {
+      for (const t of await connectedTenants()) {
+        if (stopping) break;
+        const a = await analyzeCalls(t.id, extractor!, { limit: 10 });
+        if (a.analyzed || a.failed) log("analyze.tenant", { tenant: t.id.slice(0, 8), ...a });
+        if (a.analyzed) progressed = true;
+      }
+    } catch (e) {
+      log("analyze.error", { message: (e as Error).message });
+    }
+    if (!progressed) await new Promise((r) => setTimeout(r, 30_000));
+  }
+}
+
+/** Reads queued WhatsApp replies (oldest first) and, every 10 minutes, reminds complainants who went quiet. */
+async function whatsappLoop() {
+  let reader: ReturnType<typeof caseReaderFromEnv>;
+  try {
+    reader = caseReaderFromEnv();
+  } catch (e) {
+    // No model to read replies with (e.g. a police server without its local AI yet): messages stay queued.
+    log("whatsapp.no_reader", { message: (e as Error).message });
+    return;
+  }
+  let lastReminders = 0;
+  while (!stopping) {
+    let progressed = false;
+    try {
+      const tenants = await platformDb().selectDistinct({ id: whatsappChannels.tenantId }).from(whatsappChannels).where(eq(whatsappChannels.status, "active"));
+      for (const t of tenants) {
+        if (stopping) break;
+        const r = await processInbox(t.id, reader);
+        if (r.handled || r.failed) log("whatsapp.inbox", { tenant: t.id.slice(0, 8), ...r });
+        if (r.handled) progressed = true;
+      }
+      if (Date.now() - lastReminders > 10 * 60_000) {
+        lastReminders = Date.now();
+        for (const t of tenants) {
+          const n = await remindPending(t.id);
+          if (n) log("cases.reminded", { tenant: t.id.slice(0, 8), count: n });
+        }
+      }
+    } catch (e) {
+      log("whatsapp.error", { message: (e as Error).message });
+    }
+    if (!progressed) await new Promise((r) => setTimeout(r, 5_000));
+  }
+}
+
+/** The government telephone line, checked every minute and kept for the portal's home page. */
+async function lineLoop(cfg: NonNullable<ReturnType<typeof lineConfigFromEnv>>) {
+  let last = "";
+  while (!stopping) {
+    try {
+      const status = await checkLine(cfg, await readNetFacts());
+      const row = { status: status as unknown as Record<string, unknown>, checkedAt: new Date() };
+      await platformDb().insert(telephoneLineStatus).values({ id: "line", ...row }).onConflictDoUpdate({ target: telephoneLineStatus.id, set: row });
+      const summary = `${status.overall}:${status.checks.filter((c) => c.state === "fail").map((c) => c.key).join(",")}`;
+      if (summary !== last) log("line.status", { overall: status.overall, port: status.iface, failing: status.checks.filter((c) => c.state === "fail").map((c) => c.key) });
+      last = summary;
+    } catch (e) {
+      log("line.error", { message: (e as Error).message });
+    }
+    await new Promise((r) => setTimeout(r, 60_000));
   }
 }
 
@@ -174,9 +274,17 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
-log("worker.started", { realDials: REAL, sync: SYNC, analyze: ANALYZE, syncSeconds: SYNC_MS / 1000, security: SECURITY, alertTopic: ALERT_TOPIC ? "sns" : "log", safety: SAFETY, safetyRecheckDays: RECHECK_DAYS, integrations: INTEGRATIONS });
+log("worker.started", { whatsapp: WHATSAPP, edition: POLICE ? "police" : "full", realDials: REAL, sync: SYNC, analyze: ANALYZE, syncSeconds: SYNC_MS / 1000, security: SECURITY, alertTopic: ALERT_TOPIC ? "sns" : "log", safety: SAFETY, safetyRecheckDays: RECHECK_DAYS, integrations: INTEGRATIONS });
 void dialerLoop();
 if (SYNC) void syncLoop();
+if (SYNC && ANALYZE) void analyzeLoop();
 if (SECURITY) void securityLoop();
 if (SAFETY) void safetyLoop();
 if (INTEGRATIONS) void integrationsLoop();
+if (WHATSAPP) void whatsappLoop();
+try {
+  const line = lineConfigFromEnv();
+  if (line) void lineLoop(line);
+} catch (e) {
+  log("line.config_error", { message: (e as Error).message });
+}

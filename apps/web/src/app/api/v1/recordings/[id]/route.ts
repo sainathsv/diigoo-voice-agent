@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import { audit, calls, platformDb, withTenant } from "@jenai/db";
 import { checkRecordingLink, voiceClient } from "@jenai/engine";
+import { heldRecording, serveHeldRecording } from "@/server/recordings";
 
 /**
  * GET /api/v1/recordings/{callId}?exp=...&sig=...
@@ -23,11 +24,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
 
   const found = await withTenant(owner.tenantId, async (tx) => {
     const [c] = await tx.select().from(calls).where(eq(calls.id, id));
-    const v = c?.recordingRef ? await voiceClient(tx, owner.tenantId) : null;
-    return { c, v };
+    const held = c ? await heldRecording(tx, id) : null;
+    const v = c?.recordingRef && !held ? await voiceClient(tx, owner.tenantId) : null;
+    return { c, held, v };
   });
-  if (!found.c?.recordingRef) return new Response("No recording for this call", { status: 404 });
-  if (!found.v) return new Response("The voice engine is not connected", { status: 503 });
+  if (!found.held && !found.c?.recordingRef) return new Response("No recording for this call", { status: 404 });
+  if (!found.held && !found.v) return new Response("The voice engine is not connected", { status: 503 });
 
   const range = req.headers.get("range");
   if (!range || /^bytes=0-/.test(range)) {
@@ -45,7 +47,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       }),
     );
   }
-  const res = await found.v.client.fetchArtifact(found.c.recordingRef, range ?? undefined);
+  if (found.held) return serveHeldRecording(owner.tenantId, id, found.held, range);
+  const res = await found.v!.client.fetchArtifact(found.c!.recordingRef!, range ?? undefined);
   if (!res.ok && res.status !== 206) return new Response("Could not fetch the recording", { status: 502 });
   const headers = new Headers();
   for (const h of ["content-type", "content-length", "content-range", "accept-ranges"]) {

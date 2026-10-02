@@ -38,14 +38,20 @@ export function scamKeyFromText(text: string | null | undefined): ScamType | nul
     [/invest|trading|stock|ipo|crypto|bitcoin/, "investment_trading"],
     [/part.?time|task|job|work from home|youtube like|review/, "part_time_job_task"],
     [/kyc|customer care|apk|anydesk|teamviewer|screen shar|electricity/, "fake_customer_care_kyc_apk"],
+    // Ransomware and email fraud before "hack", or "hacking/ransomware" would read as a hacked profile.
+    [/ransom|malware|email fraud|business email/, "hacking_ransomware"],
     [/hack|fake profile|impersonat|social media|instagram|facebook|whatsapp hack/, "social_media_hack_fake_profile"],
     [/shopping|olx|marketplace|website|booking|helicopter|hotel|delivery/, "online_shopping_fake_booking"],
     [/lottery|prize|gift|romance|matrimon|dating|kbc/, "lottery_gift_romance"],
     [/sim swap|esim|aeps|aadhaar|fingerprint/, "sim_swap_aeps"],
     [/harass|stalk|threat|defam|abuse/, "online_harassment"],
-    [/ransom|malware|email fraud|business email/, "hacking_ransomware"],
     [/upi|bank|card|debit|credit|otp|qr|transaction|money/, "upi_bank_card"],
   ];
   for (const [re, key] of rules) if (re.test(t)) return key;
   return SCAM_TYPES.some((s) => s.key === t) ? (t as ScamType) : "other";
+}
+
+/** The analyser's label for a call that turned out not to be a cyber crime (a theft, a family dispute). */
+export function isNotCyberCrime(text: string | null | undefined): boolean {
+  return /\bnot\s+(a\s+)?cyber\s*crime\b/i.test(String(text ?? ""));
 }

@@ -27,6 +27,9 @@ function meta(h: Headers | undefined) {
 export const auth = betterAuth({
   appName: "JENAI",
   baseURL: process.env.BETTER_AUTH_URL,
+  // Other addresses this server is opened on, comma-separated: an office server is
+  // reached on its office network address and on its Tailscale address.
+  trustedOrigins: (process.env.JENAI_TRUSTED_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean),
   secret: process.env.BETTER_AUTH_SECRET,
   database: drizzleAdapter(appDb(), {
     provider: "pg",

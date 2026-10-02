@@ -1,0 +1,297 @@
+/**
+ * What a cyber crime case must contain before officers get it, and how the
+ * complainant is asked for each piece on WhatsApp. The call takes a few simple
+ * answers and the caller's permission; for a money fraud WhatsApp then takes the
+ * department's form, one line at a time in the form's own order, with the proof.
+ * Code decides WHAT to ask next and checks the shape of every answer; the model
+ * only reads the replies, so it can never invent a question or skip an item.
+ * Keys are the call program's, so a call and its WhatsApp answers merge as one.
+ */
+import { SCAM_TYPES } from "../scams";
+
+/** Asked first when a case starts on WhatsApp with nothing known yet. */
+export const OPENING_REQUIRED = ["how_it_happened", "scam_type"] as const;
+
+/** The department's complaint form for a money fraud, in the form's order. */
+export const FINANCIAL_REQUIRED = [
+  "complainant_name",
+  "father_or_husband_name",
+  "date_of_birth",
+  "house_number",
+  "present_address",
+  "police_station",
+  "district",
+  "pincode",
+  "victim_bank_and_account",
+  "card_last4",
+  "transactions",
+  "money_lost",
+  "how_it_happened",
+  "fraudster_details",
+  "apk_or_link",
+  "proof",
+] as const;
+
+/** "fraudster_details" is answered by any one of these (one question; the reader splits the answer). */
+export const FRAUDSTER_KEYS = ["fraudster_mobile", "fraudster_whatsapp", "suspect_account_or_upi", "suspect_social_media", "suspect_email"] as const;
+
+/** Items a complainant may honestly not know; "not known" then counts as an answer. */
+const MAY_BE_UNKNOWN = new Set(["house_number", "police_station", "pincode", "card_last4", "fraudster_details"]);
+
+export const FIELD_LABELS: Record<string, string> = {
+  how_it_happened: "How the fraud happened",
+  scam_type: "Type of fraud",
+  complainant_name: "Name",
+  father_or_husband_name: "Father's / husband's name",
+  date_of_birth: "Date of birth",
+  house_number: "House number",
+  present_address: "Present address",
+  police_station: "Police station",
+  district: "District",
+  pincode: "PIN code",
+  victim_bank_and_account: "Bank and account the money left from",
+  card_last4: "Card (last 4 digits)",
+  transactions: "Transactions (UPI / UTR numbers)",
+  money_lost: "Total amount lost",
+  fraudster_details: "Fraudster's number, UPI ID, account or profile",
+  apk_or_link: "APK file or link",
+  proof: "Proof (screenshots)",
+};
+
+type Lang = "hi" | "en" | "ne";
+
+const SHORT: Record<string, Record<Lang, string>> = {
+  how_it_happened: { hi: "घटना का विवरण", en: "what happened", ne: "घटनाको विवरण" },
+  scam_type: { hi: "फ्रॉड का प्रकार", en: "type of fraud", ne: "ठगीको प्रकार" },
+  complainant_name: { hi: "आपका नाम", en: "your name", ne: "तपाईंको नाम" },
+  father_or_husband_name: { hi: "पिता/पति का नाम", en: "father's or husband's name", ne: "बुबा/श्रीमानको नाम" },
+  date_of_birth: { hi: "जन्म तिथि", en: "date of birth", ne: "जन्म मिति" },
+  house_number: { hi: "मकान नंबर", en: "house number", ne: "घर नम्बर" },
+  present_address: { hi: "वर्तमान पता", en: "present address", ne: "हालको ठेगाना" },
+  police_station: { hi: "पुलिस स्टेशन", en: "police station", ne: "प्रहरी चौकी" },
+  district: { hi: "जनपद", en: "district", ne: "जिल्ला" },
+  pincode: { hi: "पिनकोड", en: "PIN code", ne: "पिनकोड" },
+  victim_bank_and_account: { hi: "बैंक नाम व खाता संख्या", en: "bank and account number", ne: "बैंक र खाता नम्बर" },
+  card_last4: { hi: "कार्ड के आख़िरी 4 अंक", en: "last 4 digits of the card", ne: "कार्डका अन्तिम ४ अंक" },
+  transactions: { hi: "ट्रांजेक्शन के UTR नंबर", en: "transaction UTR numbers", ne: "कारोबारको UTR नम्बर" },
+  money_lost: { hi: "कुल राशि", en: "total amount", ne: "जम्मा रकम" },
+  fraudster_details: { hi: "फ्रॉड करने वाले की जानकारी", en: "the fraudster's details", ne: "ठगको विवरण" },
+  apk_or_link: { hi: "APK/लिंक की जानकारी", en: "APK or link", ne: "APK/लिंक" },
+  proof: { hi: "सबूत (स्क्रीनशॉट)", en: "proof (screenshots)", ne: "प्रमाण (स्क्रिनसट)" },
+};
+
+const Q: Record<string, Record<Lang, string>> = {
+  how_it_happened: {
+    hi: "कृपया संक्षेप में बताइए कि आपके साथ क्या हुआ।",
+    en: "Please tell us briefly what happened.",
+    ne: "कृपया तपाईंलाई के भयो छोटकरीमा बताउनुहोस्।",
+  },
+  scam_type: {
+    hi: "यह किस तरह का फ्रॉड था? (जैसे UPI/बैंक, नौकरी/टास्क, निवेश, डिजिटल अरेस्ट, लोन ऐप, फर्जी प्रोफाइल)",
+    en: "What kind of fraud was it? (for example UPI/bank, job/task, investment, digital arrest, loan app, fake profile)",
+    ne: "यो कस्तो किसिमको ठगी थियो? (जस्तै UPI/बैंक, जागिर/टास्क, लगानी, डिजिटल अरेस्ट, लोन एप, नक्कली प्रोफाइल)",
+  },
+  complainant_name: {
+    hi: "1. आपका पूरा नाम क्या है? (जैसा आधार कार्ड में है, English अक्षरों में)",
+    en: "1. What is your full name? (as on your Aadhaar card)",
+    ne: "१. तपाईंको पूरा नाम के हो? (आधार कार्डमा जस्तै, English अक्षरमा)",
+  },
+  father_or_husband_name: {
+    hi: "2. आपके पिता या पति का नाम क्या है?",
+    en: "2. What is your father's or husband's name?",
+    ne: "२. तपाईंको बुबा वा श्रीमानको नाम के हो?",
+  },
+  date_of_birth: {
+    hi: "3. आपकी जन्म तिथि क्या है? (दिन/महीना/साल, जैसे 15/08/1990)",
+    en: "3. What is your date of birth? (day/month/year, for example 15/08/1990)",
+    ne: "३. तपाईंको जन्म मिति के हो? (दिन/महिना/साल, जस्तै 15/08/1990)",
+  },
+  house_number: {
+    hi: "4. आपका मकान नंबर क्या है?",
+    en: "4. What is your house number?",
+    ne: "४. तपाईंको घर नम्बर के हो?",
+  },
+  present_address: {
+    hi: "5. आपका वर्तमान पता क्या है, जहाँ आप अभी रह रहे हैं? (गली/मोहल्ला, शहर/गाँव)",
+    en: "5. What is your present address, where you live now? (street or locality, town or village)",
+    ne: "५. तपाईं अहिले बस्ने हालको ठेगाना के हो? (टोल, सहर/गाउँ)",
+  },
+  police_station: {
+    hi: "6. आपका पुलिस स्टेशन (थाना) कौन सा है?",
+    en: "6. Which is your police station?",
+    ne: "६. तपाईंको प्रहरी चौकी कुन हो?",
+  },
+  district: {
+    hi: "7. आपका जनपद (जिला) कौन सा है?",
+    en: "7. Which is your district?",
+    ne: "७. तपाईंको जिल्ला कुन हो?",
+  },
+  pincode: {
+    hi: "8. आपके क्षेत्र का पिनकोड क्या है? (6 अंक)",
+    en: "8. What is your PIN code? (6 digits)",
+    ne: "८. तपाईंको क्षेत्रको पिनकोड के हो? (६ अंक)",
+  },
+  victim_bank_and_account: {
+    hi: "9. आपका बैंक नाम और खाता संख्या क्या है, जिससे पैसे कटे हैं?",
+    en: "9. Which bank, and which account number, did the money leave from?",
+    ne: "९. पैसा काटिएको बैंकको नाम र खाता नम्बर के हो?",
+  },
+  card_last4: {
+    hi: "10. अगर कार्ड से फ्रॉड हुआ है, तो कार्ड के सिर्फ़ आख़िरी 4 अंक भेजें। पूरा नंबर, CVV या PIN कभी न भेजें।",
+    en: "10. If a card was used, send ONLY the last 4 digits of the card. Never send the full number, CVV or PIN.",
+    ne: "१०. कार्डबाट ठगी भएको भए कार्डका अन्तिम ४ अंक मात्र पठाउनुहोस्। पूरा नम्बर, CVV वा PIN कहिल्यै नपठाउनुहोस्।",
+  },
+  transactions: {
+    hi: "11. हर ट्रांजेक्शन का UTR / UPI रेफरेंस नंबर, तारीख और रकम भेजें। (यह बैंक के SMS या UPI ऐप में मिलता है)",
+    en: "11. Send the UTR / UPI reference number, date and amount of each transaction. (You will find it in the bank SMS or the UPI app)",
+    ne: "११. हरेक कारोबारको UTR / UPI रेफरेन्स नम्बर, मिति र रकम पठाउनुहोस्। (बैंकको SMS वा UPI एपमा हुन्छ)",
+  },
+  money_lost: {
+    hi: "12. कुल कितनी राशि कटी? (रुपये में)",
+    en: "12. What is the total amount lost? (in rupees)",
+    ne: "१२. जम्मा कति रकम गयो? (रुपैयाँमा)",
+  },
+  fraudster_details: {
+    hi: "13. फ्रॉड करने वाले का मोबाइल नंबर, WhatsApp नंबर, जिस UPI ID या बैंक खाते में पैसे गए, सोशल मीडिया प्रोफाइल या ईमेल ID, जो भी आपके पास है, भेजें।",
+    en: "13. Send whatever you have of the fraudster: mobile number, WhatsApp number, the UPI ID or bank account the money went to, social media profile or email ID.",
+    ne: "१३. ठगको मोबाइल नम्बर, WhatsApp नम्बर, पैसा गएको UPI ID वा बैंक खाता, सामाजिक सञ्जाल प्रोफाइल वा इमेल ID, जे छ पठाउनुहोस्।",
+  },
+  apk_or_link: {
+    hi: "14. क्या आपको कोई APK फ़ाइल या लिंक भेजा गया था, या आपने कोई ऐप इंस्टॉल किया? (हाँ/नहीं, और उसका नाम)",
+    en: "14. Were you sent an APK file or a link, or did you install an app? (yes/no, and its name)",
+    ne: "१४. के तपाईंलाई कुनै APK फाइल वा लिंक पठाइएको थियो, वा कुनै एप इन्स्टल गर्नुभयो? (हो/होइन, र त्यसको नाम)",
+  },
+  proof: {
+    hi: "15. कृपया सबूत यहीं भेजें: ट्रांजेक्शन का स्क्रीनशॉट (UTR नंबर के साथ) और फ्रॉड वाली चैट या कॉल के स्क्रीनशॉट।",
+    en: "15. Please send the proof here: the transaction screenshot (with the UTR number) and screenshots of the fraud chat or calls.",
+    ne: "१५. कृपया प्रमाण यहीँ पठाउनुहोस्: कारोबारको स्क्रिनसट (UTR नम्बर सहित) र ठगीको च्याट वा कलको स्क्रिनसट।",
+  },
+};
+
+/** Said before asking an item again when the reply did not fit. */
+const HINT: Record<string, Record<Lang, string>> = {
+  date_of_birth: { hi: "जन्म तिथि दिन/महीना/साल में लिखें, जैसे 15/08/1990।", en: "Please write the date as day/month/year, for example 15/08/1990.", ne: "मिति दिन/महिना/साल मा लेख्नुहोस्, जस्तै 15/08/1990।" },
+  pincode: { hi: "पिनकोड 6 अंकों का होता है, जैसे 248001।", en: "A PIN code has 6 digits, for example 248001.", ne: "पिनकोड ६ अंकको हुन्छ, जस्तै 248001।" },
+  transactions: { hi: "UTR / रेफरेंस नंबर 12 या उससे ज़्यादा अंकों का होता है, जो बैंक के SMS या UPI ऐप में दिखता है।", en: "The UTR / reference number has 12 or more characters; it is shown in the bank SMS or the UPI app.", ne: "UTR / रेफरेन्स नम्बर १२ वा बढी अंकको हुन्छ, बैंकको SMS वा UPI एपमा देखिन्छ।" },
+  money_lost: { hi: "कृपया सिर्फ़ रकम अंकों में लिखें, जैसे 45000।", en: "Please write just the amount in figures, for example 45000.", ne: "कृपया रकम अंकमा मात्र लेख्नुहोस्, जस्तै 45000।" },
+  victim_bank_and_account: { hi: "बैंक का नाम और खाता संख्या दोनों लिखें, जैसे SBI 1234567890।", en: "Please write both the bank name and the account number, for example SBI 1234567890.", ne: "बैंकको नाम र खाता नम्बर दुवै लेख्नुहोस्, जस्तै SBI 1234567890।" },
+  card_last4: { hi: "सिर्फ़ 4 अंक भेजें।", en: "Please send just 4 digits.", ne: "४ अंक मात्र पठाउनुहोस्।" },
+  apk_or_link: { hi: "कृपया हाँ या नहीं लिखें।", en: "Please answer yes or no.", ne: "कृपया हो वा होइन लेख्नुहोस्।" },
+};
+const HINT_ANY: Record<Lang, string> = { hi: "माफ़ कीजिए, यह जानकारी साफ़ नहीं मिली।", en: "Sorry, that did not come through clearly.", ne: "माफ गर्नुहोस्, यो जानकारी स्पष्ट भएन।" };
+
+const VALID: Record<string, (v: string) => boolean> = {
+  complainant_name: (v) => /\p{L}{2,}/u.test(v),
+  father_or_husband_name: (v) => /\p{L}{2,}/u.test(v),
+  date_of_birth: (v) => /\b(19[2-9]\d|200\d|201[0-5])\b/.test(v),
+  present_address: (v) => v.length >= 8,
+  police_station: (v) => /\p{L}{2,}/u.test(v),
+  district: (v) => /\p{L}{2,}/u.test(v),
+  pincode: (v) => /^\d{6}$/.test(v.replace(/\s/g, "")),
+  victim_bank_and_account: (v) => /\p{L}{2,}/u.test(v) && /\d{4,}/.test(v),
+  card_last4: (v) => /^\d{4}$/.test(v.replace(/\D/g, "")),
+  transactions: (v) => /[A-Za-z0-9]{10,}/.test(v.replace(/[\s-]/g, "")) && /\d{6,}/.test(v.replace(/\D/g, "")),
+  money_lost: (v) => Number(v.replace(/[^\d.]/g, "")) > 0,
+  how_it_happened: (v) => v.length >= 8,
+  apk_or_link: (v) => /^(yes|no)\b/i.test(v),
+};
+
+const filled = (v: unknown) => String(v ?? "").trim();
+
+/** Whether the form line has a usable answer: present, in the right shape, or honestly "not known" where allowed. */
+export function answered(key: string, fields: Record<string, string>): boolean {
+  if (key === "fraudster_details") return FRAUDSTER_KEYS.some((k) => filled(fields[k])) || /^not known$/i.test(filled(fields.fraudster_details));
+  const v = filled(fields[key]);
+  if (!v) return false;
+  if (/^not known$/i.test(v)) return MAY_BE_UNKNOWN.has(key);
+  return VALID[key]?.(v) ?? true;
+}
+
+/** Money left the complainant: the case needs the full form (otherwise the form link is sent). */
+export function isFinancial(fields: Record<string, string>, scamType: string | null): boolean {
+  if (fields.financial === "yes") return true; // decided from the call, before WhatsApp asks the amount again
+  const moneyType = SCAM_TYPES.find((s) => s.key === scamType)?.money ?? false;
+  return moneyType || Number(filled(fields.money_lost).replace(/[^\d.]/g, "")) > 0;
+}
+
+/** A card was used. Read from what happened, not the type label ("UPI/bank/card fraud" names every UPI case). */
+function cardFraud(fields: Record<string, string>): boolean {
+  return /\b(credit card|debit card|atm card|card number|swipe|card)\b/i.test([fields.type_details, fields.how_it_happened, fields.transactions].map(filled).join(" "));
+}
+
+/** What WhatsApp must collect: the opening two while the type is unknown, the whole form for a money fraud, nothing otherwise. */
+export function requiredFor(fields: Record<string, string>, scamType: string | null): string[] {
+  if (!scamType) return [...OPENING_REQUIRED];
+  if (!isFinancial(fields, scamType)) return [];
+  return FINANCIAL_REQUIRED.filter((k) => k !== "card_last4" || cardFraud(fields));
+}
+
+/** Required items not yet answered, in the order they will be asked. */
+export function missingFor(fields: Record<string, string>, scamType: string | null, evidenceCount: number): string[] {
+  return requiredFor(fields, scamType).filter((k) => {
+    if (k === "proof") return evidenceCount === 0;
+    if (k === "scam_type") return !scamType;
+    return !answered(k, fields);
+  });
+}
+
+export function langOf(language: string | null | undefined): Lang {
+  return language === "en" || language === "ne" ? language : "hi";
+}
+
+export function questionFor(field: string, language: string | null | undefined): string {
+  return Q[field]?.[langOf(language)] ?? Q.how_it_happened![langOf(language)];
+}
+
+/** What to say before asking the same item again because the reply did not fit. */
+export function hintFor(field: string, language: string | null | undefined): string {
+  return HINT[field]?.[langOf(language)] ?? HINT_ANY[langOf(language)];
+}
+
+export function openerText(department: string, caseNo: string, language: string | null | undefined): string {
+  const l = langOf(language);
+  if (l === "en") return `Hello, this is the ${department} cyber crime helpline, as agreed on your call. Your complaint number is ${caseNo}. We will ask the complaint form one question at a time; please reply here and send the screenshots here too.`;
+  if (l === "ne") return `नमस्ते, यो ${department} साइबर क्राइम हेल्पलाइन हो, फोनमा भनेअनुसार। तपाईंको उजुरी नम्बर ${caseNo} हो। हामी उजुरी फारमका प्रश्न एक-एक गरी सोध्छौं; कृपया यहीँ जवाफ र स्क्रिनसट पठाउनुहोस्।`;
+  return `नमस्ते, यह ${department} साइबर क्राइम हेल्पलाइन है, जैसा कॉल पर बात हुई। आपकी शिकायत संख्या ${caseNo} है। हम शिकायत फ़ॉर्म के सवाल एक-एक करके पूछेंगे; कृपया यहीं जवाब दें और स्क्रीनशॉट भी यहीं भेजें।`;
+}
+
+/** For a complaint without money lost: the cyber team's own form. */
+export function formLinkText(department: string, caseNo: string, url: string, language: string | null | undefined): string {
+  const l = langOf(language);
+  if (l === "en") return `Hello, this is the ${department} cyber crime helpline, as agreed on your call. Your complaint number is ${caseNo}. Please fill in the complaint form here: ${url}\nYou can also send screenshots in reply to this message.`;
+  if (l === "ne") return `नमस्ते, यो ${department} साइबर क्राइम हेल्पलाइन हो, फोनमा भनेअनुसार। तपाईंको उजुरी नम्बर ${caseNo} हो। कृपया यहाँ उजुरी फारम भर्नुहोस्: ${url}\nस्क्रिनसट यही सन्देशको जवाफमा पनि पठाउन सक्नुहुन्छ।`;
+  return `नमस्ते, यह ${department} साइबर क्राइम हेल्पलाइन है, जैसा कॉल पर बात हुई। आपकी शिकायत संख्या ${caseNo} है। कृपया यह शिकायत फ़ॉर्म भरें: ${url}\nस्क्रीनशॉट इसी मैसेज के जवाब में भी भेज सकते हैं।`;
+}
+
+export function reminderText(caseNo: string, missing: string[], language: string | null | undefined): string {
+  const l = langOf(language);
+  const items = missing.map((k) => SHORT[k]?.[l] ?? FIELD_LABELS[k] ?? k).join(", ");
+  if (l === "en") return `Reminder about complaint ${caseNo}: we still need ${items}. Your complaint goes to officers as soon as this is in. Please reply here.`;
+  if (l === "ne") return `उजुरी ${caseNo} बारे सम्झना: अझै चाहिन्छ: ${items}। यो आएपछि उजुरी अधिकारीलाई पठाइन्छ। कृपया यहीँ जवाफ दिनुहोस्।`;
+  return `शिकायत ${caseNo} के बारे में याद दिला रहे हैं: अभी भी चाहिए: ${items}। यह मिलते ही आपकी शिकायत अधिकारियों को भेज दी जाएगी। कृपया यहीं जवाब दें।`;
+}
+
+export function completeText(caseNo: string, language: string | null | undefined): string {
+  const l = langOf(language);
+  if (l === "en") return `Thank you. Complaint ${caseNo} is complete and has been handed to the cyber cell officers. An officer will contact you on this number. Please keep all chats and screenshots; do not delete them.`;
+  if (l === "ne") return `धन्यवाद। उजुरी ${caseNo} पूरा भयो र साइबर सेलका अधिकारीलाई दिइयो। अधिकारीले यही नम्बरमा सम्पर्क गर्नुहुनेछ। सबै च्याट र स्क्रिनसट नमेटाउनुहोस्।`;
+  return `धन्यवाद। शिकायत ${caseNo} पूरी हो गई है और साइबर सेल के अधिकारियों को सौंप दी गई है। अधिकारी इसी नंबर पर आपसे संपर्क करेंगे। सभी चैट और स्क्रीनशॉट संभाल कर रखें, डिलीट न करें।`;
+}
+
+export function receivedProofText(language: string | null | undefined): string {
+  const l = langOf(language);
+  if (l === "en") return "Received, thank you. You can send more screenshots any time.";
+  if (l === "ne") return "प्राप्त भयो, धन्यवाद। थप स्क्रिनसट जुनसुकै बेला पठाउन सक्नुहुन्छ।";
+  return "मिल गया, धन्यवाद। आप और स्क्रीनशॉट कभी भी भेज सकते हैं।";
+}
+
+export function dangerText(language: string | null | undefined): string {
+  const l = langOf(language);
+  if (l === "en") return "You are not at fault and you must not pay anyone. If anyone's life is in danger right now, call 112. We have marked your complaint urgent for an officer.";
+  if (l === "ne") return "तपाईंको गल्ती होइन, कसैलाई पैसा नदिनुहोस्। कसैको ज्यान खतरामा छ भने अहिले नै 112 मा फोन गर्नुहोस्। तपाईंको उजुरी अधिकारीका लागि जरुरी भनेर राखिएको छ।";
+  return "इसमें आपकी कोई गलती नहीं है, किसी को भी पैसे न दें। अगर किसी की जान को अभी खतरा है तो तुरंत 112 पर कॉल करें। आपकी शिकायत अधिकारी के लिए अर्जेंट मार्क कर दी गई है।";
+}
+
+export function caseNumber(prefix: string, createdAt: Date, seq: number): string {
+  return `${prefix}-${createdAt.getUTCFullYear()}-${String(seq).padStart(6, "0")}`;
+}

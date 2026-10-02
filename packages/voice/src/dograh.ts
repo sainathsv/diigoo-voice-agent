@@ -224,10 +224,12 @@ export class DograhClient {
    * purpose. When a media base URL is configured (platform running next to the
    * engine), the redirect is followed to that internal address instead.
    */
-  async fetchArtifact(url: string, range?: string | null): Promise<Response> {
+  async fetchArtifact(url: string, range?: string | null, timeoutMs?: number): Promise<Response> {
     const headers: Record<string, string> = range ? { Range: range } : {};
+    // Background downloads (sync) pass a time limit; playback streams to the browser without one.
+    const signal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
     await assertSafeUrl(url);
-    const first = await this.fetchImpl(url, { headers, redirect: "manual", cache: "no-store" });
+    const first = await this.fetchImpl(url, { headers, redirect: "manual", cache: "no-store", signal });
     if (first.status < 300 || first.status >= 400) return first;
     const loc = first.headers.get("location");
     if (!loc) return first;
@@ -235,9 +237,9 @@ export class DograhClient {
     if (this.mediaBaseUrl && target.pathname.startsWith("/voice-audio/")) {
       const media = `${this.mediaBaseUrl.replace(/\/+$/, "")}${target.pathname}`;
       await assertSafeUrl(media); // the internal store must be on JENAI_ALLOWED_PRIVATE_HOSTS
-      return this.fetchImpl(media, { headers, redirect: "error", cache: "no-store" });
+      return this.fetchImpl(media, { headers, redirect: "error", cache: "no-store", signal });
     }
     await assertSafeUrl(target.toString());
-    return this.fetchImpl(target.toString(), { headers, redirect: "error", cache: "no-store" });
+    return this.fetchImpl(target.toString(), { headers, redirect: "error", cache: "no-store", signal });
   }
 }

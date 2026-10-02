@@ -5,6 +5,7 @@ import {
   agentVersions,
   agents,
   branches,
+  callRecordings,
   calls,
   campaignTargets,
   campaigns,
@@ -72,7 +73,9 @@ export async function loadCall(tenantId: string, id: string) {
     if (!row) return null;
     const [lead] = row.c.contactId ? await tx.select().from(leads).where(eq(leads.contactId, row.c.contactId)).orderBy(desc(leads.createdAt)).limit(1) : [];
     const blocked = row.contact ? await tx.select().from(suppressions).where(eq(suppressions.phoneE164, row.contact.phoneE164)) : [];
-    return { ...row, lead: lead ?? null, blocked };
+    // A copy kept on this server plays even after the voice engine's copy is gone.
+    const [held] = await tx.select({ size: callRecordings.sizeBytes }).from(callRecordings).where(eq(callRecordings.callId, id));
+    return { ...row, lead: lead ?? null, blocked, recordingHeld: !!held };
   });
 }
 

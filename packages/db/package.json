@@ -22,7 +22,8 @@
     "client": "tsx src/scripts/client.ts",
     "zoho": "tsx src/scripts/zoho.ts",
     "catalog": "tsx src/scripts/catalog.ts",
-    "voice": "tsx src/scripts/voice.ts"
+    "voice": "tsx src/scripts/voice.ts",
+    "whatsapp": "tsx src/scripts/whatsapp.ts"
   },
   "dependencies": {
     "@jenai/authz": "workspace:*",

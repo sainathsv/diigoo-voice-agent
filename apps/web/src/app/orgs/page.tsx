@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { editionFrom } from "@jenai/authz";
 import { Logo, StatusBadge } from "@/components/ui";
 import { SignOutButton } from "@/components/sign-out";
 import { myOrganizations, requireUser } from "@/server/session";
@@ -10,7 +11,8 @@ export default async function OrgsPage({ searchParams }: { searchParams: Promise
   const { notice } = await searchParams;
   const u = await requireUser();
   const orgs = await myOrganizations(u.id);
-  const staff = orgs.find((o) => o.kind === "platform");
+  // A police department's own server has no JENAI console.
+  const staff = editionFrom(process.env.JENAI_EDITION) === "full" ? orgs.find((o) => o.kind === "platform") : undefined;
   const clients = orgs.filter((o) => o.kind !== "platform");
 
   return (

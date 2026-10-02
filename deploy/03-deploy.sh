@@ -31,7 +31,15 @@ done
 
 say() { printf "\n\033[1m%s\033[0m\n" "$*"; }
 pw() { openssl rand -base64 30 | tr -d '/@" =+' | cut -c1-28; }
-onserver() { $SSH "sudo -u jenai bash -c 'set -a; . /etc/jenai/env; set +a; export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; cd /opt/jenai/app && $1'"; }
+# pipefail: "build | tail" must fail when the build fails, or a broken build would be migrated and restarted.
+onserver() { $SSH "sudo -u jenai bash -c 'set -o pipefail; set -a; . /etc/jenai/env; set +a; export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; cd /opt/jenai/app && $1'"; }
+
+if [ "$FIRST_RUN" = "yes" ] && $SSH 'sudo test -f /etc/jenai/env'; then
+  # A second --first-run would mint new database passwords, session secret and data key: every
+  # sealed credential stops decrypting and every login and two-step enrolment is lost.
+  echo "Refusing --first-run: this server is already set up (/etc/jenai/env exists). Deploy without --first-run."
+  exit 1
+fi
 
 say "1. Copying the code"
 rsync -az --delete \
@@ -44,6 +52,12 @@ rsync -az --delete \
 # node_modules we are preserving), and prints a screen of "cannot delete
 # non-empty directory" on every deploy. It is rebuilt in step 3 regardless.
 $SSH 'sudo rsync -a --delete --exclude node_modules --exclude .next /tmp/jenai-app/ /opt/jenai/app/ && sudo chown -R jenai:jenai /opt/jenai/app && rm -rf /tmp/jenai-app'
+# Record exactly what went out, so /api/version shows it (a "-dirty" build carried uncommitted changes).
+VER="$(git -C "$REPO" rev-parse --short=10 HEAD 2>/dev/null || echo nogit)"
+[ -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" ] || VER="$VER-dirty"
+VER="$VER $(date -u +%Y-%m-%dT%H:%MZ)"
+$SSH "echo '$VER' | sudo tee /opt/jenai/app/VERSION >/dev/null && sudo chown jenai:jenai /opt/jenai/app/VERSION"
+echo "   version $VER"
 
 if [ "$FIRST_RUN" = "yes" ]; then
   say "2. Secrets (made here, kept on the server and in the AWS parameter store)"

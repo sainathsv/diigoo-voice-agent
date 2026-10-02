@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { editionFrom, editionRoute } from "@jenai/authz";
 
 /**
  * Content-Security-Policy with a fresh nonce per request (red-team finding,
@@ -7,6 +8,11 @@ import { NextResponse, type NextRequest } from "next/server";
  * without that nonce can run, even if an attacker gets markup onto a page.
  */
 export function proxy(req: NextRequest) {
+  // A police department's own server (JENAI_EDITION=police) serves its complaint portal only.
+  const route = editionRoute(editionFrom(process.env.JENAI_EDITION), req.nextUrl.pathname);
+  if (route === "not_found") return new NextResponse("Not found", { status: 404 });
+  if (route !== "serve") return NextResponse.redirect(new URL(route.redirect, req.url));
+
   const nonce = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("base64");
   const dev = process.env.NODE_ENV !== "production";
   const csp = [
