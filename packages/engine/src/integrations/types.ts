@@ -21,6 +21,12 @@ export interface OutEvent {
   /** Their record this is about, when we know it. */
   externalId: string | null;
   payload: Record<string, unknown>;
+  /**
+   * What an earlier try already wrote in their system, as the connector named
+   * it ({Calls: "<id>"}). A connector that makes more than one request for an
+   * event skips the ones listed here, so a retry never writes them twice.
+   */
+  progress?: Record<string, string>;
 }
 
 export interface SendResult {
@@ -42,6 +48,12 @@ export interface SendResult {
    * reconnects it. Never set for a refusal about one record.
    */
   connectionBroken?: boolean;
+  /**
+   * Everything written in their system for this event so far, by this try and
+   * the ones before it. Kept on the event whatever the outcome, and handed back
+   * on the next try as OutEvent.progress.
+   */
+  progress?: Record<string, string>;
 }
 
 export interface Connector {
@@ -56,7 +68,11 @@ export function pick(payload: Record<string, unknown>, path: string): unknown {
   return path.split(".").reduce<unknown>((v, part) => (v && typeof v === "object" ? (v as Record<string, unknown>)[part] : undefined), payload);
 }
 
-/** Builds the body their system expects: {theirField: "our.path"} becomes {theirField: value}. */
+/**
+ * Builds the body their system expects: {theirField: "our.path"} becomes {theirField: value}.
+ * With no mapping it is the whole payload, which suits a webhook; a CRM
+ * connector checks for a mapping first, or it writes the raw event on a record.
+ */
 export function applyMapping(payload: Record<string, unknown>, mapping: Record<string, string> | undefined): Record<string, unknown> {
   if (!mapping || !Object.keys(mapping).length) return payload;
   const out: Record<string, unknown> = {};

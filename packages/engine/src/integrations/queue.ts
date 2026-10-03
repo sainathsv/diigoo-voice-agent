@@ -161,13 +161,13 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
           .where(eq(integrations.id, i.id));
       },
     };
-    const out: OutEvent = { id: e.id, kind: e.kind, idempotencyKey: e.idempotencyKey, externalId: e.externalId, payload: e.payload };
+    const out: OutEvent = { id: e.id, kind: e.kind, idempotencyKey: e.idempotencyKey, externalId: e.externalId, payload: e.payload, progress: e.progress };
     const r = await connector.send(ctx, out);
 
     if (r.ok) {
       await tx
         .update(integrationEvents)
-        .set({ status: "done", httpStatus: r.httpStatus ?? null, response: (r.response ?? "").slice(0, 1000), externalId: r.externalId ?? e.externalId, error: null, updatedAt: new Date() })
+        .set({ status: "done", httpStatus: r.httpStatus ?? null, response: (r.response ?? "").slice(0, 1000), externalId: r.externalId ?? e.externalId, progress: r.progress ?? e.progress, error: null, updatedAt: new Date() })
         .where(eq(integrationEvents.id, e.id));
       await tx.update(integrations).set({ status: "connected", lastOkAt: new Date(), lastError: null, updatedAt: new Date() }).where(eq(integrations.id, i.id));
       // Remember which of their records this person is, so the next call lands in the same place.
@@ -190,6 +190,8 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
         .update(integrationEvents)
         .set({
           status: "skipped",
+          externalId: r.externalId ?? e.externalId,
+          progress: r.progress ?? e.progress,
           httpStatus: r.httpStatus ?? null,
           response: (r.response ?? "").slice(0, 1000),
           error: (r.response ?? "refused").slice(0, 500),
@@ -200,6 +202,8 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
     }
 
     // Only a refused connection, or a day of failed tries, marks it broken.
+    // The record found and what already landed are kept, so the next try
+    // carries on from there instead of writing the same call again.
     const give_up = r.connectionBroken === true || e.attempts >= BACKOFF_MS.length;
     const wait = BACKOFF_MS[Math.min(e.attempts, BACKOFF_MS.length - 1)]!;
     await tx
@@ -207,6 +211,8 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
       .set({
         status: give_up ? "failed" : "queued",
         nextAttemptAt: new Date(Date.now() + wait),
+        externalId: r.externalId ?? e.externalId,
+        progress: r.progress ?? e.progress,
         httpStatus: r.httpStatus ?? null,
         response: (r.response ?? "").slice(0, 1000),
         error: (r.response ?? "could not deliver").slice(0, 500),

@@ -414,15 +414,21 @@ describe("logging calls on their Zoho records", () => {
   const SCOPES = ["leads.READ", "leads.UPDATE", "contacts.READ", "contacts.UPDATE", "calls.CREATE", "notes.CREATE"].map((s) => `ZohoCRM.modules.${s}`).concat("ZohoCRM.settings.fields.READ");
   let zohoId = "";
   const asked: string[] = [];
+  // What each request carried, for the ones whose body matters.
+  const sent: Array<{ req: string; body: Record<string, unknown> }> = [];
   // Stands in for Zoho, answering by method and path with the bodies Zoho documents.
   let zoho: (req: string, token: string) => { status: number; body?: unknown } = () => ({ status: 500 });
   const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const req = `${init?.method ?? "GET"} ${new URL(String(input)).pathname}`;
     asked.push(req);
+    if (typeof init?.body === "string") sent.push({ req, body: (JSON.parse(init.body) as { data: Array<Record<string, unknown>> }).data[0]! });
     const token = String((init?.headers as Record<string, string> | undefined)?.Authorization ?? "").replace("Zoho-oauthtoken ", "");
     const r = zoho(req, token);
     return new Response(r.body === undefined ? null : JSON.stringify(r.body), { status: r.status, headers: { "Content-Type": "application/json" } });
   }) as typeof fetch;
+  const added = (id: string) => ({ status: 201, body: { data: [{ code: "SUCCESS", details: { id }, message: "record added", status: "success" }] } });
+  const updated = (id: string) => ({ status: 200, body: { data: [{ code: "SUCCESS", details: { id }, message: "record updated", status: "success" }] } });
+  const bodyOf = (req: string) => sent.find((s) => s.req === req)?.body;
 
   beforeAll(async () => {
     const [row] = await withTenant(tenant, (tx) =>
@@ -431,33 +437,47 @@ describe("logging calls on their Zoho records", () => {
     zohoId = row!.id;
   });
 
-  /** One finished call on its way to Zoho, with an access token cached the way the worker leaves it. */
-  async function readyToSend(opts: { externalId?: string; token?: string } = {}) {
+  const aCall = (seconds = 75) => ({ person: { phone: "+919800000777", name: "Lakshmi" }, call: { outcome: "booked", seconds, at: new Date(Date.now() - 600_000).toISOString() }, program: { name: "Front desk" } });
+
+  /** One event on its way to Zoho, with an access token cached the way the worker leaves it. */
+  async function readyToSend(
+    opts: { externalId?: string; token?: string; kind?: string; payload?: Record<string, unknown>; module?: string; mapping?: Record<string, string> } = {},
+  ) {
     asked.length = 0;
+    sent.length = 0;
     return withTenant(tenant, async (tx) => {
       const credentials = { client_id: "cid", client_secret: "secret", refresh_token: "refresh", access_token: opts.token ?? "cached", access_token_until: String(Date.now() + 3_600_000) };
-      await tx.update(integrations).set({ status: "connected", credentials: sealCredentials(tenant, credentials) }).where(eq(integrations.id, zohoId));
+      await tx
+        .update(integrations)
+        .set({
+          status: "connected",
+          credentials: sealCredentials(tenant, credentials),
+          config: { dc: "in", module: opts.module ?? "Leads", scopes: SCOPES },
+          mapping: { fields: opts.mapping ?? { Lead_Status: "call.outcome" } },
+        })
+        .where(eq(integrations.id, zohoId));
       const [ev] = await tx
         .insert(integrationEvents)
         .values({
           tenantId: tenant,
           integrationId: zohoId,
           direction: "out",
-          kind: "call.completed",
+          kind: opts.kind ?? "call.completed",
           refType: "call",
           refId: randomUUID(),
           externalId: opts.externalId ?? null,
           idempotencyKey: `zoho-${randomUUID()}`,
           status: "sending",
           attempts: 1,
-          payload: { person: { phone: "+919800000777", name: "Lakshmi" }, call: { outcome: "booked", seconds: 75, at: new Date().toISOString() }, program: { name: "Front desk" } },
+          payload: opts.payload ?? aCall(),
         })
         .returning();
       return ev!;
     });
   }
   const send = (id: string) => deliver({ tenantId: tenant, id }, fakeFetch);
-  const errorOf = async (id: string) => (await withTenant(tenant, (tx) => tx.select().from(integrationEvents).where(eq(integrationEvents.id, id))))[0]?.error;
+  const eventRow = async (id: string) => (await withTenant(tenant, (tx) => tx.select().from(integrationEvents).where(eq(integrationEvents.id, id))))[0]!;
+  const errorOf = async (id: string) => (await eventRow(id)).error;
 
   it("skips a caller who is not in Zoho, and keeps logging everyone else", async () => {
     zoho = (req) => (req === "GET /crm/v2/Leads/search" ? { status: 204 } : { status: 500 });
@@ -471,7 +491,7 @@ describe("logging calls on their Zoho records", () => {
   it("skips a record that is gone from Zoho the same way", async () => {
     zoho = (req) =>
       req === "POST /crm/v2/Calls"
-        ? { status: 400, body: { data: [{ code: "INVALID_DATA", details: { api_name: "Who_Id" }, message: "the related id given seems to be invalid", status: "error" }] } }
+        ? { status: 400, body: { data: [{ code: "INVALID_DATA", details: { api_name: "What_Id" }, message: "the related id given seems to be invalid", status: "error" }] } }
         : { status: 500 };
     const ev = await readyToSend({ externalId: "ZOHO-DELETED-1" });
     expect((await send(ev.id)).status).toBe("skipped");
@@ -493,11 +513,9 @@ describe("logging calls on their Zoho records", () => {
   it("gets a new token when Zoho has dropped the cached one, rather than switching off", async () => {
     zoho = (req, token) => {
       if (req === "POST /oauth/v2/token") return { status: 200, body: { access_token: "fresh", expires_in: 3600 } };
-      if (req === "PUT /crm/v2/Leads/ZOHO-LEAD-7") return { status: 200, body: { data: [{ code: "SUCCESS", details: { id: "ZOHO-LEAD-7" }, message: "record updated", status: "success" }] } };
+      if (req === "PUT /crm/v2/Leads/ZOHO-LEAD-7") return updated("ZOHO-LEAD-7");
       if (req !== "POST /crm/v2/Calls") return { status: 500 };
-      return token === "fresh"
-        ? { status: 201, body: { data: [{ code: "SUCCESS", details: { id: "CALL-1" }, message: "record added", status: "success" }] } }
-        : { status: 401, body: { code: "INVALID_TOKEN", details: {}, message: "invalid oauth token", status: "error" } };
+      return token === "fresh" ? added("CALL-1") : { status: 401, body: { code: "INVALID_TOKEN", details: {}, message: "invalid oauth token", status: "error" } };
     };
     const ev = await readyToSend({ externalId: "ZOHO-LEAD-7" });
     expect((await send(ev.id)).status).toBe("done");
@@ -517,5 +535,98 @@ describe("logging calls on their Zoho records", () => {
     expect(r.status).toBe("failed");
     expect(r.message).toMatch(/invalid_code/);
     expect(await integrationStatus(zohoId)).toBe("error");
+  });
+
+  it("links the call to a Lead through What_Id and to a Contact through Who_Id", async () => {
+    zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-2") : req.startsWith("PUT ") ? updated("REC") : { status: 500 });
+    let ev = await readyToSend({ externalId: "ZOHO-LEAD-8" });
+    expect((await send(ev.id)).status).toBe("done");
+    // Zoho's Who_Id is always a Contact: a Lead goes in What_Id, with its module named.
+    let call = bodyOf("POST /crm/v2/Calls")!;
+    expect(call).toMatchObject({ What_Id: "ZOHO-LEAD-8", $se_module: "Leads", Call_Type: "Outbound", Call_Duration: "01:15" });
+    expect(call).not.toHaveProperty("Who_Id");
+    expect(String(call.Call_Start_Time)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+05:30$/);
+
+    ev = await readyToSend({ externalId: "ZOHO-CONTACT-3", module: "Contacts" });
+    expect((await send(ev.id)).status).toBe("done");
+    call = bodyOf("POST /crm/v2/Calls")!;
+    expect(call).toMatchObject({ Who_Id: "ZOHO-CONTACT-3" });
+    expect(call).not.toHaveProperty("What_Id");
+    expect(call).not.toHaveProperty("$se_module");
+    expect(asked).toContain("PUT /crm/v2/Contacts/ZOHO-CONTACT-3");
+  });
+
+  it("never sends Zoho a call of no length, which it refuses", async () => {
+    zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-3") : req.startsWith("PUT ") ? updated("REC") : { status: 500 });
+    const ev = await readyToSend({ externalId: "ZOHO-LEAD-9", payload: aCall(0) });
+    expect((await send(ev.id)).status).toBe("done");
+    expect(bodyOf("POST /crm/v2/Calls")).toMatchObject({ Call_Duration: "00:01" });
+  });
+
+  it("leaves the record's fields alone when no fields are mapped", async () => {
+    zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-4") : { status: 500 });
+    const ev = await readyToSend({ externalId: "ZOHO-LEAD-10", mapping: {} });
+    expect((await send(ev.id)).status).toBe("done");
+    // Not a PUT of the raw event onto their Lead.
+    expect(asked).toEqual(["POST /crm/v2/Calls"]);
+  });
+
+  it("writes a note for a booked visit and for an opt-out, never a call that did not happen", async () => {
+    zoho = (req) => (req === "POST /crm/v2/Notes" ? added("NOTE-1") : { status: 500 });
+    let ev = await readyToSend({
+      externalId: "ZOHO-LEAD-11",
+      kind: "appointment.booked",
+      payload: { event: "appointment.booked", appointment: { at: "25 Sep 2026, 11:00 AM", source_call: randomUUID() }, person: { phone: "+919800000777" } },
+    });
+    expect((await send(ev.id)).status).toBe("done");
+    // The mapped Lead_Status reads call.outcome, which a booking does not carry, so no PUT either.
+    expect(asked).toEqual(["POST /crm/v2/Notes"]);
+    expect(bodyOf("POST /crm/v2/Notes")).toMatchObject({ Parent_Id: "ZOHO-LEAD-11", se_module: "Leads", Note_Title: "JENAI: appointment booked" });
+    expect(String(bodyOf("POST /crm/v2/Notes")!.Note_Content)).toContain("25 Sep 2026, 11:00 AM");
+    expect((await eventRow(ev.id)).progress).toEqual({ Notes: "NOTE-1" });
+
+    ev = await readyToSend({
+      externalId: "ZOHO-LEAD-11",
+      kind: "do_not_call.added",
+      payload: { event: "do_not_call.added", person: { phone: "+919800000777" }, source: "said so on a call" },
+    });
+    expect((await send(ev.id)).status).toBe("done");
+    expect(asked).toEqual(["POST /crm/v2/Notes"]);
+    expect(bodyOf("POST /crm/v2/Notes")).toMatchObject({ Parent_Id: "ZOHO-LEAD-11", Note_Title: "JENAI: asked not to be called" });
+  });
+
+  it("skips a kind it has nothing to write for, without asking Zoho anything", async () => {
+    const ev = await readyToSend({ externalId: "ZOHO-LEAD-12", kind: "lead.updated", payload: { event: "lead.updated" } });
+    expect((await send(ev.id)).status).toBe("skipped");
+    expect(asked).toEqual([]);
+    expect(await integrationStatus(zohoId)).toBe("connected");
+  });
+
+  it("logs the call once when only the field update failed, and retries just that", async () => {
+    let put = 0;
+    zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-5") : req === "PUT /crm/v2/Leads/ZOHO-LEAD-13" ? (++put === 1 ? { status: 503 } : updated("ZOHO-LEAD-13")) : { status: 500 });
+    const ev = await readyToSend({ externalId: "ZOHO-LEAD-13" });
+    expect((await send(ev.id)).status).toBe("queued");
+    expect((await eventRow(ev.id)).progress).toEqual({ Calls: "CALL-5" }); // kept for the next try
+
+    const r = await send(ev.id);
+    expect(r.status).toBe("done");
+    expect(r.message).toMatch(/CALL-5 already logged/);
+    expect(asked).toEqual(["POST /crm/v2/Calls", "PUT /crm/v2/Leads/ZOHO-LEAD-13", "PUT /crm/v2/Leads/ZOHO-LEAD-13"]);
+  });
+
+  it("keeps the record it found when a try fails, so the retry does not search again", async () => {
+    let calls = 0;
+    zoho = (req) =>
+      req === "GET /crm/v2/Leads/search"
+        ? { status: 200, body: { data: [{ id: "ZOHO-LEAD-14" }] } }
+        : req === "POST /crm/v2/Calls"
+          ? ++calls === 1 ? { status: 500 } : added("CALL-6")
+          : req.startsWith("PUT ") ? updated("ZOHO-LEAD-14") : { status: 500 };
+    const ev = await readyToSend();
+    expect((await send(ev.id)).status).toBe("queued");
+    expect((await eventRow(ev.id)).externalId).toBe("ZOHO-LEAD-14");
+    expect((await send(ev.id)).status).toBe("done");
+    expect(asked.filter((a) => a === "GET /crm/v2/Leads/search")).toHaveLength(1);
   });
 });

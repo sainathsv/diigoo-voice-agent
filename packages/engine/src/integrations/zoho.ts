@@ -47,13 +47,33 @@ const may = (ctx: ConnectorContext, scope: string) => {
   return g.size === 0 || g.has(scope);
 };
 
-/** Zoho wants a wall-clock time with an offset, and a duration as mm:ss. */
+/**
+ * Zoho wants a wall-clock time with an offset, and a duration it refuses at
+ * zero ("Call Duration can not be zero"), so a call too short to time counts
+ * as one second.
+ *
+ * Zoho's own pages disagree on the duration's format: the API reference says
+ * HH:mm (with "10:00" as its sample), the CRM help says it is entered in
+ * minutes and seconds. We send minutes and seconds, the way the CRM shows it.
+ * If the reference is the right one, Zoho refuses the Call (a start plus that
+ * many hours is after now) and the skipped event carries its reason. Sent as
+ * HH:mm and wrong, every call would land sixty times too short, silently.
+ */
 function callTimes(p: Record<string, unknown>): { start: string; duration: string } {
   const c = (p.call ?? {}) as Record<string, unknown>;
   const at = new Date(String(c.at ?? c.started_at ?? new Date().toISOString()));
   const ist = new Date(at.getTime() + 330 * 60_000).toISOString().slice(0, 19);
-  const secs = Math.max(0, Number(c.seconds ?? 0));
+  const secs = Math.max(1, Math.round(Number(c.seconds) || 0));
   return { start: `${ist}+05:30`, duration: `${String(Math.floor(secs / 60)).padStart(2, "0")}:${String(secs % 60).padStart(2, "0")}` };
+}
+
+/**
+ * How a Call points at its record. Zoho's Who_Id is always a Contact; a Lead,
+ * or any other module, goes in What_Id with $se_module naming the module.
+ */
+function linkTo(ctx: ConnectorContext, id: string): Record<string, string> {
+  const module = moduleOf(ctx);
+  return module === "Contacts" ? { Who_Id: id } : { What_Id: id, $se_module: module };
 }
 
 interface Token {
@@ -124,9 +144,12 @@ async function call(ctx: ConnectorContext, path: string, init: RequestInit = {},
  * a scope their admin did not give) and fails for every record alike. Anything
  * else is about this record.
  */
-function refused(r: { status: number; text: string }, id?: string): SendResult {
-  return { ok: false, httpStatus: r.status, response: r.text, retry: retryable(r.status), connectionBroken: r.status === 401, externalId: id };
+function refused(r: { status: number; text: string }, id?: string, progress?: Record<string, string>): SendResult {
+  return { ok: false, httpStatus: r.status, response: r.text, retry: retryable(r.status), connectionBroken: r.status === 401, externalId: id, progress };
 }
+
+/** The id Zoho gave a record it just created, from {data: [{details: {id}}]}. */
+const createdId = (r: { json: Record<string, unknown> }) => ((r.json.data as Array<{ details?: { id?: string } }> | undefined) ?? [])[0]?.details?.id;
 
 /**
  * Their record for this person: the one we linked before, else a phone search.
@@ -143,19 +166,48 @@ async function findRecord(ctx: ConnectorContext, e: OutEvent): Promise<{ id: str
   return { id: data[0]?.id ?? null };
 }
 
-function noteText(p: Record<string, unknown>): { title: string; content: string } {
-  const call = (p.call ?? {}) as Record<string, unknown>;
-  const fields = (p.fields ?? {}) as Record<string, unknown>;
-  const program = (p.program ?? {}) as Record<string, unknown>;
-  const lines = [
-    `Outcome: ${String(call.outcome ?? call.status ?? "unknown")}`,
-    call.summary ? `Summary: ${String(call.summary)}` : "",
-    Object.entries(fields).length ? `Answers: ${Object.entries(fields).map(([k, v]) => `${k.replace(/_/g, " ")}: ${String(v)}`).join("; ")}` : "",
-    call.seconds ? `Length: ${String(call.seconds)} seconds` : "",
-    call.recording_url ? `Recording: ${String(call.recording_url)}` : "",
-    `Made by JENAI (AI call)`,
-  ].filter(Boolean);
-  return { title: `JENAI call: ${String(program.name ?? "call")}`.slice(0, 120), content: lines.join("\n").slice(0, 32_000) };
+interface Writeup {
+  /** A finished call, logged as a Call record when Calls were granted. Everything else is a Note. */
+  call: boolean;
+  title: string;
+  content: string;
+}
+
+/**
+ * What each kind of event says on their record. A booked visit or an opt-out
+ * is not a call: logged as one it read "Outcome: unknown", 00:00, Completed, a
+ * call that never happened. A kind with nothing to say here gets no note.
+ */
+function writeup(e: OutEvent): Writeup | null {
+  const p = e.payload;
+  const said = (title: string, lines: string[], call = false): Writeup => ({
+    call,
+    title: title.slice(0, 120),
+    content: [...lines.filter(Boolean), `Made by JENAI (AI call)`].join("\n").slice(0, 32_000),
+  });
+  if (e.kind === "call.completed") {
+    const call = (p.call ?? {}) as Record<string, unknown>;
+    const fields = (p.fields ?? {}) as Record<string, unknown>;
+    const program = (p.program ?? {}) as Record<string, unknown>;
+    return said(`JENAI call: ${String(program.name ?? "call")}`, [
+      `Outcome: ${String(call.outcome ?? call.status ?? "unknown")}`,
+      call.summary ? `Summary: ${String(call.summary)}` : "",
+      Object.entries(fields).length ? `Answers: ${Object.entries(fields).map(([k, v]) => `${k.replace(/_/g, " ")}: ${String(v)}`).join("; ")}` : "",
+      call.seconds ? `Length: ${String(call.seconds)} seconds` : "",
+      call.recording_url ? `Recording: ${String(call.recording_url)}` : "",
+    ], true);
+  }
+  if (e.kind === "appointment.booked") {
+    const appointment = (p.appointment ?? {}) as Record<string, unknown>;
+    return said("JENAI: appointment booked", [`Booked on a call for: ${String(appointment.at ?? "a time to be confirmed")}`]);
+  }
+  if (e.kind === "do_not_call.added") {
+    return said("JENAI: asked not to be called", [
+      "Asked not to be called again. JENAI will not call this number.",
+      p.source ? `Source: ${String(p.source)}` : "",
+    ]);
+  }
+  return null;
 }
 
 export const zohoConnector: Connector = {
@@ -181,7 +233,17 @@ export const zohoConnector: Connector = {
   },
 
   async send(ctx, e): Promise<SendResult> {
+    // What earlier tries already wrote, plus what this one writes.
+    const done: Record<string, string> = { ...(e.progress ?? {}) };
     try {
+      const say = writeup(e);
+      // Only the fields they mapped. Without a mapping applyMapping hands back
+      // the whole event, and that is not something to PUT on their record.
+      const mapping = ctx.integration.mapping?.fields;
+      const fields = mapping && Object.keys(mapping).length ? applyMapping(e.payload, mapping) : {};
+      // Skipped rather than done: nothing reached Zoho, so it says nothing about the connection.
+      if (!say && !Object.keys(fields).length) return { ok: false, retry: false, response: `Nothing to write in Zoho for ${e.kind}` };
+
       const found = await findRecord(ctx, e);
       if ("refused" in found) return found.refused;
       const id = found.id;
@@ -195,56 +257,60 @@ export const zohoConnector: Connector = {
           method: "POST",
           body: JSON.stringify({ data: [{ Last_Name: String((e.payload.person as Record<string, unknown>)?.name ?? "Unknown"), Phone: String((e.payload.person as Record<string, unknown>)?.phone ?? ""), Lead_Source: "JENAI call" }] }),
         });
-        const newId = ((created.json.data as Array<{ details?: { id?: string } }> | undefined) ?? [])[0]?.details?.id;
+        const newId = createdId(created);
         if (!newId) return refused(created);
         return this.send(ctx, { ...e, externalId: newId });
       }
 
-      // How the call gets recorded, in order of what the client granted. A Call
-      // record is the better home for it: it lands in their activity history
-      // with a type, a time and a duration, rather than as loose text.
-      const { title, content } = noteText(e.payload);
+      // How it gets recorded, in order of what the client granted. A Call
+      // record is the better home for a call: it lands in their activity
+      // history with a type, a time and a duration, rather than as loose text.
+      // Written once: a retry after the field update failed finds it in done.
       let wrote = "nothing";
       let status = 200;
-      if (may(ctx, "ZohoCRM.modules.calls.CREATE")) {
+      const logged = done.Calls ?? done.Notes;
+      if (say && logged) {
+        wrote = `${done.Calls ? "call" : "note"} ${logged} already logged`;
+      } else if (say?.call && may(ctx, "ZohoCRM.modules.calls.CREATE")) {
         const t = callTimes(e.payload);
         const direction = String(((e.payload.call ?? {}) as Record<string, unknown>).direction ?? "outbound");
         const r = await call(ctx, `/crm/v2/Calls`, {
           method: "POST",
           body: JSON.stringify({ data: [{
-            Subject: title,
+            Subject: say.title,
             Call_Type: direction === "inbound" ? "Inbound" : "Outbound",
             Call_Start_Time: t.start,
             Call_Duration: t.duration,
             Call_Status: "Completed",
-            Description: content,
-            Who_Id: id,
-            $se_module: moduleOf(ctx),
+            Description: say.content,
+            ...linkTo(ctx, id),
           }] }),
         });
-        if (r.status >= 400) return refused(r, id);
+        if (r.status >= 400) return refused(r, id, done);
+        // No id back would be odd, but the call is in Zoho all the same.
+        done.Calls = createdId(r) ?? "logged";
         wrote = "call logged";
         status = r.status;
-      } else if (may(ctx, "ZohoCRM.modules.notes.CREATE")) {
+      } else if (say && may(ctx, "ZohoCRM.modules.notes.CREATE")) {
         const r = await call(ctx, `/crm/v2/Notes`, {
           method: "POST",
-          body: JSON.stringify({ data: [{ Note_Title: title, Note_Content: content, Parent_Id: id, se_module: moduleOf(ctx) }] }),
+          body: JSON.stringify({ data: [{ Note_Title: say.title, Note_Content: say.content, Parent_Id: id, se_module: moduleOf(ctx) }] }),
         });
-        if (r.status >= 400) return refused(r, id);
+        if (r.status >= 400) return refused(r, id, done);
+        done.Notes = createdId(r) ?? "logged";
         wrote = "note added";
         status = r.status;
       }
 
       // Fields the client chose to keep in step (for example Lead Status from the outcome).
-      const fields = applyMapping(e.payload, ctx.integration.mapping?.fields);
       if (Object.keys(fields).length) {
         const upd = await call(ctx, `/crm/v2/${moduleOf(ctx)}/${id}`, { method: "PUT", body: JSON.stringify({ data: [fields] }) });
-        if (upd.status >= 400) return refused(upd, id);
+        if (upd.status >= 400) return refused(upd, id, done);
       }
-      return { ok: true, httpStatus: status, externalId: id, response: `${wrote} on ${moduleOf(ctx)} ${id}` };
+      return { ok: true, httpStatus: status, externalId: id, progress: done, response: `${wrote} on ${moduleOf(ctx)} ${id}` };
     } catch (err) {
       const gone = err instanceof GrantGoneError;
-      return { ok: false, response: (err as Error).message.slice(0, 300), retry: !gone, connectionBroken: gone };
+      return { ok: false, response: (err as Error).message.slice(0, 300), retry: !gone, connectionBroken: gone, progress: done };
     }
   },
 };

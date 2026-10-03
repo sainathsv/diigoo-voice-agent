@@ -982,6 +982,8 @@ export const integrationEvents = pgTable(
     externalId: text("external_id"),
     idempotencyKey: text("idempotency_key").notNull(),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
+    /** What already landed in their system (migration 0023), so a retry does not write it twice. */
+    progress: jsonb("progress").$type<Record<string, string>>().notNull().default({}),
     status: text("status").notNull().default("queued"),
     attempts: integer("attempts").notNull().default(0),
     nextAttemptAt: ts("next_attempt_at").notNull().defaultNow(),
