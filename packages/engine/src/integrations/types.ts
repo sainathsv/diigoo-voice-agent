@@ -29,8 +29,19 @@ export interface SendResult {
   /** Their record id, when the connector created or found one. */
   externalId?: string;
   response?: string;
-  /** false for a permanent refusal (bad request, revoked access): stop retrying. */
+  /**
+   * false for a permanent refusal: stop retrying. On its own that refusal is
+   * about this one record (not in their CRM, a stale id, a value they reject):
+   * the event is skipped with its reason and the connection stays up.
+   */
   retry?: boolean;
+  /**
+   * The refusal is about the connection itself: a revoked grant, a scope their
+   * admin did not give, an address we will not send to. Nothing else would get
+   * through either, so the integration is marked broken until someone
+   * reconnects it. Never set for a refusal about one record.
+   */
+  connectionBroken?: boolean;
 }
 
 export interface Connector {

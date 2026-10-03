@@ -27,7 +27,7 @@ import {
 import { analyzeCalls, type Extractor } from "../analyze";
 import { setUpProgram } from "../programs";
 import { addCarrierAccount, addPhoneNumber } from "../telephony";
-import { claimDeliveries, deliver, enqueueEvent, sealCredentials } from "./queue";
+import { claimDeliveries, deliver, enqueueEvent, sealCredentials, subscribers } from "./queue";
 import { EVENT_KINDS, emitCallCompleted } from "./events";
 import { verifySignature } from "./http";
 import { CallRequestError, requestCall } from "./inbound";
@@ -95,6 +95,9 @@ afterAll(async () => {
   await new Promise<void>((r) => server.close(() => r()));
 });
 
+const integrationStatus = async (id: string) =>
+  (await withTenant(tenant, (tx) => tx.select({ status: integrations.status }).from(integrations).where(eq(integrations.id, id))))[0]?.status;
+
 let seq = 500;
 async function seedCall(outcome: string) {
   const phone = `+9198000005${String(++seq).slice(-2)}`;
@@ -152,7 +155,7 @@ describe("handing results back to the client's own system", () => {
     expect(link?.externalId).toBeUndefined(); // a plain webhook returns no record id
   });
 
-  it("keeps trying when their system is down, and gives up on a refusal", async () => {
+  it("keeps trying when their system is down, and skips a refusal without switching the connection off", async () => {
     answer = { status: 500, body: "boom" };
     const { call } = await seedCall("callback");
     await withTenant(tenant, (tx) => emitCallCompleted(tx, tenant, call.id));
@@ -164,16 +167,29 @@ describe("handing results back to the client's own system", () => {
     expect(ev!.attempts).toBe(1);
     expect(ev!.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
 
-    // A refusal (their endpoint says the request is wrong) is not retried for ever.
+    // A refusal (their endpoint says this request is wrong) is not retried for
+    // ever, and it is about this one event: the next call still goes to them.
     answer = { status: 400, body: "bad request" };
     await withTenant(tenant, (tx) => tx.update(integrationEvents).set({ status: "queued", nextAttemptAt: new Date() }).where(eq(integrationEvents.id, ev!.id)));
     claimed = (await claimDeliveries(platformDb(), 10)).filter((c) => c.tenantId === tenant);
     r = await deliver(claimed[0]!);
-    expect(r.status).toBe("failed");
+    expect(r.status).toBe("skipped");
     [ev] = await withTenant(tenant, (tx) => tx.select().from(integrationEvents).where(eq(integrationEvents.id, ev!.id)));
-    expect(ev!.error).toContain("bad request");
-    const [i] = await withTenant(tenant, (tx) => tx.select().from(integrations).where(eq(integrations.id, integrationId)));
-    expect(i!.status).toBe("error"); // the client sees it on their integrations page
+    expect(ev!.status).toBe("skipped");
+    expect(ev!.error).toContain("bad request"); // the reason, for whoever works the list
+    expect(await integrationStatus(integrationId)).toBe("connected");
+    expect((await withTenant(tenant, (tx) => subscribers(tx, "call.completed"))).map((s) => s.id)).toContain(integrationId);
+    answer = { status: 200, body: `{"ok":true}` };
+  });
+
+  it("switches the connection off when their system refuses our key", async () => {
+    answer = { status: 401, body: "unknown signing key" };
+    const { call } = await seedCall("callback");
+    await withTenant(tenant, (tx) => emitCallCompleted(tx, tenant, call.id));
+    const claimed = (await claimDeliveries(platformDb(), 10)).filter((c) => c.tenantId === tenant);
+    const r = await deliver(claimed[0]!);
+    expect(r.status).toBe("failed"); // "Send failed again" picks it up once the key is fixed
+    expect(await integrationStatus(integrationId)).toBe("error"); // the client sees it on their integrations page
     answer = { status: 200, body: `{"ok":true}` };
     await withTenant(tenant, (tx) => tx.update(integrations).set({ status: "connected" }).where(eq(integrations.id, integrationId)));
   });
@@ -195,6 +211,7 @@ describe("handing results back to the client's own system", () => {
       const r = await deliver({ tenantId: tenant, id: event!.id });
       expect(r.ok).toBe(false);
       expect(r.message).toMatch(/Blocked address/);
+      expect(await integrationStatus(bad!.id)).toBe("error"); // the address is the connection's, not the event's
     } finally {
       process.env.JENAI_ALLOW_PRIVATE_WEBHOOKS = relaxed;
     }
@@ -389,5 +406,116 @@ describe("an opt-out said on a call", () => {
       tx.select().from(integrationEvents).where(and(eq(integrationEvents.integrationId, crmId), eq(integrationEvents.refId, call.id), eq(integrationEvents.kind, "call.completed"))),
     );
     expect(sent).toHaveLength(1);
+  });
+});
+
+describe("logging calls on their Zoho records", () => {
+  // Zennara's grant: no leads.CREATE, so a caller who is not in Zoho stays out of it.
+  const SCOPES = ["leads.READ", "leads.UPDATE", "contacts.READ", "contacts.UPDATE", "calls.CREATE", "notes.CREATE"].map((s) => `ZohoCRM.modules.${s}`).concat("ZohoCRM.settings.fields.READ");
+  let zohoId = "";
+  const asked: string[] = [];
+  // Stands in for Zoho, answering by method and path with the bodies Zoho documents.
+  let zoho: (req: string, token: string) => { status: number; body?: unknown } = () => ({ status: 500 });
+  const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const req = `${init?.method ?? "GET"} ${new URL(String(input)).pathname}`;
+    asked.push(req);
+    const token = String((init?.headers as Record<string, string> | undefined)?.Authorization ?? "").replace("Zoho-oauthtoken ", "");
+    const r = zoho(req, token);
+    return new Response(r.body === undefined ? null : JSON.stringify(r.body), { status: r.status, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+
+  beforeAll(async () => {
+    const [row] = await withTenant(tenant, (tx) =>
+      tx.insert(integrations).values({ tenantId: tenant, kind: "zoho_crm", name: "Zoho", status: "connected", config: { dc: "in", module: "Leads", scopes: SCOPES }, mapping: { fields: { Lead_Status: "call.outcome" } }, events: ["call.completed"] }).returning(),
+    );
+    zohoId = row!.id;
+  });
+
+  /** One finished call on its way to Zoho, with an access token cached the way the worker leaves it. */
+  async function readyToSend(opts: { externalId?: string; token?: string } = {}) {
+    asked.length = 0;
+    return withTenant(tenant, async (tx) => {
+      const credentials = { client_id: "cid", client_secret: "secret", refresh_token: "refresh", access_token: opts.token ?? "cached", access_token_until: String(Date.now() + 3_600_000) };
+      await tx.update(integrations).set({ status: "connected", credentials: sealCredentials(tenant, credentials) }).where(eq(integrations.id, zohoId));
+      const [ev] = await tx
+        .insert(integrationEvents)
+        .values({
+          tenantId: tenant,
+          integrationId: zohoId,
+          direction: "out",
+          kind: "call.completed",
+          refType: "call",
+          refId: randomUUID(),
+          externalId: opts.externalId ?? null,
+          idempotencyKey: `zoho-${randomUUID()}`,
+          status: "sending",
+          attempts: 1,
+          payload: { person: { phone: "+919800000777", name: "Lakshmi" }, call: { outcome: "booked", seconds: 75, at: new Date().toISOString() }, program: { name: "Front desk" } },
+        })
+        .returning();
+      return ev!;
+    });
+  }
+  const send = (id: string) => deliver({ tenantId: tenant, id }, fakeFetch);
+  const errorOf = async (id: string) => (await withTenant(tenant, (tx) => tx.select().from(integrationEvents).where(eq(integrationEvents.id, id))))[0]?.error;
+
+  it("skips a caller who is not in Zoho, and keeps logging everyone else", async () => {
+    zoho = (req) => (req === "GET /crm/v2/Leads/search" ? { status: 204 } : { status: 500 });
+    const ev = await readyToSend();
+    expect((await send(ev.id)).status).toBe("skipped");
+    expect(await errorOf(ev.id)).toMatch(/No matching record in Zoho/); // the front desk's list of people to add
+    expect(await integrationStatus(zohoId)).toBe("connected");
+    expect((await withTenant(tenant, (tx) => subscribers(tx, "call.completed"))).map((s) => s.id)).toContain(zohoId);
+  });
+
+  it("skips a record that is gone from Zoho the same way", async () => {
+    zoho = (req) =>
+      req === "POST /crm/v2/Calls"
+        ? { status: 400, body: { data: [{ code: "INVALID_DATA", details: { api_name: "Who_Id" }, message: "the related id given seems to be invalid", status: "error" }] } }
+        : { status: 500 };
+    const ev = await readyToSend({ externalId: "ZOHO-DELETED-1" });
+    expect((await send(ev.id)).status).toBe("skipped");
+    expect(await errorOf(ev.id)).toMatch(/INVALID_DATA/);
+    expect(await integrationStatus(zohoId)).toBe("connected");
+  });
+
+  it("switches the connection off for a scope Zoho was not given, even on the phone search", async () => {
+    const mismatch = { code: "OAUTH_SCOPE_MISMATCH", details: {}, message: "Client does not have ZohoSearch.securesearch.READ scope. Create a new client with valid scope.", status: "error" };
+    zoho = (req) => (req === "GET /crm/v2/Leads/search" ? { status: 401, body: mismatch } : { status: 500 });
+    const ev = await readyToSend();
+    const r = await send(ev.id);
+    // Not "not in Zoho": with the search refused, nobody could have been found.
+    expect(r.status).toBe("failed");
+    expect(r.message).toMatch(/ZohoSearch\.securesearch\.READ/);
+    expect(await integrationStatus(zohoId)).toBe("error");
+  });
+
+  it("gets a new token when Zoho has dropped the cached one, rather than switching off", async () => {
+    zoho = (req, token) => {
+      if (req === "POST /oauth/v2/token") return { status: 200, body: { access_token: "fresh", expires_in: 3600 } };
+      if (req === "PUT /crm/v2/Leads/ZOHO-LEAD-7") return { status: 200, body: { data: [{ code: "SUCCESS", details: { id: "ZOHO-LEAD-7" }, message: "record updated", status: "success" }] } };
+      if (req !== "POST /crm/v2/Calls") return { status: 500 };
+      return token === "fresh"
+        ? { status: 201, body: { data: [{ code: "SUCCESS", details: { id: "CALL-1" }, message: "record added", status: "success" }] } }
+        : { status: 401, body: { code: "INVALID_TOKEN", details: {}, message: "invalid oauth token", status: "error" } };
+    };
+    const ev = await readyToSend({ externalId: "ZOHO-LEAD-7" });
+    expect((await send(ev.id)).status).toBe("done");
+    expect(asked).toEqual(["POST /crm/v2/Calls", "POST /oauth/v2/token", "POST /crm/v2/Calls", "PUT /crm/v2/Leads/ZOHO-LEAD-7"]);
+    expect(await integrationStatus(zohoId)).toBe("connected");
+  });
+
+  it("waits out Zoho's limit on new tokens, and switches off only when the grant is revoked", async () => {
+    zoho = (req) => (req === "POST /oauth/v2/token" ? { status: 400, body: { error: "Access Denied" } } : { status: 500 });
+    let ev = await readyToSend({ externalId: "ZOHO-LEAD-7", token: "" });
+    expect((await send(ev.id)).status).toBe("queued");
+    expect(await integrationStatus(zohoId)).toBe("connected");
+
+    zoho = (req) => (req === "POST /oauth/v2/token" ? { status: 200, body: { error: "invalid_code" } } : { status: 500 });
+    ev = await readyToSend({ externalId: "ZOHO-LEAD-7", token: "" });
+    const r = await send(ev.id);
+    expect(r.status).toBe("failed");
+    expect(r.message).toMatch(/invalid_code/);
+    expect(await integrationStatus(zohoId)).toBe("error");
   });
 });

@@ -181,7 +181,26 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
       return { ok: true, status: "done", message: r.response ?? "" };
     }
 
-    const give_up = r.retry === false || e.attempts >= BACKOFF_MS.length;
+    // A refusal about this one record (a caller who is not in their CRM, a
+    // stale id) must not stop the calls after it reaching their system. It is
+    // skipped with its reason, and those rows are the list of people to add on
+    // their side. The connection's status is left as it is.
+    if (r.retry === false && !r.connectionBroken) {
+      await tx
+        .update(integrationEvents)
+        .set({
+          status: "skipped",
+          httpStatus: r.httpStatus ?? null,
+          response: (r.response ?? "").slice(0, 1000),
+          error: (r.response ?? "refused").slice(0, 500),
+          updatedAt: new Date(),
+        })
+        .where(eq(integrationEvents.id, e.id));
+      return { ok: false, status: "skipped", message: r.response ?? "" };
+    }
+
+    // Only a refused connection, or a day of failed tries, marks it broken.
+    const give_up = r.connectionBroken === true || e.attempts >= BACKOFF_MS.length;
     const wait = BACKOFF_MS[Math.min(e.attempts, BACKOFF_MS.length - 1)]!;
     await tx
       .update(integrationEvents)

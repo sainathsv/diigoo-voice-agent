@@ -38,10 +38,12 @@ async function post(ctx: ConnectorContext, url: string, headers: Record<string, 
     await assertClientUrl(url);
     const res = await ctx.fetch(url, { method, headers, body, signal: ctrl.signal, redirect: "error" });
     const text = (await res.text().catch(() => "")).slice(0, 2000);
-    return { ok: res.ok, httpStatus: res.status, response: text, retry: retryable(res.status) };
+    // A 401 is about the key we hold, not the record we sent: every send after it fails the same way.
+    return { ok: res.ok, httpStatus: res.status, response: text, retry: retryable(res.status), connectionBroken: res.status === 401 };
   } catch (e) {
+    // The address belongs to the connection, so a refused one stops every send.
     const blocked = (e as Error).name === "BlockedUrlError";
-    return { ok: false, response: (e as Error).message.slice(0, 300), retry: !blocked };
+    return { ok: false, response: (e as Error).message.slice(0, 300), retry: !blocked, connectionBroken: blocked };
   } finally {
     clearTimeout(timer);
   }
@@ -57,7 +59,7 @@ export const webhookConnector: Connector = {
   },
   async send(ctx, e) {
     const url = String(ctx.integration.config.url ?? "");
-    if (!url) return { ok: false, response: "No address configured", retry: false };
+    if (!url) return { ok: false, response: "No address configured", retry: false, connectionBroken: true };
     const body = JSON.stringify(applyMapping(e.payload, ctx.integration.mapping?.[e.kind]));
     const secret = ctx.credentials.signing_secret ?? "";
     return post(ctx, url, {

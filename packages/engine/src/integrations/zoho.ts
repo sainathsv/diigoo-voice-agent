@@ -62,11 +62,19 @@ interface Token {
   error?: string;
 }
 
+/**
+ * What Zoho answers for a refresh token that will never work again: revoked by
+ * their admin, or a client id or secret that is wrong. Its rate limit on new
+ * tokens ("Access Denied") and outages pass, so those are retried instead.
+ */
+const GRANT_GONE = new Set(["invalid_code", "invalid_client", "invalid_client_secret"]);
+class GrantGoneError extends Error {}
+
 /** Zoho access tokens last an hour; the refresh token is the long-lived one we store. */
-async function accessToken(ctx: ConnectorContext): Promise<string> {
+async function accessToken(ctx: ConnectorContext, fresh = false): Promise<string> {
   const cached = ctx.credentials.access_token;
   const until = Number(ctx.credentials.access_token_until ?? 0);
-  if (cached && until > Date.now() + 60_000) return cached;
+  if (!fresh && cached && until > Date.now() + 60_000) return cached;
   const dc = dcOf(ctx);
   const url = `${ACCOUNTS[dc] ?? ACCOUNTS.in}/oauth/v2/token`;
   await assertClientUrl(url);
@@ -78,15 +86,18 @@ async function accessToken(ctx: ConnectorContext): Promise<string> {
   });
   const res = await ctx.fetch(url, { method: "POST", body, headers: { "Content-Type": "application/x-www-form-urlencoded" }, redirect: "error" });
   const j = (await res.json().catch(() => ({}))) as Token;
-  if (!j.access_token) throw new Error(`Zoho refused the refresh token: ${j.error ?? res.status}`);
+  if (!j.access_token) {
+    const why = `Zoho refused the refresh token: ${j.error ?? res.status}`;
+    throw GRANT_GONE.has(j.error ?? "") ? new GrantGoneError(`${why}. Reconnect Zoho.`) : new Error(why);
+  }
   await ctx.save({ credentials: { ...ctx.credentials, access_token: j.access_token, access_token_until: String(Date.now() + (j.expires_in ?? 3600) * 1000) } });
   ctx.credentials.access_token = j.access_token;
   ctx.credentials.access_token_until = String(Date.now() + (j.expires_in ?? 3600) * 1000);
   return j.access_token;
 }
 
-async function call(ctx: ConnectorContext, path: string, init: RequestInit = {}): Promise<{ status: number; json: Record<string, unknown>; text: string }> {
-  const token = await accessToken(ctx);
+async function call(ctx: ConnectorContext, path: string, init: RequestInit = {}, fresh = false): Promise<{ status: number; json: Record<string, unknown>; text: string }> {
+  const token = await accessToken(ctx, fresh);
   const url = `${API[dcOf(ctx)] ?? API.in}${path}`;
   await assertClientUrl(url);
   const res = await ctx.fetch(url, {
@@ -101,17 +112,35 @@ async function call(ctx: ConnectorContext, path: string, init: RequestInit = {})
   } catch {
     json = {};
   }
+  // Zoho keeps only the newest 15 access tokens per refresh token and drops
+  // the oldest, so a cached one can die before its hour is up. One more try
+  // with a new token, before a 401 is taken as the connection's.
+  if (res.status === 401 && json.code === "INVALID_TOKEN" && !fresh) return call(ctx, path, init, true);
   return { status: res.status, json, text };
 }
 
-/** Their record for this person: the one we linked before, else a phone search. */
-async function findRecord(ctx: ConnectorContext, e: OutEvent): Promise<string | null> {
-  if (e.externalId) return e.externalId;
+/**
+ * A refusal from Zoho, in the queue's terms. A 401 is our grant (a dead token,
+ * a scope their admin did not give) and fails for every record alike. Anything
+ * else is about this record.
+ */
+function refused(r: { status: number; text: string }, id?: string): SendResult {
+  return { ok: false, httpStatus: r.status, response: r.text, retry: retryable(r.status), connectionBroken: r.status === 401, externalId: id };
+}
+
+/**
+ * Their record for this person: the one we linked before, else a phone search.
+ * A refused search is passed back as it is: read as "no match", a missing
+ * search scope would put every caller on the not-in-Zoho list.
+ */
+async function findRecord(ctx: ConnectorContext, e: OutEvent): Promise<{ id: string | null } | { refused: SendResult }> {
+  if (e.externalId) return { id: e.externalId };
   const phone = String((e.payload.person as Record<string, unknown> | undefined)?.phone ?? "");
-  if (!phone) return null;
+  if (!phone) return { id: null };
   const r = await call(ctx, `/crm/v2/${moduleOf(ctx)}/search?phone=${encodeURIComponent(phone)}`);
+  if (r.status >= 400) return { refused: refused(r) };
   const data = (r.json.data as Array<{ id?: string }> | undefined) ?? [];
-  return data[0]?.id ?? null;
+  return { id: data[0]?.id ?? null };
 }
 
 function noteText(p: Record<string, unknown>): { title: string; content: string } {
@@ -153,7 +182,9 @@ export const zohoConnector: Connector = {
 
   async send(ctx, e): Promise<SendResult> {
     try {
-      const id = await findRecord(ctx, e);
+      const found = await findRecord(ctx, e);
+      if ("refused" in found) return found.refused;
+      const id = found.id;
       if (!id) {
         // Their CRM decides who exists. We do not create records unless asked to.
         if (!ctx.integration.config.createIfMissing) return { ok: false, response: "No matching record in Zoho for this number", retry: false };
@@ -165,7 +196,7 @@ export const zohoConnector: Connector = {
           body: JSON.stringify({ data: [{ Last_Name: String((e.payload.person as Record<string, unknown>)?.name ?? "Unknown"), Phone: String((e.payload.person as Record<string, unknown>)?.phone ?? ""), Lead_Source: "JENAI call" }] }),
         });
         const newId = ((created.json.data as Array<{ details?: { id?: string } }> | undefined) ?? [])[0]?.details?.id;
-        if (!newId) return { ok: false, httpStatus: created.status, response: created.text, retry: retryable(created.status) };
+        if (!newId) return refused(created);
         return this.send(ctx, { ...e, externalId: newId });
       }
 
@@ -191,7 +222,7 @@ export const zohoConnector: Connector = {
             $se_module: moduleOf(ctx),
           }] }),
         });
-        if (r.status >= 400) return { ok: false, httpStatus: r.status, response: r.text, retry: retryable(r.status), externalId: id };
+        if (r.status >= 400) return refused(r, id);
         wrote = "call logged";
         status = r.status;
       } else if (may(ctx, "ZohoCRM.modules.notes.CREATE")) {
@@ -199,7 +230,7 @@ export const zohoConnector: Connector = {
           method: "POST",
           body: JSON.stringify({ data: [{ Note_Title: title, Note_Content: content, Parent_Id: id, se_module: moduleOf(ctx) }] }),
         });
-        if (r.status >= 400) return { ok: false, httpStatus: r.status, response: r.text, retry: retryable(r.status), externalId: id };
+        if (r.status >= 400) return refused(r, id);
         wrote = "note added";
         status = r.status;
       }
@@ -208,11 +239,12 @@ export const zohoConnector: Connector = {
       const fields = applyMapping(e.payload, ctx.integration.mapping?.fields);
       if (Object.keys(fields).length) {
         const upd = await call(ctx, `/crm/v2/${moduleOf(ctx)}/${id}`, { method: "PUT", body: JSON.stringify({ data: [fields] }) });
-        if (upd.status >= 400) return { ok: false, httpStatus: upd.status, response: upd.text, retry: retryable(upd.status), externalId: id };
+        if (upd.status >= 400) return refused(upd, id);
       }
       return { ok: true, httpStatus: status, externalId: id, response: `${wrote} on ${moduleOf(ctx)} ${id}` };
     } catch (err) {
-      return { ok: false, response: (err as Error).message.slice(0, 300), retry: true };
+      const gone = err instanceof GrantGoneError;
+      return { ok: false, response: (err as Error).message.slice(0, 300), retry: !gone, connectionBroken: gone };
     }
   },
 };
