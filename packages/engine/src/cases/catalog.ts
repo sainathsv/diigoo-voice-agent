@@ -40,6 +40,7 @@ const MAY_BE_UNKNOWN = new Set(["house_number", "police_station", "pincode", "ca
 export const mayBeUnknown = (key: string) => MAY_BE_UNKNOWN.has(key);
 
 export const FIELD_LABELS: Record<string, string> = {
+  mobile_number: "Mobile number",
   how_it_happened: "How the fraud happened",
   scam_type: "Type of fraud",
   complainant_name: "Name",
@@ -62,6 +63,7 @@ export const FIELD_LABELS: Record<string, string> = {
 type Lang = "hi" | "en" | "ne";
 
 const SHORT: Record<string, Record<Lang, string>> = {
+  mobile_number: { hi: "मोबाइल नंबर", en: "mobile number", ne: "मोबाइल नम्बर" },
   how_it_happened: { hi: "घटना का विवरण", en: "what happened", ne: "घटनाको विवरण" },
   scam_type: { hi: "फ्रॉड का प्रकार", en: "type of fraud", ne: "ठगीको प्रकार" },
   complainant_name: { hi: "आपका नाम", en: "your name", ne: "तपाईंको नाम" },
@@ -82,6 +84,11 @@ const SHORT: Record<string, Record<Lang, string>> = {
 };
 
 const Q: Record<string, Record<Lang, string>> = {
+  mobile_number: {
+    hi: "WhatsApp पर हमें आपका नंबर नहीं दिखता। कृपया अपना मोबाइल नंबर भेजें (10 अंक)।",
+    en: "WhatsApp does not show us your number. Please send your mobile number (10 digits).",
+    ne: "WhatsApp मा हामीलाई तपाईंको नम्बर देखिँदैन। कृपया आफ्नो मोबाइल नम्बर पठाउनुहोस् (१० अंक)।",
+  },
   how_it_happened: {
     hi: "कृपया संक्षेप में बताइए कि आपके साथ क्या हुआ।",
     en: "Please tell us briefly what happened.",
@@ -171,6 +178,7 @@ const Q: Record<string, Record<Lang, string>> = {
 
 /** Said before asking an item again when the reply did not fit. */
 const HINT: Record<string, Record<Lang, string>> = {
+  mobile_number: { hi: "मोबाइल नंबर 10 अंकों का होता है, जैसे 9876543210।", en: "A mobile number has 10 digits, for example 9876543210.", ne: "मोबाइल नम्बर १० अंकको हुन्छ, जस्तै 9876543210।" },
   date_of_birth: { hi: "जन्म तिथि दिन/महीना/साल में लिखें, जैसे 15/08/1990।", en: "Please write the date as day/month/year, for example 15/08/1990.", ne: "मिति दिन/महिना/साल मा लेख्नुहोस्, जस्तै 15/08/1990।" },
   pincode: { hi: "पिनकोड 6 अंकों का होता है, जैसे 248001।", en: "A PIN code has 6 digits, for example 248001.", ne: "पिनकोड ६ अंकको हुन्छ, जस्तै 248001।" },
   transactions: { hi: "UTR / रेफरेंस नंबर 12 या उससे ज़्यादा अंकों का होता है, जो बैंक के SMS या UPI ऐप में दिखता है।", en: "The UTR / reference number has 12 or more characters; it is shown in the bank SMS or the UPI app.", ne: "UTR / रेफरेन्स नम्बर १२ वा बढी अंकको हुन्छ, बैंकको SMS वा UPI एपमा देखिन्छ।" },
@@ -182,6 +190,7 @@ const HINT: Record<string, Record<Lang, string>> = {
 const HINT_ANY: Record<Lang, string> = { hi: "माफ़ कीजिए, यह जानकारी साफ़ नहीं मिली।", en: "Sorry, that did not come through clearly.", ne: "माफ गर्नुहोस्, यो जानकारी स्पष्ट भएन।" };
 
 const VALID: Record<string, (v: string) => boolean> = {
+  mobile_number: (v) => /^(\+?91)?[6-9]\d{9}$/.test(v.replace(/[\s-]/g, "")),
   complainant_name: (v) => /\p{L}{2,}/u.test(v),
   father_or_husband_name: (v) => /\p{L}{2,}/u.test(v),
   date_of_birth: (v) => /\b(19[2-9]\d|200\d|201[0-5])\b/.test(v),
@@ -220,11 +229,13 @@ function cardFraud(fields: Record<string, string>): boolean {
   return /\b(credit card|debit card|atm card|card number|swipe|card)\b/i.test([fields.type_details, fields.how_it_happened, fields.transactions].map(filled).join(" "));
 }
 
-/** What WhatsApp must collect: the opening two while the type is unknown, the whole form for a money fraud, nothing otherwise. */
+/**
+ * What WhatsApp must collect: the opening two while the type is unknown, the whole form for a
+ * money fraud, nothing otherwise; first of all the mobile number when WhatsApp hides it.
+ */
 export function requiredFor(fields: Record<string, string>, scamType: string | null): string[] {
-  if (!scamType) return [...OPENING_REQUIRED];
-  if (!isFinancial(fields, scamType)) return [];
-  return FINANCIAL_REQUIRED.filter((k) => k !== "card_last4" || cardFraud(fields));
+  const form = !scamType ? [...OPENING_REQUIRED] : !isFinancial(fields, scamType) ? [] : FINANCIAL_REQUIRED.filter((k) => k !== "card_last4" || cardFraud(fields));
+  return fields.number_hidden === "yes" ? ["mobile_number", ...form] : form;
 }
 
 /** Required items not yet answered, in the order they will be asked. */
@@ -304,6 +315,17 @@ function completeTextIn(caseNo: string, l: Lang): string {
   if (l === "en") return `Thank you. Complaint ${caseNo} is complete and has been handed to the cyber cell officers. An officer will contact you on this number. Please keep all chats and screenshots; do not delete them.`;
   if (l === "ne") return `धन्यवाद। उजुरी ${caseNo} पूरा भयो र साइबर सेलका अधिकारीलाई दिइयो। अधिकारीले यही नम्बरमा सम्पर्क गर्नुहुनेछ। सबै च्याट र स्क्रिनसट नमेटाउनुहोस्।`;
   return `धन्यवाद। शिकायत ${caseNo} पूरी हो गई है और साइबर सेल के अधिकारियों को सौंप दी गई है। अधिकारी इसी नंबर पर आपसे संपर्क करेंगे। सभी चैट और स्क्रीनशॉट संभाल कर रखें, डिलीट न करें।`;
+}
+
+/** The person behind a hidden number turned out to have a complaint open already: the chat continues it. */
+function joinedTextIn(caseNo: string, l: Lang): string {
+  if (l === "en") return `Thank you. We found your complaint ${caseNo}; let us continue it here.`;
+  if (l === "ne") return `धन्यवाद। तपाईंको उजुरी ${caseNo} भेटियो; यसलाई यहीँ अगाडि बढाऔं।`;
+  return `धन्यवाद। आपकी शिकायत ${caseNo} मिल गई; आइए इसे यहीं आगे बढ़ाते हैं।`;
+}
+
+export function joinedText(caseNo: string, language: string | null | undefined): string {
+  return both((l) => joinedTextIn(caseNo, l), language);
 }
 
 export function completeText(caseNo: string, language: string | null | undefined): string {

@@ -1,7 +1,7 @@
 import { and, asc, eq, gte, isNull, lt, sql } from "drizzle-orm";
 import { whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
 import { handleInbound, type CaseReader } from "./cases";
-import { OpenWaWhatsApp, openWaMediaId, whatsappFor, type InboundMessage, type QueuedMessage, type WhatsAppSender } from "./whatsapp";
+import { OpenWaWhatsApp, lidAddress, openWaMediaId, whatsappFor, type InboundMessage, type QueuedMessage, type WhatsAppSender } from "./whatsapp";
 
 /**
  * A message that keeps failing (the number cannot be resolved, the database is down) is
@@ -38,12 +38,17 @@ export async function recordLink(tenantId: string, link: { status: string | null
   );
 }
 
-/** Turns a queued message into one the case logic reads, resolving a privacy id (…@lid) to the phone number. */
+/**
+ * Turns a queued message into one the case logic reads, resolving a privacy id (…@lid) to the
+ * phone number. When WhatsApp hides the number from this account, the chat runs on the
+ * private id and the complaint asks the number instead.
+ */
 async function toInbound(m: QueuedMessage, sender: WhatsAppSender): Promise<InboundMessage | null> {
   let from = m.from;
   if (!from && m.lid && sender instanceof OpenWaWhatsApp) from = await sender.resolvePhone(m.lid);
+  if (!from && m.lid) from = lidAddress(m.lid);
   if (!from) return null;
-  const msg: InboundMessage = { from, id: m.id, at: new Date(m.at), ...(m.text ? { text: m.text } : {}) };
+  const msg: InboundMessage = { from, id: m.id, at: new Date(m.at), ...(m.name ? { name: m.name } : {}), ...(m.text ? { text: m.text } : {}) };
   if (m.media) {
     msg.media = {
       id: openWaMediaId(m.chatId, m.id),

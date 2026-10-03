@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
-import { and, desc, eq, gte, inArray, isNull, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { agents, audit, calls, caseCalls, caseEvidence, caseMessages, cases, organizations, withTenant, type Case, type Tx, type WhatsappChannel } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN, toE164 } from "@jenai/voice";
@@ -16,6 +16,7 @@ import {
   formLinkText,
   hintFor,
   isFinancial,
+  joinedText,
   missingFor,
   openerText,
   questionFor,
@@ -23,7 +24,7 @@ import {
   reminderText,
 } from "./catalog";
 import { fallbackRead, quickRead } from "./quick-read";
-import { whatsappFor, type InboundMessage, type WhatsAppSender } from "./whatsapp";
+import { isLidAddress, whatsappFor, type InboundMessage, type WhatsAppSender } from "./whatsapp";
 
 function one<T>(rows: T[]): T {
   if (!rows[0]) throw new Error("Case row vanished mid-update");
@@ -164,12 +165,16 @@ async function newCase(tx: Tx, tenantId: string, input: { phone: string; contact
   return c!;
 }
 
-/** The complainant's case still being worked on, if any; one still being filled in on WhatsApp comes first. */
-async function openCaseFor(tx: Tx, phone: string): Promise<Case | null> {
+/**
+ * The complainant's case still being worked on, if any; one still being filled in on WhatsApp
+ * comes first. A hidden-number chat ("lid:…") also finds the complaint it was joined to.
+ */
+async function openCaseFor(tx: Tx, address: string): Promise<Case | null> {
+  const who = isLidAddress(address) ? or(eq(cases.complainantE164, address), sql`${cases.fields}->>'whatsapp_lid' = ${address}`) : eq(cases.complainantE164, address);
   const [c] = await tx
     .select()
     .from(cases)
-    .where(and(eq(cases.complainantE164, phone), inArray(cases.status, ["collecting", "ready", "taken_up"])))
+    .where(and(who, inArray(cases.status, ["collecting", "ready", "taken_up"])))
     .orderBy(sql`(${cases.status} = 'collecting') desc`, desc(cases.updatedAt))
     .limit(1);
   return c ?? null;
@@ -201,9 +206,17 @@ async function record(tx: Tx, tenantId: string, caseId: string, m: { direction: 
     .onConflictDoNothing();
 }
 
+/** Where the complainant's WhatsApp chat is: their hidden-number chat once one was joined, else their number. */
+const chatOf = (c: Case) => c.fields.whatsapp_lid ?? c.complainantE164;
+
+/** The complainant's number to show and call; for a hidden-number chat, the number they gave (or null). */
+export function complainantNumber(c: Pick<Case, "complainantE164" | "fields">): string | null {
+  return isLidAddress(c.complainantE164) ? (toE164(c.fields.mobile_number ?? "") ?? null) : c.complainantE164;
+}
+
 async function send(tx: Tx, tenantId: string, c: Case, sender: WhatsAppSender, body: string, asking?: string | null, at = new Date()) {
   try {
-    const r = await sender.sendText(c.complainantE164, body);
+    const r = await sender.sendText(chatOf(c), body);
     await record(tx, tenantId, c.id, { direction: "out", body, externalId: r.id, status: sender.mode === "simulated" ? "simulated" : "sent" });
   } catch (e) {
     await record(tx, tenantId, c.id, { direction: "out", body, status: "failed", error: (e as Error).message.slice(0, 300) });
@@ -377,6 +390,7 @@ export interface CaseReader {
 
 /** The form's lines a reply can answer, with how each value must be written. */
 const READ_FIELDS: Record<string, string> = {
+  mobile_number: "the complainant's own 10-digit mobile number, digits only",
   how_it_happened: "how the fraud happened, 1 to 3 sentences in English",
   complainant_name: "the complainant's own full name, in English letters exactly as written",
   father_or_husband_name: "father's or husband's name in English letters, prefixed 'F: ' or 'H: ' when they say which",
@@ -547,8 +561,14 @@ export async function handleInbound(tenantId: string, msg: InboundMessage, reade
     if (!wa) return null;
 
     // Writing to the helpline is consent: someone who said no on the call, or never called, is answered here.
+    // Someone whose number WhatsApp hides is asked for it first.
     let c = await openCaseFor(tx, msg.from);
-    if (!c) c = await settle(tx, tenantId, await newCase(tx, tenantId, { phone: msg.from, fields: { followup: "questions", whatsapp_consent: "wrote first" } }));
+    if (!c) {
+      const fields: Record<string, string> = { followup: "questions", whatsapp_consent: "wrote first" };
+      if (isLidAddress(msg.from)) fields.number_hidden = "yes";
+      if (msg.name) fields.whatsapp_name = msg.name;
+      c = await settle(tx, tenantId, await newCase(tx, tenantId, { phone: msg.from, fields }));
+    }
     else if (c.fields.followup === "none")
       c = one(await tx.update(cases).set({ fields: { ...c.fields, followup: "questions", whatsapp_consent: "wrote first" }, status: "collecting" }).where(eq(cases.id, c.id)).returning());
 
@@ -598,11 +618,49 @@ export async function handleInbound(tenantId: string, msg: InboundMessage, reade
     }
     if (evidenceId) prefix = [prefix, receivedProofText(c!.language)].filter(Boolean).join("\n\n");
     c = await settle(tx, tenantId, c!);
+    // A hidden-number chat whose mobile number has a complaint open (from a call, say) continues that complaint.
+    const given = c.fields.number_hidden === "yes" && isLidAddress(c.complainantE164) ? toE164(c.fields.mobile_number ?? "") : null;
+    const target = given ? await openCaseFor(tx, given) : null;
+    if (target && target.id !== c.id) {
+      c = await settle(tx, tenantId, await joinInto(tx, tenantId, c, target));
+      const no = await caseNo(tx, tenantId, c);
+      const found = [prefix, joinedText(no, c.language)].filter(Boolean).join("\n\n");
+      if (c.missing.length || (c.asking !== "__form__" && c.asking !== "__done__")) await askNext(tx, tenantId, c, wa, found);
+      else {
+        // Nothing left to ask there: say where the complaint stands.
+        const url = wa.channel.formUrl;
+        const rest = c.fields.followup === "form_link" && url ? formLinkText(await departmentName(tx, tenantId), no, url, c.language) : completeText(no, c.language);
+        await send(tx, tenantId, c, wa.sender, `${found}\n\n${rest}`);
+      }
+      return { caseId: c.id, ready: c.status === "ready" };
+    }
     // The reply did not answer what we asked, or not in the right shape: say why before asking again.
     if (asked && msg.text?.trim() && !evidenceId && c.missing[0] === asked) prefix = [prefix, hintFor(asked, c.language)].filter(Boolean).join("\n\n");
     await askNext(tx, tenantId, c, wa, prefix);
     return { caseId: c.id, ready: c.status === "ready" };
   });
+}
+
+/**
+ * The person behind a hidden-number chat gave the mobile number of a complaint already open:
+ * the chat, its messages and proof move to that complaint, which keeps its own answers and
+ * takes the chat's for anything it lacks. The chat's own case is closed with a note.
+ */
+async function joinInto(tx: Tx, tenantId: string, chat: Case, target: Case): Promise<Case> {
+  await tx.update(caseMessages).set({ caseId: target.id }).where(eq(caseMessages.caseId, chat.id));
+  await tx.update(caseEvidence).set({ caseId: target.id }).where(eq(caseEvidence.caseId, chat.id));
+  const { number_hidden: _hidden, followup: _followup, whatsapp_consent: _consent, ...answers } = chat.fields;
+  const joined = one(
+    await tx
+      .update(cases)
+      .set({ fields: { ...answers, ...target.fields, whatsapp_lid: chat.complainantE164 }, scamType: target.scamType ?? chat.scamType, language: chat.language ?? target.language, lastInboundAt: chat.lastInboundAt, remindersSent: 0, updatedAt: new Date() })
+      .where(eq(cases.id, target.id))
+      .returning(),
+  );
+  const [from, into] = [await caseNo(tx, tenantId, chat), await caseNo(tx, tenantId, target)];
+  await tx.update(cases).set({ status: "closed", officerNote: `Same person as complaint ${into}: WhatsApp hid their number, so this chat continues there.`, updatedAt: new Date() }).where(eq(cases.id, chat.id));
+  await audit(tx, { tenantId, actorUserId: null, via: "system", action: "case.joined", targetType: "case", targetId: target.id, summary: `WhatsApp chat ${from} (number hidden) joined to complaint ${into} by the mobile number given` });
+  return joined;
 }
 
 /** Delivery receipts from WhatsApp (sent, delivered, read, failed), matched on the message id. */

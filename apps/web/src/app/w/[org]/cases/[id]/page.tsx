@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { can, maskPhone, phoneFor } from "@jenai/authz";
-import { FIELD_LABELS, complaintLines, scamLabel } from "@jenai/engine";
+import { FIELD_LABELS, complainantNumber, complaintLines, scamLabel } from "@jenai/engine";
 import { Flash, PageHead, Section, StatusBadge, fmtDate, fmtDuration } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadCase } from "@/server/queries/cases";
@@ -31,7 +31,7 @@ export default async function CasePage({ params, searchParams }: { params: Promi
   const edit = can(ctx.access, "contacts:edit", scope);
   const followup = d.c.fields.followup ?? "questions";
   const lines = complaintLines(
-    { id: d.c.id, startedAt: d.c.createdAt, durationS: null, phone: d.c.complainantE164, extracted: d.merged, summary: d.callSummary },
+    { id: d.c.id, startedAt: d.c.createdAt, durationS: null, phone: complainantNumber(d.c), extracted: d.merged, summary: d.callSummary },
     reveal ? {} : { mask: maskPhone },
   );
 

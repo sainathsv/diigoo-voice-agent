@@ -2,7 +2,7 @@ import "server-only";
 import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { branchesFor, type AccessContext } from "@jenai/authz";
 import { calls, caseEvidence, caseMessages, cases, memberships, user, whatsappChannels, whatsappInbox, withTenant, type WhatsappChannel } from "@jenai/db";
-import { INBOX_MAX_ATTEMPTS, caseNo, openWaFor, scamLabel, withWhatsApp, type OpenWaSession } from "@jenai/engine";
+import { INBOX_MAX_ATTEMPTS, caseNo, complainantNumber, openWaFor, scamLabel, withWhatsApp, type OpenWaSession } from "@jenai/engine";
 
 const STATUSES = new Set(["collecting", "ready", "taken_up", "closed"]);
 
@@ -45,7 +45,7 @@ export async function loadCase(tenantId: string, id: string) {
     const relatedCalls = await tx
       .select({ id: calls.id, startedAt: calls.startedAt, durationS: calls.durationS, summary: calls.summary })
       .from(calls)
-      .where(sql`${calls.fromE164} = ${c.complainantE164} or ${calls.toE164} = ${c.complainantE164}`)
+      .where(sql`${calls.fromE164} = ${complainantNumber(c) ?? c.complainantE164} or ${calls.toE164} = ${complainantNumber(c) ?? c.complainantE164}`)
       .orderBy(desc(calls.startedAt))
       .limit(20);
     const team = await tx

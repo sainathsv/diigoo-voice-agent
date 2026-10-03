@@ -38,6 +38,13 @@ describe("plain answers, read without the AI", () => {
     expect(q("present_address", "Shanti Vihar, Rishikesh").result.fields).toEqual({ present_address: "Shanti Vihar, Rishikesh" });
   });
 
+  it("reads the mobile number asked when WhatsApp hides it", () => {
+    expect(q("mobile_number", "98000 00071").result.fields).toEqual({ mobile_number: "+919800000071" });
+    expect(q("mobile_number", "+91 98000-00071").result.fields).toEqual({ mobile_number: "+919800000071" });
+    expect(q("mobile_number", "09800000071").result.fields).toEqual({ mobile_number: "+919800000071" });
+    expect(q("mobile_number", "12345")).toEqual({ confident: true, result: { fields: {} } }); // asked again with the hint
+  });
+
   it("takes the bank and the account number together, or in two messages", () => {
     expect(q("victim_bank_and_account", "SBI 3001 2345 678").result.fields).toEqual({ victim_bank_and_account: "SBI; 30012345678" });
     const half = q("victim_bank_and_account", "Hdfc");

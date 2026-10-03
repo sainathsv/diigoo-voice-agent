@@ -42,7 +42,13 @@ export async function complaintStatusFor(tenantId: string, number: string | null
     tx
       .select({ status: cases.status })
       .from(cases)
-      .where(and(inArray(cases.status, ["collecting", "ready", "taken_up"]), or(eq(cases.complainantE164, phone), sql`${cases.fields}->>'caller_number' = ${phone}`)))
+      .where(
+        and(
+          inArray(cases.status, ["collecting", "ready", "taken_up"]),
+          // The number that called, the one it continued on, or the one given in a hidden-number WhatsApp chat.
+          or(eq(cases.complainantE164, phone), sql`${cases.fields}->>'caller_number' = ${phone}`, sql`${cases.fields}->>'mobile_number' = ${phone}`),
+        ),
+      )
       .orderBy(desc(cases.updatedAt))
       .limit(1),
   );

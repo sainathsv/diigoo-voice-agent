@@ -1,6 +1,7 @@
 import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { agents, calls, caseCalls, cases, withTenant, type Case } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
+import { complainantNumber } from "./cases/cases";
 import { withWhatsApp } from "./complaint-form";
 import { SCAM_CATEGORIES, categoryOf, isNotCyberCrime, scamKeyFromText, type ScamCategory, type ScamType } from "./scams";
 
@@ -140,7 +141,7 @@ export async function callAnalytics(tenantId: string, days = 30, opts: { branche
   // Someone who wrote to the helpline on WhatsApp without calling.
   for (const r of caseRows.filter((r) => !r.k.firstCallId)) {
     const x: Record<string, unknown> = { ...r.k.fields, complaint_type: r.k.fields.complaint_type ?? r.k.scamType ?? undefined };
-    complaints.push(toComplaint(withWhatsApp({}, x as Record<string, string>), { callId: null, branchId: r.k.branchId, at: r.k.createdAt, durationS: null, phone: r.k.complainantE164, summary: null }, progress(r.k, r.proofs)));
+    complaints.push(toComplaint(withWhatsApp({}, x as Record<string, string>), { callId: null, branchId: r.k.branchId, at: r.k.createdAt, durationS: null, phone: complainantNumber(r.k), summary: null }, progress(r.k, r.proofs)));
   }
   complaints.sort((a, b) => b.at.getTime() - a.at.getTime());
 

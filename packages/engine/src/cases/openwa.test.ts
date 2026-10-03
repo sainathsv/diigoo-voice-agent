@@ -65,6 +65,9 @@ describe("OpenWA gateway client", () => {
     const sent = seen.find((s) => s.path.endsWith("/send-text"))!;
     expect(sent.key).toBe(KEY);
     expect(sent.body).toEqual({ chatId: "919812345678@c.us", text: "नमस्ते" });
+    // Someone WhatsApp shows only by a private id is answered on that chat.
+    await gw.sendText("lid:12345678901234", "नमस्ते");
+    expect(seen.filter((s) => s.path.endsWith("/send-text")).at(-1)!.body).toEqual({ chatId: "12345678901234@lid", text: "नमस्ते" });
   });
 
   it("explains a refusal instead of failing quietly", async () => {

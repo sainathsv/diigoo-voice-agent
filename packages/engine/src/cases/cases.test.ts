@@ -9,10 +9,10 @@ import { eq } from "drizzle-orm";
 import { agents, calls, caseCalls, caseEvidence, caseMessages, cases, organizations, platformDb, whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { scamKeyFromText } from "../scams";
-import { ResilientReader, caseFromCall, fieldsFromCall, followUpCalls, handleInbound, parseRead, remindPending, type CaseReader, type ReadResult } from "./cases";
+import { ResilientReader, caseFromCall, complainantNumber, fieldsFromCall, followUpCalls, handleInbound, parseRead, remindPending, type CaseReader, type ReadResult } from "./cases";
 import { missingFor, questionFor, reminderText } from "./catalog";
 import { INBOX_MAX_ATTEMPTS, processInbox, queueInbound, retryInbox } from "./inbox";
-import { SimulatedWhatsApp, parseOpenWaWebhook, validSignature, type QueuedMessage } from "./whatsapp";
+import { SimulatedWhatsApp, chatIdFor, parseOpenWaWebhook, validSignature, type QueuedMessage } from "./whatsapp";
 import { createHmac } from "node:crypto";
 
 let tenant = "";
@@ -442,6 +442,58 @@ describe("WhatsApp through OpenWA", () => {
     expect(await processInbox(tenant, new ScriptedReader({}), new SimulatedWhatsApp())).toEqual({ handled: 0, failed: 0 });
     expect(await retryInbox(tenant)).toBe(1);
     expect(await processInbox(tenant, new ScriptedReader({}), new SimulatedWhatsApp())).toEqual({ handled: 1, failed: 0 });
+  });
+
+  it("answers someone whose number WhatsApp hides on their private chat, and asks the number first", async () => {
+    expect(chatIdFor("lid:12345678901234")).toBe("12345678901234@lid");
+    expect(chatIdFor("+919800000001")).toBe("919800000001@c.us");
+    const wa = new SimulatedWhatsApp();
+    const hook = parseOpenWaWebhook({ event: "message.received", sessionId: "s", data: { id: "lid-m1", from: "12345678901234@lid", chatId: "12345678901234@lid", body: "mere saath fraud hua", type: "text", contact: { pushName: "Ravi" } } });
+    if (hook?.kind !== "message") throw new Error("not a message");
+    expect(hook.message).toMatchObject({ from: null, lid: "12345678901234@lid", name: "Ravi" });
+    await queueInbound(tenant, hook.message);
+    const reader = new ResilientReader(null);
+    expect(await processInbox(tenant, reader, wa)).toEqual({ handled: 1, failed: 0 });
+    expect(wa.sent.at(-1)!.to).toBe("lid:12345678901234");
+    expect(wa.sent.at(-1)!.body).toContain("WhatsApp does not show us your number");
+    const [c] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.complainantE164, "lid:12345678901234")));
+    expect(c!.fields).toMatchObject({ number_hidden: "yes", whatsapp_name: "Ravi" });
+    expect(complainantNumber(c!)).toBeNull();
+    await handleInbound(tenant, { from: "lid:12345678901234", id: randomUUID(), at: new Date(), text: "98000 00071" }, reader, wa);
+    const [after] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.id, c!.id)));
+    expect(after!.fields.mobile_number).toBe("+919800000071");
+    expect(complainantNumber(after!)).toBe("+919800000071");
+    expect(wa.sent.at(-1)!.body).toContain("Please tell us briefly what happened."); // on with the complaint, on the private chat
+    expect(wa.sent.at(-1)!.to).toBe("lid:12345678901234");
+  });
+
+  it("joins a hidden-number chat to the caller's complaint once they give the number they called from", async () => {
+    const wa = new SimulatedWhatsApp();
+    const phone = "+919800000072";
+    const call = await withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id: randomUUID(), phone, contactId: null, branchId: null, extracted: { complaint_type: "UPI fraud", money_lost: "7000", complainant_name: "Neha Bisht", how_it_happened: "Paid a fake seller on OLX" } }, wa));
+    expect(wa.sent.at(-1)!.body).toContain("father's or husband's name");
+    // WhatsApp now shows the same person only by a private id.
+    const reader = new ResilientReader(null);
+    const say = (text: string) => handleInbound(tenant, { from: "lid:555550000072", id: randomUUID(), at: new Date(), text }, reader, wa);
+    await say("Mohan Bisht");
+    expect(wa.sent.at(-1)!.body).toContain("WhatsApp does not show us your number");
+    await say("9800000072");
+    expect(wa.sent.at(-1)!.to).toBe("lid:555550000072");
+    expect(wa.sent.at(-1)!.body).toMatch(/We found your complaint CY-\d{4}-\d{6}; let us continue it here\./);
+    expect(wa.sent.at(-1)!.body).toContain("father's or husband's name");
+    const [joined] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.id, call!.id)));
+    expect(joined!.fields.whatsapp_lid).toBe("lid:555550000072");
+    expect(joined!.fields.complainant_name).toBe("Neha Bisht"); // the complaint keeps its own answers
+    const [chat] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.complainantE164, "lid:555550000072")));
+    expect(chat!.status).toBe("closed");
+    expect(chat!.officerNote).toMatch(/Same person as complaint CY-/);
+    const moved = await withTenant(tenant, (tx) => tx.select().from(caseMessages).where(eq(caseMessages.caseId, call!.id)));
+    expect(moved.filter((m) => m.direction === "in").map((m) => m.body)).toEqual(["Mohan Bisht", "9800000072"]);
+    // The private chat's next reply lands in the caller's complaint.
+    await say("F: Mohan Bisht");
+    const [next] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.id, call!.id)));
+    expect(next!.fields.father_or_husband_name).toBe("F: Mohan Bisht");
+    expect(wa.sent.at(-1)!.body).toContain("3. What is your date of birth?");
   });
 
   it("stores a photo that arrived inside the webhook without asking the gateway again", async () => {

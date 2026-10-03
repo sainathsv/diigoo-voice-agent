@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { can, holdsAnywhere, phoneFor } from "@jenai/authz";
-import { FIELD_LABELS, SCAM_TYPES, scamLabel } from "@jenai/engine";
+import { FIELD_LABELS, SCAM_TYPES, complainantNumber, scamLabel } from "@jenai/engine";
 import { Empty, Flash, PageHead, Section, StatusBadge, fmtDate } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
 import { loadCases } from "@/server/queries/cases";
@@ -71,7 +71,7 @@ export default async function CasesPage({ params, searchParams }: { params: Prom
                       </td>
                       <td>
                         <div className="font-semibold">{c.fields.complainant_name ?? <span className="text-grey">Not given yet</span>}</div>
-                        <div className="font-mono text-[12px] text-grey">{phoneFor(can(ctx.access, "contacts:reveal_phone", { branchId: c.branchId }), c.complainantE164)}</div>
+                        <div className="font-mono text-[12px] text-grey">{complainantNumber(c) ? phoneFor(can(ctx.access, "contacts:reveal_phone", { branchId: c.branchId }), complainantNumber(c)) : "Number hidden by WhatsApp"}</div>
                       </td>
                       <td className="max-w-[20ch]">
                         {scamLabel(c.scamType)}

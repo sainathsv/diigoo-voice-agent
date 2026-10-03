@@ -85,6 +85,14 @@ function amount(t: string): QuickRead {
   return unsure;
 }
 
+/** The complainant's own mobile number, asked when WhatsApp hides it: kept as +91 and 10 digits. */
+function mobile(t: string): QuickRead {
+  const d = joinDigits(ascii(t)).replace(/\D/g, "");
+  const ten = d.length === 12 && d.startsWith("91") ? d.slice(2) : d.length === 11 && d.startsWith("0") ? d.slice(1) : d;
+  if (/^[6-9]\d{9}$/.test(ten)) return sure({ mobile_number: `+91${ten}` });
+  return d.length ? sure({}) : unsure; // digits that are no mobile number: asked again with the hint
+}
+
 function card(t: string): QuickRead {
   const d = ascii(t).replace(/\D/g, "");
   if (d.length === 4) return sure({ card_last4: d });
@@ -197,6 +205,8 @@ export function quickRead(input: ReplyInput): QuickRead {
   const k = input.asking;
   if (UNKNOWN.test(t)) return k === "fraudster_details" ? sure({ fraudster_details: "not known" }) : k && mayBeUnknown(k) ? sure({ [k]: "not known" }) : sure({});
   switch (k) {
+    case "mobile_number":
+      return mobile(t);
     case "pincode":
       return pincode(t);
     case "date_of_birth":
@@ -227,7 +237,7 @@ export function quickRead(input: ReplyInput): QuickRead {
 }
 
 /** Items a reply can answer as written, when no AI could read it (officers read it as the complainant wrote it). */
-const AS_WRITTEN = new Set(["complainant_name", "father_or_husband_name", "date_of_birth", "house_number", "present_address", "police_station", "district", "victim_bank_and_account", "transactions", "how_it_happened"]);
+const AS_WRITTEN = new Set(["mobile_number", "complainant_name", "father_or_husband_name", "date_of_birth", "house_number", "present_address", "police_station", "district", "victim_bank_and_account", "transactions", "how_it_happened"]);
 
 /** The reply kept as written for the item asked, when it fits that item; otherwise nothing (the item is asked again). */
 export function fallbackRead(input: ReplyInput): ReadResult {

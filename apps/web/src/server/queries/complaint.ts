@@ -1,7 +1,7 @@
 import "server-only";
 import { and, asc, desc, eq, gte, lte } from "drizzle-orm";
 import { calls, caseCalls, caseEvidence, cases, withTenant, type Case } from "@jenai/db";
-import { scamLabel, withWhatsApp } from "@jenai/engine";
+import { complainantNumber, scamLabel, withWhatsApp } from "@jenai/engine";
 
 export interface SheetEvidence {
   id: string;
@@ -60,7 +60,7 @@ export async function loadComplaint(tenantId: string, ref: { callId: string } | 
       evidence,
       merged: withWhatsApp(base, kase?.fields),
       branchId: call?.branchId ?? kase?.branchId ?? null,
-      phone: call ? (call.direction === "inbound" ? call.fromE164 : call.toE164) : kase!.complainantE164,
+      phone: call ? (call.direction === "inbound" ? call.fromE164 : call.toE164) : complainantNumber(kase!),
     };
   });
 }

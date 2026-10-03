@@ -20,9 +20,16 @@ export interface WhatsAppSender {
 
 const MAX_MEDIA = 15 * 1024 * 1024;
 
-/** "+91 98123 45678" becomes "919812345678@c.us", the chat id OpenWA addresses a person by. */
-export function chatIdFor(e164: string): string {
-  return `${e164.replace(/\D/g, "")}@c.us`;
+/**
+ * Someone WhatsApp shows only by a private id (…@lid), because it hides their number from
+ * this account: their chat address here is "lid:<id>", and the complaint asks their number.
+ */
+export const lidAddress = (jid: string) => `lid:${jid.split("@")[0]!.replace(/\D/g, "")}`;
+export const isLidAddress = (address: string) => address.startsWith("lid:");
+
+/** "+91 98123 45678" becomes "919812345678@c.us", the chat id OpenWA addresses a person by; "lid:123" becomes "123@lid". */
+export function chatIdFor(address: string): string {
+  return isLidAddress(address) ? `${address.slice(4).replace(/\D/g, "")}@lid` : `${address.replace(/\D/g, "")}@c.us`;
 }
 
 /** The media id handleInbound passes to fetchMedia: the chat and the message it came in. */
@@ -205,9 +212,12 @@ export function validSignature(rawBody: string, header: string | null, secret: s
 }
 
 export interface InboundMessage {
+  /** "+<digits>", or "lid:<id>" when WhatsApp hides the number (see lidAddress). */
   from: string;
   id: string;
   at: Date;
+  /** The name the sender set in WhatsApp. */
+  name?: string;
   text?: string;
   media?: { id: string; kind: "image" | "document" | "audio" | "video"; mime?: string; filename?: string; caption?: string; inline?: { bytes: Buffer; mime: string } };
 }
@@ -220,6 +230,7 @@ export interface QueuedMessage {
   from: string | null;
   lid: string | null;
   at: string;
+  name?: string;
   text?: string;
   media?: { kind: "image" | "document" | "audio" | "video"; mime?: string; filename?: string; dataBase64?: string };
 }
@@ -257,7 +268,8 @@ export function parseOpenWaWebhook(body: unknown): OpenWaEvent | null {
   const kind = MEDIA_KINDS[type];
   const text = typeof d.body === "string" && d.body.trim() ? d.body.slice(0, 4000) : undefined;
   const at = new Date(Number(d.timestamp) > 0 ? Number(d.timestamp) * 1000 : Date.now()).toISOString();
-  const message: QueuedMessage = { id: String(d.id ?? ""), chatId, from: phoneDigits.length >= 8 ? `+${phoneDigits}` : null, lid: isLid ? sender : null, at, ...(text ? { text } : {}) };
+  const name = typeof d.contact?.pushName === "string" && d.contact.pushName.trim() ? d.contact.pushName.trim().slice(0, 80) : undefined;
+  const message: QueuedMessage = { id: String(d.id ?? ""), chatId, from: phoneDigits.length >= 8 ? `+${phoneDigits}` : null, lid: isLid ? sender : null, at, ...(name ? { name } : {}), ...(text ? { text } : {}) };
   if (!message.id) return null;
   if (kind) {
     const m = (d.media ?? {}) as { mimetype?: string; filename?: string; data?: string; omitted?: boolean };
