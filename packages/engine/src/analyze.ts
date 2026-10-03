@@ -275,7 +275,8 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
           const phone = c.direction === "inbound" ? c.fromE164 : c.toE164;
           if (phone) {
             await tx.insert(suppressions).values({ tenantId, phoneE164: phone, reason: "opt_out", scope: null, source: `said on call ${c.externalRunId}` }).onConflictDoNothing();
-            await emitDoNotCall(tx, tenantId, phone, `said so on call ${c.id}`);
+            // Handing it on runs in its own savepoint, so a queue error cannot undo the opt-out above.
+            await emitDoNotCall(tx, tenantId, phone, c.contactId, `said so on call ${c.id}`);
             stats.optOuts++;
           }
         }

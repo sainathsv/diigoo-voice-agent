@@ -3,10 +3,10 @@
  * A small HTTP server stands in for their CRM.
  */
 import "@jenai/db/env";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
   branches,
@@ -21,14 +21,22 @@ import {
   organizations,
   phoneNumbers,
   platformDb,
+  suppressions,
   withTenant,
 } from "@jenai/db";
+import { analyzeCalls, type Extractor } from "../analyze";
 import { setUpProgram } from "../programs";
 import { addCarrierAccount, addPhoneNumber } from "../telephony";
-import { claimDeliveries, deliver, sealCredentials } from "./queue";
-import { emitCallCompleted } from "./events";
+import { claimDeliveries, deliver, enqueueEvent, sealCredentials } from "./queue";
+import { EVENT_KINDS, emitCallCompleted } from "./events";
 import { verifySignature } from "./http";
 import { CallRequestError, requestCall } from "./inbound";
+
+// The real queue. One test below makes it fail on purpose.
+vi.mock("./queue", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./queue")>();
+  return { ...real, enqueueEvent: vi.fn(real.enqueueEvent) };
+});
 
 interface Received {
   path: string;
@@ -308,5 +316,78 @@ describe("calls their own system asks for", () => {
 
   it("refuses a program this workspace does not run", async () => {
     await expect(requestCall(tenant, { programKey: "municipal.property_tax_due", phone: "9876500033" })).rejects.toThrow(/No such calling program/);
+  });
+});
+
+describe("an opt-out said on a call", () => {
+  let crmId = "";
+  const saidStop: Extractor = {
+    model: "test",
+    async extract() {
+      return { caller_name: "Ravi", interest_level: "cold", next_step: "none", do_not_call: true, summary: "Asked not to be called again." };
+    },
+  };
+
+  beforeAll(async () => {
+    // Subscribed to every event, the way a Zoho connection is set up.
+    const [row] = await withTenant(tenant, (tx) =>
+      tx
+        .insert(integrations)
+        .values({ tenantId: tenant, kind: "webhook_out", name: "Every event", status: "connected", config: { url: `${base}/every-event` }, events: [...EVENT_KINDS] })
+        .returning(),
+    );
+    crmId = row!.id;
+  });
+
+  async function heardStop() {
+    const seeded = await seedCall("none");
+    await withTenant(tenant, (tx) =>
+      tx.update(calls).set({ extracted: {}, transcript: "Agent: Hello Ravi. Caller: Please do not call me again." }).where(eq(calls.id, seeded.call.id)),
+    );
+    return seeded;
+  }
+
+  const optedOut = (phone: string) => withTenant(tenant, (tx) => tx.select().from(suppressions).where(eq(suppressions.phoneE164, phone)));
+  const analysedAt = async (callId: string) => (await withTenant(tenant, (tx) => tx.select().from(calls).where(eq(calls.id, callId))))[0]?.analyzedAt;
+
+  it("keeps the opt-out and tells a system that subscribes to it", async () => {
+    const { call, contact, phone } = await heardStop();
+    await withTenant(tenant, (tx) =>
+      tx.insert(externalLinks).values({ tenantId: tenant, integrationId: crmId, ourType: "contact", ourId: contact.id, externalType: "Leads", externalId: "ZOHO-STOP-1" }),
+    );
+    const stats = await analyzeCalls(tenant, saidStop);
+    expect(stats).toMatchObject({ analyzed: 1, optOuts: 1, failed: 0 });
+    expect(await optedOut(phone)).toHaveLength(1);
+    expect(await analysedAt(call.id)).toBeTruthy(); // not read again by the model next round
+
+    const [ev] = await withTenant(tenant, (tx) =>
+      tx.select().from(integrationEvents).where(and(eq(integrationEvents.integrationId, crmId), eq(integrationEvents.kind, "do_not_call.added"))),
+    );
+    expect(ev!.payload).toMatchObject({ person: { contact_id: contact.id, phone } });
+    // Their record is found through our contact, not through the phone number.
+    expect(ev!.externalId).toBe("ZOHO-STOP-1");
+  });
+
+  it("keeps the opt-out even when handing it on fails", async () => {
+    const { call, phone } = await heardStop();
+    const real = await vi.importActual<typeof import("./queue")>("./queue");
+    // The same Postgres error the phone number caused in production, raised inside the queue.
+    vi.mocked(enqueueEvent).mockImplementation(async (tx, tenantId, input) => {
+      if (input.kind === "do_not_call.added") await tx.execute(sql`select 'not-a-uuid'::uuid`);
+      return real.enqueueEvent(tx, tenantId, input);
+    });
+    try {
+      const stats = await analyzeCalls(tenant, saidStop);
+      expect(stats).toMatchObject({ analyzed: 1, optOuts: 1, failed: 0 });
+    } finally {
+      vi.mocked(enqueueEvent).mockImplementation(real.enqueueEvent);
+    }
+    expect(await optedOut(phone)).toHaveLength(1);
+    expect(await analysedAt(call.id)).toBeTruthy();
+    // The rest of the analysis carried on: the call itself still goes to their system.
+    const sent = await withTenant(tenant, (tx) =>
+      tx.select().from(integrationEvents).where(and(eq(integrationEvents.integrationId, crmId), eq(integrationEvents.refId, call.id), eq(integrationEvents.kind, "call.completed"))),
+    );
+    expect(sent).toHaveLength(1);
   });
 });

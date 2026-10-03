@@ -112,13 +112,27 @@ export async function emitAppointmentBooked(tx: Tx, tenantId: string, callId: st
   });
 }
 
-/** Queued when someone asks not to be called, so their system stops too. */
-export async function emitDoNotCall(tx: Tx, tenantId: string, phone: string, source: string): Promise<number> {
-  return enqueueEvent(tx, tenantId, {
-    kind: "do_not_call.added",
-    refType: "phone",
-    refId: phone,
-    payload: { event: "do_not_call.added", at: new Date().toISOString(), person: { phone }, source },
-    idempotencyKey: `do_not_call:${phone}:${new Date().toISOString().slice(0, 10)}`,
-  });
+/**
+ * Queued when someone asks not to be called, so their system stops too. The
+ * contact id is how the queue finds their record for this person.
+ *
+ * The caller has already written the opt-out in the same transaction, and our
+ * own suppression list is what stops the calls. So a queue error here rolls
+ * back to a savepoint and is logged: it can never take the opt-out with it.
+ */
+export async function emitDoNotCall(tx: Tx, tenantId: string, phone: string, contactId: string | null, source: string): Promise<number> {
+  try {
+    return await tx.transaction((sp) =>
+      enqueueEvent(sp, tenantId, {
+        kind: "do_not_call.added",
+        refType: "phone",
+        refId: phone,
+        payload: { event: "do_not_call.added", at: new Date().toISOString(), person: { contact_id: contactId, phone }, source },
+        idempotencyKey: `do_not_call:${phone}:${new Date().toISOString().slice(0, 10)}`,
+      }),
+    );
+  } catch (e) {
+    console.error(`[integrations] do_not_call.added not queued for tenant ${tenantId}: ${(e as Error).message}`);
+    return 0;
+  }
 }

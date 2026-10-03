@@ -62,13 +62,15 @@ export interface EnqueueInput {
 export async function enqueueEvent(tx: Tx, tenantId: string, input: EnqueueInput): Promise<number> {
   const targets = await subscribers(tx, input.kind);
   let queued = 0;
+  const ours = linkedRecord(input);
   for (const i of targets) {
-    const [linked] = input.externalId
-      ? []
-      : await tx
-          .select({ externalId: externalLinks.externalId })
-          .from(externalLinks)
-          .where(and(eq(externalLinks.integrationId, i.id), eq(externalLinks.ourType, input.refType === "call" ? "contact" : input.refType), eq(externalLinks.ourId, String(payloadContactId(input) ?? input.refId))));
+    const [linked] =
+      input.externalId || !ours
+        ? []
+        : await tx
+            .select({ externalId: externalLinks.externalId })
+            .from(externalLinks)
+            .where(and(eq(externalLinks.integrationId, i.id), eq(externalLinks.ourType, ours.type), eq(externalLinks.ourId, ours.id)));
     const key = `${input.idempotencyKey ?? `${input.kind}:${input.refId}`}:${i.id}`;
     const r = await tx
       .insert(integrationEvents)
@@ -90,9 +92,24 @@ export async function enqueueEvent(tx: Tx, tenantId: string, input: EnqueueInput
   return queued;
 }
 
+/**
+ * external_links.our_id is a uuid column, and Postgres rejects the statement,
+ * and the caller's whole transaction with it, when handed anything else. A
+ * phone number as the ref id did exactly that, so only a real uuid gets near it.
+ */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function payloadContactId(input: EnqueueInput): string | undefined {
   const person = input.payload.person as Record<string, unknown> | undefined;
-  return typeof person?.contact_id === "string" ? person.contact_id : undefined;
+  return typeof person?.contact_id === "string" && UUID.test(person.contact_id) ? person.contact_id : undefined;
+}
+
+/** Which of our records to look up in external_links: the person when we know them, else the event's own record. */
+function linkedRecord(input: EnqueueInput): { type: string; id: string } | null {
+  const contactId = payloadContactId(input);
+  if (contactId) return { type: "contact", id: contactId };
+  // Links are kept per contact, so a call with no contact has nothing to find.
+  return input.refType !== "call" && UUID.test(input.refId) ? { type: input.refType, id: input.refId } : null;
 }
 
 /** Takes up to `limit` due deliveries for this worker. */
