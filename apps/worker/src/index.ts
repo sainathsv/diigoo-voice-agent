@@ -51,6 +51,7 @@ import {
   processInbox,
   remindPending,
   resendFailed,
+  keepWhatsappConnected,
   claimDeliveries,
   claimSafetyChecks,
   deliver,
@@ -199,10 +200,13 @@ async function whatsappLoop() {
         if (r.handled || r.failed) log("whatsapp.inbox", { tenant: t.id.slice(0, 8), ...r });
         if (r.handled) progressed = true;
       }
-      // A message WhatsApp could not take (gateway busy, disconnected, pacing) goes again.
+      // The linked number is reconnected if the gateway dropped it, and a message WhatsApp could
+      // not take (gateway busy, disconnected, pacing) goes again.
       if (Date.now() - lastResend > 2 * 60_000) {
         lastResend = Date.now();
         for (const t of tenants) {
+          const k = await keepWhatsappConnected(t.id).catch((e: Error) => (log("whatsapp.gateway_error", { tenant: t.id.slice(0, 8), message: e.message.slice(0, 200) }), null));
+          if (k?.reconnecting) log("whatsapp.reconnecting", { tenant: t.id.slice(0, 8), was: k.status });
           const n = await resendFailed(t.id);
           if (n) log("whatsapp.resent", { tenant: t.id.slice(0, 8), count: n });
         }

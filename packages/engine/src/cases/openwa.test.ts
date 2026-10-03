@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { BedrockCaseReader, LocalCaseReader, caseReaderFromEnv } from "./cases";
-import { OpenWaWhatsApp, chatIdFor, openWaMediaId } from "./whatsapp";
+import { OpenWaWhatsApp, chatIdFor, keepConnected, openWaMediaId } from "./whatsapp";
 
 let server: Server;
 let base = "";
@@ -32,6 +32,10 @@ beforeAll(async () => {
     if (req.method === "GET" && path === "/api/sessions/sess-1/contacts/99@lid/phone") return json(200, { contactId: "99@lid", phone: null });
     if (req.method === "GET" && path === "/api/sessions/sess-1/qr") return json(200, { qrCode: "data:image/png;base64,iVBORw0KGgo=", status: "qr_ready" });
     if (req.method === "GET" && path === "/api/sessions/sess-1") return json(200, { id: "sess-1", status: "ready", phone: "919000011111" });
+    // Dropped by a gateway restart, with the login kept; and one that was unlinked (no phone kept).
+    if (req.method === "GET" && path === "/api/sessions/sess-down") return json(200, { id: "sess-down", status: "disconnected", phone: "919000011111" });
+    if (req.method === "POST" && path === "/api/sessions/sess-down/start") return json(200, { id: "sess-down", status: "initializing", phone: "919000011111" });
+    if (req.method === "GET" && path === "/api/sessions/sess-out") return json(200, { id: "sess-out", status: "disconnected", phone: null });
     if (req.method === "POST" && path === "/api/sessions/sess-1/start") return json(200, { id: "sess-1", status: "initializing", phone: null });
     if (req.method === "GET" && path === "/api/sessions/sess-1/webhooks") return json(200, hooks);
     if (req.method === "DELETE" && path.startsWith("/api/sessions/sess-1/webhooks/")) {
@@ -68,6 +72,14 @@ describe("OpenWA gateway client", () => {
     // Someone WhatsApp shows only by a private id is answered on that chat.
     await gw.sendText("lid:12345678901234", "नमस्ते");
     expect(seen.filter((s) => s.path.endsWith("/send-text")).at(-1)!.body).toEqual({ chatId: "12345678901234@lid", text: "नमस्ते" });
+  });
+
+  it("reconnects a linked number the gateway dropped, and leaves an unlinked one for the QR code", async () => {
+    expect(await keepConnected(new OpenWaWhatsApp(base, "sess-down", KEY))).toEqual({ status: "disconnected", phone: "919000011111", reconnecting: true });
+    expect(seen.some((s) => s.method === "POST" && s.path === "/api/sessions/sess-down/start")).toBe(true);
+    expect(await keepConnected(new OpenWaWhatsApp(base, "sess-out", KEY))).toMatchObject({ reconnecting: false });
+    expect(seen.some((s) => s.path === "/api/sessions/sess-out/start")).toBe(false);
+    expect(await keepConnected(new OpenWaWhatsApp(base, "sess-1", KEY))).toMatchObject({ status: "ready", reconnecting: false });
   });
 
   it("explains a refusal instead of failing quietly", async () => {

@@ -47,6 +47,8 @@ fi
 # 2026-10-03). OpenWA's API limits sit far above what this server sends; it listens here only.
 owset() { if sudo grep -q "^$1=" $OW/.env; then sudo sed -i "s#^$1=.*#$1=$2#" $OW/.env; else echo "$1=$2" | sudo tee -a $OW/.env >/dev/null; fi; }
 owset SEND_PACING_ENABLED false
+# The linked number reconnects by itself when the gateway restarts (a reboot, an update).
+owset AUTO_START_SESSIONS true
 owset RATE_LIMIT_SHORT_LIMIT 1000
 owset RATE_LIMIT_MEDIUM_LIMIT 20000
 owset RATE_LIMIT_LONG_LIMIT 1000000

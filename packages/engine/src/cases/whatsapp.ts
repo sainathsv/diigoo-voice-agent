@@ -140,6 +140,18 @@ export class OpenWaWhatsApp implements WhatsAppSender {
   }
 }
 
+/**
+ * Reconnects the linked number when the gateway has it disconnected (a gateway restart, a dropped
+ * connection), with the login the gateway kept, so no QR code is needed. A number that was
+ * unlinked (the gateway keeps no phone for it) is left alone: linking it again needs the QR code.
+ */
+export async function keepConnected(gw: OpenWaWhatsApp): Promise<{ status: string; phone: string | null; reconnecting: boolean }> {
+  const s = await gw.session();
+  const reconnecting = (s.status === "disconnected" || s.status === "failed") && !!s.phone;
+  if (reconnecting) await gw.start();
+  return { status: s.status, phone: s.phone, reconnecting };
+}
+
 /** Records what would have been sent. Used in tests and before a number is linked. */
 export class SimulatedWhatsApp implements WhatsAppSender {
   readonly mode = "simulated" as const;

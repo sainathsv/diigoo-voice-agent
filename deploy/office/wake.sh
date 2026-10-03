@@ -4,7 +4,8 @@
 #   bash ~/Desktop/wake.sh
 #
 #   1. WhatsApp (OpenWA): no sending limits (the department's decision: the cyber cell answers
-#      every complainant), restarted, and the linked number and connection shown.
+#      every complainant), reconnecting by itself after a restart, the linked number reconnected
+#      if it dropped, and the connection shown.
 #   2. The AI on this server (Ollama): kept loaded all the time, restarted, and asked a question.
 #   3. The portal's worker: restarted; unread WhatsApp messages read again; replies WhatsApp
 #      refused are sent again by the worker within 2 minutes.
@@ -21,29 +22,51 @@ sudo test -f $ENVF || { echo "JENAI is not installed on this server yet."; exit 
 
 say "1. WhatsApp"
 if sudo test -f $OW/.env; then
-  owset() { if sudo grep -q "^$1=" $OW/.env; then sudo sed -i "s#^$1=.*#$1=$2#" $OW/.env; else echo "$1=$2" | sudo tee -a $OW/.env >/dev/null; fi; }
+  CHANGED=0
+  owset() {
+    sudo grep -q "^$1=$2\$" $OW/.env && return 0
+    CHANGED=1
+    if sudo grep -q "^$1=" $OW/.env; then sudo sed -i "s#^$1=.*#$1=$2#" $OW/.env; else echo "$1=$2" | sudo tee -a $OW/.env >/dev/null; fi
+  }
   owset SEND_PACING_ENABLED false
+  owset AUTO_START_SESSIONS true
   owset RATE_LIMIT_SHORT_LIMIT 1000
   owset RATE_LIMIT_MEDIUM_LIMIT 20000
   owset RATE_LIMIT_LONG_LIMIT 1000000
-  sudo docker compose --project-directory $OW -f $OW/docker-compose.yml up -d --force-recreate >/dev/null 2>&1
+  # Restarted only when a setting changed or it is not running: a restart drops WhatsApp for a minute.
+  if [ $CHANGED = 1 ] || ! curl -sf http://127.0.0.1:2785/api/health/ready >/dev/null; then
+    echo "      starting the WhatsApp gateway with the new settings..."
+    sudo docker compose --project-directory $OW -f $OW/docker-compose.yml up -d --force-recreate >/dev/null 2>&1
+  fi
   for _ in $(seq 1 40); do curl -sf http://127.0.0.1:2785/api/health/ready >/dev/null && break; sleep 3; done
   if curl -sf http://127.0.0.1:2785/api/health/ready >/dev/null; then
-    ok "WhatsApp gateway running, with no sending limits"
+    ok "WhatsApp gateway running, with no sending limits, reconnecting by itself after a restart"
     KEY=$(sudo grep '^API_MASTER_KEY=' $OW/.env | cut -d= -f2-)
-    S=""
-    for _ in $(seq 1 30); do
-      S=$(curl -s -H "X-API-Key: $KEY" http://127.0.0.1:2785/api/sessions)
-      echo "$S" | grep -q '"status":"ready"' && break
-      sleep 3
-    done
-    echo "$S" | python3 -c '
+    sessions() { curl -s -H "X-API-Key: $KEY" http://127.0.0.1:2785/api/sessions; }
+    pick() { python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 d = d.get("data", d) if isinstance(d, dict) else d
+mode = sys.argv[1]
 for s in d:
-    print("      linked number:", "+" + str(s.get("phone") or "?").lstrip("+"), "| status:", s.get("status"))' 2>/dev/null
-    echo "$S" | grep -q '"status":"ready"' && ok "WhatsApp connected" || bad "WhatsApp is not connected: open the portal's WhatsApp page and link the number again"
+    if mode == "down" and s.get("status") in ("disconnected", "failed") and s.get("phone"): print(s["id"])
+    if mode == "state": print(s.get("status"))
+    if mode == "show": print("      linked number:", "+" + str(s.get("phone") or "?").lstrip("+"), "| status:", s.get("status"))' "$1" 2>/dev/null; }
+    # The linked number reconnects with the login the gateway kept: no QR code needed.
+    for ID in $(sessions | pick down); do
+      echo "      reconnecting WhatsApp..."
+      curl -s -o /dev/null -X POST -H "X-API-Key: $KEY" "http://127.0.0.1:2785/api/sessions/$ID/start"
+    done
+    STATE=""
+    for _ in $(seq 1 40); do
+      STATE=$(sessions | pick state | head -1)
+      [ "$STATE" = ready ] || [ "$STATE" = qr_ready ] && break
+      sleep 3
+    done
+    sessions | pick show
+    if [ "$STATE" = ready ]; then ok "WhatsApp connected"
+    elif [ "$STATE" = qr_ready ]; then bad "WhatsApp needs its QR code scanned: portal > WhatsApp > Show a new QR code, then on the helpline phone WhatsApp > Linked devices > Link a device"
+    else bad "WhatsApp is not connected yet (status: ${STATE:-none}): run this again in a minute"; fi
   else
     bad "WhatsApp gateway did not start: sudo docker logs openwa --tail 50"
   fi

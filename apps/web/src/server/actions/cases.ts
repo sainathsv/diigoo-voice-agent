@@ -70,13 +70,20 @@ export async function linkWhatsapp(fd: FormData) {
   const slug = String(fd.get("slug"));
   const { ctx, ch, creds } = await channelForSetup(slug);
   let error: string | null = null;
+  let connected = false;
   try {
     const sessionId = ch.openwaSession ?? (await OpenWaWhatsApp.createSession(ch.openwaUrl!, creds.apiKey, `jenai-${slug}`.slice(0, 50)));
     const gw = new OpenWaWhatsApp(ch.openwaUrl!, sessionId, creds.apiKey);
     const secret = randomBytes(32).toString("hex");
     await gw.registerWebhook(webhookUrl(), secret);
     await gw.start().catch(() => null); // already running is fine
-    const live = await gw.session().catch(() => null);
+    // A number linked before reconnects with the login the gateway kept, without a QR code.
+    let live = await gw.session().catch(() => null);
+    for (let i = 0; i < 10 && live && live.phone && live.status !== "ready" && live.status !== "qr_ready"; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      live = await gw.session().catch(() => null);
+    }
+    connected = live?.status === "ready";
     await withTenant(ctx.org.id, async (tx) => {
       await tx
         .update(whatsappChannels)
@@ -101,7 +108,7 @@ export async function linkWhatsapp(fd: FormData) {
     error = `The WhatsApp gateway did not respond as expected: ${(e as Error).message.slice(0, 200)}`;
   }
   if (error) go(slug, "whatsapp", { error });
-  go(slug, "whatsapp", { ok: "Now scan the QR code with the police phone" });
+  go(slug, "whatsapp", { ok: connected ? "WhatsApp is connected" : "Now scan the QR code with the police phone" });
 }
 
 /** Unlinks the number (the phone shows it under Linked devices until then). Messages stop until it is linked again. */

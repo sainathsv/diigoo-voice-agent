@@ -68,7 +68,9 @@ export default async function WhatsappPage({ params, searchParams }: { params: P
                 {status !== "ready" ? (
                   <form action={linkWhatsapp}>
                     <input type="hidden" name="slug" value={slug} />
-                    <SubmitButton className="btn btn-dark" pendingText="Starting">{w.channel?.openwaSession ? "Show a new QR code" : "Link the WhatsApp number"}</SubmitButton>
+                    <SubmitButton className="btn btn-dark" pendingText="Starting">
+                      {w.live?.phone && (status === "disconnected" || status === "failed") ? "Reconnect WhatsApp" : w.channel?.openwaSession ? "Show a new QR code" : "Link the WhatsApp number"}
+                    </SubmitButton>
                   </form>
                 ) : (
                   <form action={unlinkWhatsapp}>

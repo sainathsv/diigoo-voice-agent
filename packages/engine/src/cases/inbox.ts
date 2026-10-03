@@ -1,7 +1,7 @@
 import { and, asc, eq, gte, isNull, lt, sql } from "drizzle-orm";
 import { whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
 import { handleInbound, type CaseReader } from "./cases";
-import { OpenWaWhatsApp, lidAddress, openWaMediaId, whatsappFor, type InboundMessage, type QueuedMessage, type WhatsAppSender } from "./whatsapp";
+import { OpenWaWhatsApp, keepConnected, lidAddress, openWaMediaId, whatsappFor, type InboundMessage, type QueuedMessage, type WhatsAppSender } from "./whatsapp";
 
 /**
  * A message that keeps failing (the number cannot be resolved, the database is down) is
@@ -107,6 +107,15 @@ export async function processInbox(tenantId: string, reader: CaseReader, sender?
     }
   }
   return stats;
+}
+
+/** The workspace's WhatsApp number, reconnected when the gateway dropped it; null when it has no OpenWA channel. */
+export async function keepWhatsappConnected(tenantId: string): Promise<{ status: string; reconnecting: boolean } | null> {
+  const wa = await withTenant(tenantId, (tx) => whatsappFor(tx, tenantId));
+  if (!wa || !(wa.sender instanceof OpenWaWhatsApp)) return null;
+  const r = await keepConnected(wa.sender);
+  if (r.reconnecting) await recordLink(tenantId, { status: "initializing", phone: r.phone ? `+${r.phone.replace(/\D/g, "")}` : null });
+  return { status: r.status, reconnecting: r.reconnecting };
 }
 
 /** Puts the messages that could not be read back in the queue (the WhatsApp page's "Read them again"). */
