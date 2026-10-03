@@ -41,11 +41,36 @@ function granted(ctx: ConnectorContext): Set<string> {
   const raw = ctx.integration.config.scopes;
   return new Set(Array.isArray(raw) ? raw.map(String) : []);
 }
-/** Unknown scopes (an older connection recorded none) means assume allowed, as before. */
-const may = (ctx: ConnectorContext, scope: string) => {
+
+type Op = "READ" | "CREATE" | "UPDATE" | "ALL";
+const scopeFor = (module: string, op: Op) => `ZohoCRM.modules.${module.toLowerCase()}.${op}`;
+
+/**
+ * Whether their admin granted this operation on this module. A broader grant
+ * covers it: every operation on the module (ZohoCRM.modules.calls.ALL), or on
+ * every module (ZohoCRM.modules.ALL).
+ * Unknown scopes (Zoho did not say, or an older connection) means assume allowed, as before.
+ */
+const may = (ctx: ConnectorContext, module: string, op: Op) => {
   const g = granted(ctx);
-  return g.size === 0 || g.has(scope);
+  return g.size === 0 || [scopeFor(module, op), scopeFor(module, "ALL"), "ZohoCRM.modules.ALL"].some((s) => g.has(s));
 };
+
+/**
+ * The scopes a Zoho token answer lists, in the form may() compares
+ * (ZohoCRM.modules.leads.CREATE). Zoho's samples separate them with spaces and
+ * its prose says commas, so either is read. Case is evened out because their
+ * admin types the scopes by hand in the API console. Null when Zoho did not
+ * say, which is not the same as granting nothing.
+ */
+export function zohoScopes(raw: unknown): string[] | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const scopes = raw.split(/[\s,]+/).filter(Boolean).map((s) => {
+    const m = /^zohocrm\.(.+)\.([a-z]+)$/i.exec(s);
+    return m ? `ZohoCRM.${m[1]!.toLowerCase()}.${m[2]!.toUpperCase()}` : s;
+  });
+  return [...new Set(scopes)];
+}
 
 /**
  * Zoho wants a wall-clock time with an offset, and a duration it refuses at
@@ -210,6 +235,26 @@ function writeup(e: OutEvent): Writeup | null {
   return null;
 }
 
+/**
+ * What this connection will write, from what their admin granted, for the
+ * Test button. What was not granted is said as plainly as what was: a client
+ * expecting Lead Status to change after each call hears here that it will not.
+ */
+function writes(ctx: ConnectorContext): string {
+  if (!granted(ctx).size) return "Zoho did not say which scopes it granted, so each write is tried and a refusal shows on its delivery.";
+  const module = moduleOf(ctx);
+  const calls = may(ctx, "calls", "CREATE");
+  const notes = may(ctx, "notes", "CREATE");
+  const yes: string[] = [];
+  const no: string[] = [];
+  if (calls) yes.push("each call as a Call record");
+  if (notes) yes.push(calls ? "a note for each booking and opt-out" : "a note for each call, booking and opt-out");
+  else no.push(calls ? "notes for bookings and opt-outs" : "anything about calls, bookings or opt-outs");
+  if (Object.keys(ctx.integration.mapping?.fields ?? {}).length) (may(ctx, module, "UPDATE") ? yes : no).push(`the mapped ${module} fields`);
+  if (ctx.integration.config.createIfMissing) (may(ctx, module, "CREATE") ? yes : no).push(`a new ${module} record for a caller not in Zoho`);
+  return [yes.length ? `Writing ${yes.join(", ")}.` : "", no.length ? `Not granted, so not written: ${no.join(", ")}.` : ""].filter(Boolean).join(" ");
+}
+
 export const zohoConnector: Connector = {
   kind: "zoho_crm",
   async test(ctx) {
@@ -219,12 +264,7 @@ export const zohoConnector: Connector = {
       // the test on that would say "not connected" about a working connection.
       const r = await call(ctx, `/crm/v2/${moduleOf(ctx)}?per_page=1`);
       if (r.status === 200 || r.status === 204) {
-        const writes = may(ctx, "ZohoCRM.modules.calls.CREATE")
-          ? "logging each call as a Call record"
-          : may(ctx, "ZohoCRM.modules.notes.CREATE")
-            ? "adding a note after each call"
-            : "updating fields only: no scope was granted to log the call itself";
-        return { ok: true, message: `Connected to Zoho CRM (${dcOf(ctx)}). Reading ${moduleOf(ctx)}, ${writes}.` };
+        return { ok: true, message: `Connected to Zoho CRM (${dcOf(ctx)}). Reading ${moduleOf(ctx)}. ${writes(ctx)}` };
       }
       return { ok: false, message: `Zoho answered ${r.status}: ${r.text.slice(0, 160)}` };
     } catch (e) {
@@ -240,9 +280,13 @@ export const zohoConnector: Connector = {
       // Only the fields they mapped. Without a mapping applyMapping hands back
       // the whole event, and that is not something to PUT on their record.
       const mapping = ctx.integration.mapping?.fields;
-      const fields = mapping && Object.keys(mapping).length ? applyMapping(e.payload, mapping) : {};
+      const mapped = mapping && Object.keys(mapping).length ? applyMapping(e.payload, mapping) : {};
+      // And only with the update scope: without it Zoho answers 401, which
+      // would switch the whole connection off over fields it was never given.
+      const fields = may(ctx, moduleOf(ctx), "UPDATE") ? mapped : {};
+      const unwritten = Object.keys(mapped).length && !Object.keys(fields).length ? `; mapped fields left alone, Zoho was not granted ${scopeFor(moduleOf(ctx), "UPDATE")}` : "";
       // Skipped rather than done: nothing reached Zoho, so it says nothing about the connection.
-      if (!say && !Object.keys(fields).length) return { ok: false, retry: false, response: `Nothing to write in Zoho for ${e.kind}` };
+      if (!say && !Object.keys(fields).length) return { ok: false, retry: false, response: `Nothing to write in Zoho for ${e.kind}${unwritten}` };
 
       const found = await findRecord(ctx, e);
       if ("refused" in found) return found.refused;
@@ -250,7 +294,7 @@ export const zohoConnector: Connector = {
       if (!id) {
         // Their CRM decides who exists. We do not create records unless asked to.
         if (!ctx.integration.config.createIfMissing) return { ok: false, response: "No matching record in Zoho for this number", retry: false };
-        if (!may(ctx, `ZohoCRM.modules.${moduleOf(ctx).toLowerCase()}.CREATE`)) {
+        if (!may(ctx, moduleOf(ctx), "CREATE")) {
           return { ok: false, response: `No matching ${moduleOf(ctx)} record, and Zoho was not granted permission to create one`, retry: false };
         }
         const created = await call(ctx, `/crm/v2/${moduleOf(ctx)}`, {
@@ -271,7 +315,7 @@ export const zohoConnector: Connector = {
       const logged = done.Calls ?? done.Notes;
       if (say && logged) {
         wrote = `${done.Calls ? "call" : "note"} ${logged} already logged`;
-      } else if (say?.call && may(ctx, "ZohoCRM.modules.calls.CREATE")) {
+      } else if (say?.call && may(ctx, "calls", "CREATE")) {
         const t = callTimes(e.payload);
         const direction = String(((e.payload.call ?? {}) as Record<string, unknown>).direction ?? "outbound");
         const r = await call(ctx, `/crm/v2/Calls`, {
@@ -291,7 +335,7 @@ export const zohoConnector: Connector = {
         done.Calls = createdId(r) ?? "logged";
         wrote = "call logged";
         status = r.status;
-      } else if (say && may(ctx, "ZohoCRM.modules.notes.CREATE")) {
+      } else if (say && may(ctx, "notes", "CREATE")) {
         const r = await call(ctx, `/crm/v2/Notes`, {
           method: "POST",
           body: JSON.stringify({ data: [{ Note_Title: say.title, Note_Content: say.content, Parent_Id: id, se_module: moduleOf(ctx) }] }),
@@ -307,7 +351,7 @@ export const zohoConnector: Connector = {
         const upd = await call(ctx, `/crm/v2/${moduleOf(ctx)}/${id}`, { method: "PUT", body: JSON.stringify({ data: [fields] }) });
         if (upd.status >= 400) return refused(upd, id, done);
       }
-      return { ok: true, httpStatus: status, externalId: id, progress: done, response: `${wrote} on ${moduleOf(ctx)} ${id}` };
+      return { ok: true, httpStatus: status, externalId: id, progress: done, response: `${wrote} on ${moduleOf(ctx)} ${id}${unwritten}` };
     } catch (err) {
       const gone = err instanceof GrantGoneError;
       return { ok: false, response: (err as Error).message.slice(0, 300), retry: !gone, connectionBroken: gone, progress: done };

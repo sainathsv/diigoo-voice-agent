@@ -1,5 +1,8 @@
+import { and, eq } from "drizzle-orm";
+import { integrations, type Integration, type Tx } from "@jenai/db";
 import { assertClientUrl } from "@jenai/voice";
-import { ACCOUNTS } from "./zoho";
+import { sealCredentials } from "./queue";
+import { ACCOUNTS, zohoScopes } from "./zoho";
 
 /**
  * The one-time step Zoho makes you do by hand: trade the short-lived grant code
@@ -12,6 +15,11 @@ import { ACCOUNTS } from "./zoho";
  * The data centre has to match the one the code was issued in. A code from the
  * India console redeemed against accounts.zoho.com fails with invalid_code,
  * which reads like a typo and sends people back for another code.
+ *
+ * The scopes come back when Zoho lists them in its answer: that is what their
+ * admin actually granted, and the connector writes only within it. Zoho's own
+ * samples for this call do not always show the list, so null means "Zoho did
+ * not say", never "nothing granted".
  */
 export async function exchangeGrantCode(input: {
   dc: string;
@@ -19,7 +27,7 @@ export async function exchangeGrantCode(input: {
   clientSecret: string;
   code: string;
   fetchImpl?: typeof fetch;
-}): Promise<{ refreshToken: string; accessToken: string; expiresIn: number; apiDomain: string | null }> {
+}): Promise<{ refreshToken: string; accessToken: string; expiresIn: number; apiDomain: string | null; scopes: string[] | null }> {
   const accounts = ACCOUNTS[input.dc.toLowerCase()];
   if (!accounts) throw new Error(`Unknown Zoho data centre "${input.dc}". One of: ${Object.keys(ACCOUNTS).join(", ")}.`);
   const url = `${accounts}/oauth/v2/token`;
@@ -38,7 +46,7 @@ export async function exchangeGrantCode(input: {
     redirect: "error",
   });
   const j = (await res.json().catch(() => ({}))) as {
-    refresh_token?: string; access_token?: string; expires_in?: number; api_domain?: string; error?: string;
+    refresh_token?: string; access_token?: string; expires_in?: number; api_domain?: string; scope?: string; error?: string;
   };
 
   if (j.error === "invalid_code") {
@@ -53,5 +61,51 @@ export async function exchangeGrantCode(input: {
     accessToken: j.access_token ?? "",
     expiresIn: j.expires_in ?? 3600,
     apiDomain: j.api_domain ?? null,
+    scopes: zohoScopes(j.scope),
   };
+}
+
+/** What a new Zoho connection takes: every event it can write something for. */
+const ZOHO_EVENTS = ["call.completed", "lead.created", "lead.updated", "appointment.booked", "do_not_call.added"];
+
+/**
+ * Puts a Zoho grant on the client's Zoho connection, or makes the connection
+ * if they have none.
+ *
+ * Connecting again is how their admin re-grants a scope, so it must not undo
+ * what the client set up: record creation, what to pull, the field mapping,
+ * the name, and which events it takes stay unless the caller passes new ones.
+ * The scopes are the new grant's, or none recorded when Zoho did not list
+ * them: the old ones went with the old token, and the new grant may give less.
+ * It stays a draft until a test shows Zoho answers.
+ */
+export async function saveZohoConnection(
+  tx: Tx,
+  tenantId: string,
+  grant: { dc: string; credentials: Record<string, string>; scopes: string[] | null; module?: string; name?: string; events?: string[]; createdBy?: string },
+): Promise<{ integration: Integration; reconnected: boolean }> {
+  const [existing] = await tx
+    .select()
+    .from(integrations)
+    .where(and(eq(integrations.tenantId, tenantId), eq(integrations.kind, "zoho_crm")))
+    .orderBy(integrations.createdAt)
+    .limit(1);
+  const kept: Record<string, unknown> = { ...existing?.config };
+  delete kept.scopes;
+  const row = {
+    name: grant.name ?? existing?.name ?? `Zoho CRM (${grant.dc})`,
+    status: "draft" as const,
+    config: { ...kept, dc: grant.dc, module: grant.module ?? String(kept.module ?? "Leads"), ...(grant.scopes ? { scopes: grant.scopes } : {}) },
+    events: grant.events ?? existing?.events ?? ZOHO_EVENTS,
+    credentials: sealCredentials(tenantId, grant.credentials),
+    lastError: null,
+    lastErrorAt: null,
+    updatedAt: new Date(),
+  };
+  if (existing) {
+    const [i] = await tx.update(integrations).set(row).where(and(eq(integrations.tenantId, tenantId), eq(integrations.id, existing.id))).returning();
+    return { integration: i!, reconnected: true };
+  }
+  const [i] = await tx.insert(integrations).values({ tenantId, kind: "zoho_crm", direction: "both", createdBy: grant.createdBy, ...row }).returning();
+  return { integration: i!, reconnected: false };
 }

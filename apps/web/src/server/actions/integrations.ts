@@ -5,7 +5,7 @@ import { redirect } from "next/navigation";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { apiKeys, audit, integrationEvents, integrations, withTenant } from "@jenai/db";
-import { CONNECTORS, credentialsOf, sealCredentials } from "@jenai/engine";
+import { CONNECTORS, credentialsOf, saveZohoConnection, sealCredentials } from "@jenai/engine";
 import { actorFields, requireWorkspace, workspaceAction } from "../access";
 import { requestMeta } from "../session";
 import { SCOPES, newApiKey } from "../api/key";
@@ -60,14 +60,23 @@ export async function connectSystem(fd: FormData) {
   }
 
   const row = await withTenant(ctx.org.id, async (tx) => {
+    // Zoho is one CRM per client, so connecting it again is a reconnect,
+    // usually to re-grant a scope: it lands on the same connection and keeps
+    // what was set on it. A pasted refresh token does not say what it grants,
+    // so no scopes are recorded from here.
+    if (d.kind === "zoho_crm") {
+      const { integration: i, reconnected } = await saveZohoConnection(tx, ctx.org.id, { name: d.name, dc: String(config.dc), module: String(config.module), credentials, scopes: null, events, createdBy: ctx.user.userId });
+      await audit(tx, { ...(await meta(ctx)), action: reconnected ? "integration.reconnected" : "integration.connected", targetType: "integration", targetId: i.id, summary: `${reconnected ? "Reconnected" : "Connected"} ${d.name} (zoho crm)`, diff: { kind: d.kind, events } });
+      return { ...i, reconnected };
+    }
     const [i] = await tx
       .insert(integrations)
       .values({ tenantId: ctx.org.id, kind: d.kind, name: d.name, config, credentials: sealCredentials(ctx.org.id, credentials), events, status: "draft", createdBy: ctx.user.userId })
       .returning();
     await audit(tx, { ...(await meta(ctx)), action: "integration.connected", targetType: "integration", targetId: i!.id, summary: `Connected ${d.name} (${d.kind.replace("_", " ")})`, diff: { kind: d.kind, events } });
-    return i!;
+    return { ...i!, reconnected: false };
   });
-  go(slug, { ok: `${row.name} added. Test it to make sure JENAI can reach it.` });
+  go(slug, { ok: `${row.name} ${row.reconnected ? "reconnected, with its settings kept" : "added"}. Test it to make sure JENAI can reach it.` });
 }
 
 /** Ask their system whether it is reachable, and say so in one line. */

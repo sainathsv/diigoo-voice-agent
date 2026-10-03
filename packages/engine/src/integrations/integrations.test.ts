@@ -21,13 +21,16 @@ import {
   organizations,
   phoneNumbers,
   platformDb,
+  type Integration,
   suppressions,
   withTenant,
 } from "@jenai/db";
 import { analyzeCalls, type Extractor } from "../analyze";
 import { setUpProgram } from "../programs";
 import { addCarrierAccount, addPhoneNumber } from "../telephony";
-import { claimDeliveries, deliver, enqueueEvent, sealCredentials, subscribers } from "./queue";
+import { claimDeliveries, credentialsOf, deliver, enqueueEvent, sealCredentials, subscribers } from "./queue";
+import { zohoConnector } from "./zoho";
+import { exchangeGrantCode, saveZohoConnection } from "./zoho-connect";
 import { EVENT_KINDS, emitCallCompleted } from "./events";
 import { verifySignature } from "./http";
 import { CallRequestError, requestCall } from "./inbound";
@@ -441,7 +444,7 @@ describe("logging calls on their Zoho records", () => {
 
   /** One event on its way to Zoho, with an access token cached the way the worker leaves it. */
   async function readyToSend(
-    opts: { externalId?: string; token?: string; kind?: string; payload?: Record<string, unknown>; module?: string; mapping?: Record<string, string> } = {},
+    opts: { externalId?: string; token?: string; kind?: string; payload?: Record<string, unknown>; module?: string; mapping?: Record<string, string>; scopes?: string[]; config?: Record<string, unknown> } = {},
   ) {
     asked.length = 0;
     sent.length = 0;
@@ -452,7 +455,7 @@ describe("logging calls on their Zoho records", () => {
         .set({
           status: "connected",
           credentials: sealCredentials(tenant, credentials),
-          config: { dc: "in", module: opts.module ?? "Leads", scopes: SCOPES },
+          config: { dc: "in", module: opts.module ?? "Leads", scopes: opts.scopes ?? SCOPES, ...opts.config },
           mapping: { fields: opts.mapping ?? { Lead_Status: "call.outcome" } },
         })
         .where(eq(integrations.id, zohoId));
@@ -628,5 +631,123 @@ describe("logging calls on their Zoho records", () => {
     expect((await eventRow(ev.id)).externalId).toBe("ZOHO-LEAD-14");
     expect((await send(ev.id)).status).toBe("done");
     expect(asked.filter((a) => a === "GET /crm/v2/Leads/search")).toHaveLength(1);
+  });
+
+  it("does not create a Lead for a new caller when their admin did not grant it", async () => {
+    zoho = (req) => (req === "GET /crm/v2/Leads/search" ? { status: 204 } : { status: 500 });
+    const ev = await readyToSend({ config: { createIfMissing: true } });
+    expect((await send(ev.id)).status).toBe("skipped");
+    expect(await errorOf(ev.id)).toMatch(/not granted permission to create/);
+    expect(asked).toEqual(["GET /crm/v2/Leads/search"]); // never a POST Zoho would refuse
+    expect(await integrationStatus(zohoId)).toBe("connected");
+  });
+
+  it("logs the call but leaves the fields alone without the update scope, and stays connected", async () => {
+    zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-7") : { status: 500 });
+    const ev = await readyToSend({ externalId: "ZOHO-LEAD-15", scopes: ["ZohoCRM.modules.leads.READ", "ZohoCRM.modules.calls.CREATE"] });
+    const r = await send(ev.id);
+    expect(r.status).toBe("done");
+    expect(r.message).toMatch(/fields left alone, Zoho was not granted ZohoCRM\.modules\.leads\.UPDATE/);
+    // A PUT here is a 401, which would have switched the whole connection off.
+    expect(asked).toEqual(["POST /crm/v2/Calls"]);
+    expect(await integrationStatus(zohoId)).toBe("connected");
+  });
+
+  it("takes a grant on every module, or every operation on one, as covering the write", async () => {
+    zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-8") : req.startsWith("PUT ") ? updated("REC") : { status: 500 });
+    let ev = await readyToSend({ externalId: "ZOHO-LEAD-16", scopes: ["ZohoCRM.modules.ALL"] });
+    expect((await send(ev.id)).status).toBe("done");
+    expect(asked).toEqual(["POST /crm/v2/Calls", "PUT /crm/v2/Leads/ZOHO-LEAD-16"]);
+
+    ev = await readyToSend({ externalId: "ZOHO-LEAD-16", scopes: ["ZohoCRM.modules.leads.ALL", "ZohoCRM.modules.calls.ALL"] });
+    expect((await send(ev.id)).status).toBe("done");
+    expect(asked).toEqual(["POST /crm/v2/Calls", "PUT /crm/v2/Leads/ZOHO-LEAD-16"]);
+  });
+
+  it("says on Test what it will write and what it was not granted", async () => {
+    zoho = (req) => (req === "GET /crm/v2/Leads" ? { status: 200, body: { data: [{ id: "ZOHO-LEAD-1" }] } } : { status: 500 });
+    const tested = (config: Record<string, unknown>) =>
+      zohoConnector.test({
+        integration: { tenantId: tenant, id: zohoId, kind: "zoho_crm", name: "Zoho", config: { dc: "in", module: "Leads", ...config }, mapping: { fields: { Lead_Status: "call.outcome" } } } as unknown as Integration,
+        credentials: { access_token: "cached", access_token_until: String(Date.now() + 3_600_000) },
+        fetch: fakeFetch,
+        async save() {},
+      });
+
+    // Zennara's grant, asked to add callers who are not in Zoho.
+    let r = await tested({ scopes: SCOPES, createIfMissing: true });
+    expect(r.ok).toBe(true);
+    expect(r.message).toBe(
+      "Connected to Zoho CRM (in). Reading Leads. Writing each call as a Call record, a note for each booking and opt-out, the mapped Leads fields. Not granted, so not written: a new Leads record for a caller not in Zoho.",
+    );
+
+    r = await tested({ scopes: ["ZohoCRM.modules.leads.READ", "ZohoCRM.modules.notes.CREATE"] });
+    expect(r.message).toMatch(/Writing a note for each call, booking and opt-out\. Not granted, so not written: the mapped Leads fields\.$/);
+
+    // An older connection, or one Zoho did not list scopes for: not claimed either way.
+    r = await tested({});
+    expect(r.message).toMatch(/Zoho did not say which scopes it granted/);
+    expect(r.message).not.toMatch(/Call record/);
+  });
+});
+
+describe("connecting Zoho, and connecting it again", () => {
+  let org = "";
+  beforeAll(async () => {
+    const [o] = await platformDb()
+      .insert(organizations)
+      .values({ kind: "client", name: "Zoho Reconnect Clinic", slug: `zoho-re-${randomUUID().slice(0, 8)}`, status: "active", vertical: "derma", languages: ["en"] })
+      .returning();
+    org = o!.id;
+  });
+  afterAll(async () => {
+    await platformDb().delete(organizations).where(eq(organizations.id, org));
+  });
+
+  /** Zoho's token endpoint, answering the grant code exchange with the given body. */
+  const accounts = (body: Record<string, unknown>) =>
+    (async () => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })) as unknown as typeof fetch;
+  const exchange = (body: Record<string, unknown>) =>
+    exchangeGrantCode({ dc: "in", clientId: "cid", clientSecret: "secret", code: "1000.code", fetchImpl: accounts({ access_token: "a", refresh_token: "r", expires_in: 3600, ...body }) });
+
+  it("records the scopes Zoho lists, in the form the connector checks", async () => {
+    const t = await exchange({ scope: "ZohoCRM.modules.Leads.READ ZohoCRM.modules.leads.UPDATE,zohocrm.modules.calls.create  ZohoCRM.settings.fields.READ" });
+    expect(t.scopes).toEqual(["ZohoCRM.modules.leads.READ", "ZohoCRM.modules.leads.UPDATE", "ZohoCRM.modules.calls.CREATE", "ZohoCRM.settings.fields.READ"]);
+    // Zoho's own samples for this call often leave the list out: unknown, not "nothing granted".
+    expect((await exchange({})).scopes).toBeNull();
+  });
+
+  it("keeps the connection's settings when it is connected again, and takes the new grant's scopes", async () => {
+    const first = await withTenant(org, (tx) =>
+      saveZohoConnection(tx, org, { dc: "in", module: "Contacts", scopes: ["ZohoCRM.modules.contacts.READ"], credentials: { client_id: "cid", client_secret: "secret", refresh_token: "old" } }),
+    );
+    expect(first.reconnected).toBe(false);
+    expect(first.integration.config).toEqual({ dc: "in", module: "Contacts", scopes: ["ZohoCRM.modules.contacts.READ"] });
+
+    // What the client set up on it afterwards.
+    await withTenant(org, (tx) =>
+      tx
+        .update(integrations)
+        .set({ status: "error", config: { ...first.integration.config, createIfMissing: true, pull: { every: "15m" } }, mapping: { fields: { Lead_Status: "call.outcome" } }, events: ["call.completed"], name: "Front desk Zoho" })
+        .where(eq(integrations.id, first.integration.id)),
+    );
+
+    // Their admin re-grants with one more scope, and the code is redeemed again.
+    const scopes = ["ZohoCRM.modules.contacts.READ", "ZohoCRM.modules.contacts.UPDATE"];
+    const again = await withTenant(org, (tx) => saveZohoConnection(tx, org, { dc: "in", scopes, credentials: { client_id: "cid", client_secret: "secret", refresh_token: "new" } }));
+    expect(again.reconnected).toBe(true);
+    expect(again.integration.id).toBe(first.integration.id);
+    expect(again.integration.config).toEqual({ dc: "in", module: "Contacts", scopes, createIfMissing: true, pull: { every: "15m" } });
+    expect(again.integration.mapping).toEqual({ fields: { Lead_Status: "call.outcome" } });
+    expect(again.integration.events).toEqual(["call.completed"]);
+    expect(again.integration.name).toBe("Front desk Zoho");
+    expect(again.integration.status).toBe("draft"); // until a test says Zoho answers
+    expect(credentialsOf(again.integration).refresh_token).toBe("new");
+
+    // A grant Zoho did not list scopes for drops the old list rather than trusting it.
+    const unlisted = await withTenant(org, (tx) => saveZohoConnection(tx, org, { dc: "in", scopes: null, credentials: { client_id: "cid", client_secret: "secret", refresh_token: "newer" } }));
+    expect(unlisted.integration.config).not.toHaveProperty("scopes");
+    expect(unlisted.integration.config).toMatchObject({ createIfMissing: true, pull: { every: "15m" } });
+    expect(await withTenant(org, (tx) => tx.select({ id: integrations.id }).from(integrations).where(eq(integrations.kind, "zoho_crm")))).toHaveLength(1);
   });
 });
