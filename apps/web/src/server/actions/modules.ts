@@ -5,7 +5,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { can } from "@jenai/authz";
 import { agentVersions, agents, audit, campaignTargets, campaigns, consents, contacts, leads, phoneNumbers, suppressions, withTenant } from "@jenai/db";
-import { LimitError, PublishBlocked, assertFeature, createVersion, entitlements, publishVersion, requestSafetyCheck } from "@jenai/engine";
+import { LimitError, PublishBlocked, assertFeature, createVersion, emitLeadUpdated, entitlements, publishVersion, requestSafetyCheck } from "@jenai/engine";
 import { lintVersion, toE164 } from "@jenai/voice";
 import { actorFields, requireWorkspace, workspaceAction } from "../access";
 import { requestMeta } from "../session";
@@ -36,17 +36,25 @@ export async function updateLead(fd: FormData) {
   const owner = String(fd.get("owner") ?? "");
   const lostReason = String(fd.get("lostReason") ?? "").trim().slice(0, 200) || null;
   if (stage === "lost" && !lostReason) go(slug, back, { error: "Say why the lead was lost." });
+  const followAt = follow ? new Date(`${follow}T10:00:00+05:30`) : null;
   await withTenant(ctx.org.id, async (tx) => {
     await tx
       .update(leads)
       .set({
         ...(stage ? { stage } : {}),
-        ...(follow ? { nextFollowUpAt: new Date(`${follow}T10:00:00+05:30`) } : {}),
+        ...(followAt ? { nextFollowUpAt: followAt } : {}),
         ...(owner ? { ownerMembershipId: owner === "none" ? null : owner } : {}),
         ...(stage === "lost" ? { lostReason } : {}),
         updatedAt: new Date(),
       })
       .where(eq(leads.id, id));
+    // A CRM tracking the same person keeps step with what the team changed.
+    // An owner on our side means nothing in theirs, so it is not handed on.
+    const changed = [
+      ...(stage && stage !== lead!.stage ? (["stage"] as const) : []),
+      ...(followAt && followAt.getTime() !== lead!.nextFollowUpAt?.getTime() ? (["next_follow_up_at"] as const) : []),
+    ];
+    if (changed.length) await emitLeadUpdated(tx, ctx.org.id, id, changed);
     await audit(tx, { ...(await meta(ctx)), action: "lead.updated", targetType: "lead", targetId: id, summary: `Lead updated${stage ? `: stage ${stage}` : ""}${follow ? `, follow-up ${follow}` : ""}` });
   });
   go(slug, back, { ok: "Lead updated" });

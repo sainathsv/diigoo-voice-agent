@@ -117,6 +117,7 @@ export default async function IntegrationsPage({ params, searchParams }: { param
                 <label className="flex items-center gap-2"><input type="checkbox" name="event_call.completed" defaultChecked /> Call results</label>
                 <label className="flex items-center gap-2"><input type="checkbox" name="event_appointment.booked" defaultChecked /> Bookings</label>
                 <label className="flex items-center gap-2"><input type="checkbox" name="event_do_not_call.added" /> Do-not-call requests</label>
+                <label className="flex items-center gap-2"><input type="checkbox" name="event_lead.updated" /> Lead stage and follow-up changes</label>
               </div>
             </fieldset>
             <details className="lg:col-span-2">

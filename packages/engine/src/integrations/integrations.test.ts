@@ -18,6 +18,7 @@ import {
   externalLinks,
   integrationEvents,
   integrations,
+  leads,
   organizations,
   phoneNumbers,
   platformDb,
@@ -31,7 +32,7 @@ import { addCarrierAccount, addPhoneNumber } from "../telephony";
 import { claimDeliveries, credentialsOf, deliver, enqueueEvent, sealCredentials, subscribers } from "./queue";
 import { zohoConnector } from "./zoho";
 import { exchangeGrantCode, saveZohoConnection } from "./zoho-connect";
-import { EVENT_KINDS, emitCallCompleted } from "./events";
+import { EVENT_KINDS, emitCallCompleted, emitLeadUpdated } from "./events";
 import { verifySignature } from "./http";
 import { CallRequestError, requestCall } from "./inbound";
 
@@ -631,6 +632,41 @@ describe("logging calls on their Zoho records", () => {
     expect(await integrationStatus(zohoId)).toBe("connected");
   });
 
+  it("writes a lead's new stage only through the fields mapped, and nothing without a mapping", async () => {
+    const payload = { event: "lead.updated", lead: { id: randomUUID(), stage: "won", next_follow_up_at: null }, changed: ["stage"], person: { phone: "+919800000777" } };
+    let ev = await readyToSend({ externalId: "ZOHO-LEAD-31", kind: "lead.updated", payload, mapping: {} });
+    expect((await send(ev.id)).status).toBe("skipped");
+    expect(asked).toEqual([]);
+
+    zoho = (req) => (req === "PUT /crm/v2/Leads/ZOHO-LEAD-31" ? updated("ZOHO-LEAD-31") : { status: 500 });
+    ev = await readyToSend({ externalId: "ZOHO-LEAD-31", kind: "lead.updated", payload, mapping: { Lead_Status: "lead.stage" } });
+    const r = await send(ev.id);
+    expect(r.status).toBe("done");
+    // No note and no Call: a stage change is not something said on a call.
+    expect(asked).toEqual(["PUT /crm/v2/Leads/ZOHO-LEAD-31"]);
+    expect(bodyOf("PUT /crm/v2/Leads/ZOHO-LEAD-31")).toEqual({ Lead_Status: "won" });
+    expect(r.message).toMatch(/fields updated on Leads ZOHO-LEAD-31/);
+  });
+
+  it("says on the record which try it was, what they asked about, how keen they were and what was agreed", async () => {
+    zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-32") : req.startsWith("PUT ") ? updated("REC") : { status: 500 });
+    const call = { ...aCall().call, attempt: 2, concern: "hair fall treatment", interest_level: "hot", next_step: "booked", summary: "Booked a consultation." };
+    const ev = await readyToSend({ externalId: "ZOHO-LEAD-32", payload: { ...aCall(), call, appointment: { at: "25 Sep 2026, 11:00 AM", booked: true }, fields: { skin_type: "oily" } } });
+    expect((await send(ev.id)).status).toBe("done");
+    expect(String(bodyOf("POST /crm/v2/Calls")!.Description).split("\n")).toEqual([
+      "Outcome: booked",
+      "Attempt: 2",
+      "About: hair fall treatment",
+      "Interest: hot",
+      "Next step: booked",
+      "Agreed time: 25 Sep 2026, 11:00 AM (booked)",
+      "Summary: Booked a consultation.",
+      "Answers: skin type: oily",
+      "Length: 75 seconds",
+      "Made by JENAI (AI call)",
+    ]);
+  });
+
   it("logs the call once when only the field update failed, and retries just that", async () => {
     let put = 0;
     zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-5") : req === "PUT /crm/v2/Leads/ZOHO-LEAD-13" ? (++put === 1 ? { status: 503 } : updated("ZOHO-LEAD-13")) : { status: 500 });
@@ -796,11 +832,15 @@ describe("logging calls on their Zoho records", () => {
     let r = await tested({ scopes: SCOPES, createIfMissing: true });
     expect(r.ok).toBe(true);
     expect(r.message).toBe(
-      "Connected to Zoho CRM (in). Finding callers in Leads, then Contacts. Writing each call as a Call record, a note for each booking and opt-out, the mapped fields on Leads and Contacts records. Not granted, so not written: a new Leads record for a caller not in Zoho.",
+      "Connected to Zoho CRM (in). Finding callers in Leads, then Contacts. Writing each call as a Call record, a note for each booking and opt-out, the mapped fields on Leads and Contacts records. Not granted, so not written: a new Leads record for a caller not in Zoho. Health detail from calls (duration, tried before, background, advice given, urgent, problem reported, complication reported) stays in JENAI.",
     );
 
     r = await tested({ scopes: ["ZohoCRM.modules.leads.READ", "ZohoCRM.modules.notes.CREATE"] });
-    expect(r.message).toMatch(/Finding callers in Leads\. Writing a note for each call, booking and opt-out\. Not granted, so not written: the mapped fields on Leads records\.$/);
+    expect(r.message).toMatch(/Finding callers in Leads\. Writing a note for each call, booking and opt-out\. Not granted, so not written: the mapped fields on Leads records\. Health detail/);
+
+    // A client who chose what to share hears exactly that.
+    r = await tested({ scopes: SCOPES, share: ["skin_type", "tried_before"] });
+    expect(r.message).toMatch(/Answers from calls handed on: skin type, tried before\.$/);
 
     // An older connection, or one Zoho did not list scopes for: not claimed either way.
     r = await tested({});
@@ -867,5 +907,110 @@ describe("connecting Zoho, and connecting it again", () => {
     expect(unlisted.integration.config).not.toHaveProperty("scopes");
     expect(unlisted.integration.config).toMatchObject({ createIfMissing: true, pull: { every: "15m" } });
     expect(await withTenant(org, (tx) => tx.select({ id: integrations.id }).from(integrations).where(eq(integrations.kind, "zoho_crm")))).toHaveLength(1);
+  });
+});
+
+describe("what a call hands on, and to whom", () => {
+  // One system as it comes, one whose client chose what it may have.
+  let plain = "";
+  let sharing = "";
+  beforeAll(async () => {
+    const add = async (name: string, config: Record<string, unknown>, events: string[]) =>
+      (await withTenant(tenant, (tx) => tx.insert(integrations).values({ tenantId: tenant, kind: "webhook_out", name, status: "connected", config: { url: `${base}/${name}`, ...config }, events }).returning()))[0]!.id;
+    plain = await add("plain", {}, ["call.completed", "lead.updated"]);
+    sharing = await add("sharing", { share: ["duration", "skin_type"] }, ["call.completed"]);
+  });
+
+  const handed = async (integrationId: string, kind: string, refId: string) =>
+    withTenant(tenant, (tx) =>
+      tx.select().from(integrationEvents).where(and(eq(integrationEvents.integrationId, integrationId), eq(integrationEvents.kind, kind), eq(integrationEvents.refId, refId))),
+    );
+  const payloadOf = async (integrationId: string, refId: string) => (await handed(integrationId, "call.completed", refId))[0]!.payload;
+
+  it("keeps health detail out of what each system is handed, unless the client shares it", async () => {
+    const { call } = await seedCall("booked");
+    const said = { concern: "hair fall treatment", interest_level: "hot", duration: "6 months", tried_before: "onion oil", background: "after delivery", advice_given: "mild shampoo", urgent: false, problem_reported: "itching after the cream", skin_type: "oily" };
+    await withTenant(tenant, (tx) => tx.update(calls).set({ extracted: { ...call.extracted, ...said } }).where(eq(calls.id, call.id)));
+    await withTenant(tenant, (tx) => emitCallCompleted(tx, tenant, call.id));
+
+    // By default every answer but the health detail.
+    expect((await payloadOf(plain, call.id)).fields).toEqual({ booked: "yes", skin_type: "oily" });
+    // A share list hands on what it names, and only that.
+    expect((await payloadOf(sharing, call.id)).fields).toEqual({ duration: "6 months", skin_type: "oily" });
+    // What the call was about travels with it, outside the answers.
+    expect((await payloadOf(plain, call.id)).call).toMatchObject({ concern: "hair fall treatment", interest_level: "hot", next_step: "booked", attempt: null });
+  });
+
+  it("says which try a dialled call was", async () => {
+    const { call, contact, phone } = await seedCall("callback");
+    const [campaign] = await withTenant(tenant, (tx) => tx.select().from(campaigns).limit(1));
+    await withTenant(tenant, (tx) =>
+      tx.insert(campaignTargets).values({ tenantId: tenant, campaignId: campaign!.id, contactId: contact.id, phoneE164: phone, state: "dialing", attemptNo: 2, externalRunId: call.externalRunId }),
+    );
+    await withTenant(tenant, (tx) => emitCallCompleted(tx, tenant, call.id));
+    expect((await payloadOf(plain, call.id)).call).toMatchObject({ attempt: 2 });
+  });
+
+  /** A call made by the appointment reminder program, to a person with a lead closed long ago and one still open. */
+  async function reminderCall() {
+    const [cp] = await withTenant(tenant, (tx) => tx.select().from(clientPrograms).where(eq(clientPrograms.programKey, "clinic.appointment_reminder")));
+    const { call, contact } = await seedCall("none");
+    const long = new Date(Date.now() - 90 * 86_400_000);
+    return withTenant(tenant, async (tx) => {
+      const [closed] = await tx.insert(leads).values({ tenantId: tenant, contactId: contact.id, stage: "lost", lostReason: "went elsewhere", createdAt: long, updatedAt: long }).returning();
+      const [open] = await tx.insert(leads).values({ tenantId: tenant, contactId: contact.id, stage: "booked" }).returning();
+      await tx.update(calls).set({ agentId: cp!.agentId, extracted: {}, transcript: "Agent: Your visit is tomorrow at 11. Caller: Yes, I will come." }).where(eq(calls.id, call.id));
+      return { call, contact, closed: closed!, open: open! };
+    });
+  }
+  const confirmed: Extractor = {
+    model: "test",
+    async extract() {
+      return { caller_name: "Ravi", next_step: "none", summary: "Confirmed the visit.", confirmed: "yes", outcome: "confirmed" };
+    },
+  };
+  const stageOf = async (id: string) => (await withTenant(tenant, (tx) => tx.select().from(leads).where(eq(leads.id, id))))[0]!.stage;
+
+  it("sets the stage a program's outcome means on the open lead, before the call is handed on, and says so once", async () => {
+    const { call, contact, closed, open } = await reminderCall();
+    expect(await analyzeCalls(tenant, confirmed)).toMatchObject({ analyzed: 1, failed: 0 });
+
+    expect(await stageOf(open.id)).toBe("won"); // "confirmed" means won in this program
+    expect(await stageOf(closed.id)).toBe("lost"); // closed before, stays closed
+    // The call carries the stage it left, on the lead it moved, though that lead is now closed.
+    expect((await payloadOf(plain, call.id)).lead).toMatchObject({ id: open.id, stage: "won" });
+    const updates = await handed(plain, "lead.updated", open.id);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.payload).toMatchObject({ lead: { id: open.id, stage: "won" }, changed: ["stage"], source_call: call.id, person: { contact_id: contact.id } });
+    expect(await handed(plain, "lead.updated", closed.id)).toEqual([]);
+  });
+
+  it("keeps the lead's new stage even when handing it on fails", async () => {
+    const { call, open } = await reminderCall();
+    const real = await vi.importActual<typeof import("./queue")>("./queue");
+    vi.mocked(enqueueEvent).mockImplementation(async (tx, tenantId, input) => {
+      if (input.kind === "lead.updated") await tx.execute(sql`select 'not-a-uuid'::uuid`);
+      return real.enqueueEvent(tx, tenantId, input);
+    });
+    try {
+      expect(await analyzeCalls(tenant, confirmed)).toMatchObject({ analyzed: 1, failed: 0 });
+    } finally {
+      vi.mocked(enqueueEvent).mockImplementation(real.enqueueEvent);
+    }
+    expect(await stageOf(open.id)).toBe("won");
+    expect(await payloadOf(plain, call.id)).toBeTruthy(); // the call itself still went
+  });
+
+  it("hands on each change the team makes to a lead, back and forth", async () => {
+    const { contact } = await seedCall("none");
+    const [lead] = await withTenant(tenant, (tx) => tx.insert(leads).values({ tenantId: tenant, contactId: contact.id, stage: "callback" }).returning());
+    for (const stage of ["booked", "callback", "booked"] as const) {
+      await withTenant(tenant, async (tx) => {
+        await tx.update(leads).set({ stage, updatedAt: new Date() }).where(eq(leads.id, lead!.id));
+        await emitLeadUpdated(tx, tenant, lead!.id, ["stage"]);
+      });
+    }
+    const updates = await handed(plain, "lead.updated", lead!.id);
+    expect(updates.map((u) => (u.payload.lead as { stage: string }).stage).sort()).toEqual(["booked", "booked", "callback"]);
   });
 });

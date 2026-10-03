@@ -90,6 +90,28 @@ export function applyMapping(payload: Record<string, unknown>, mapping: Record<s
   return out;
 }
 
+/**
+ * Health detail a call gathers: the history the advisor asks for (how long,
+ * what they tried, background, the advice given, whether it is urgent) and a
+ * problem a follow-up or feedback call hears about. It stays in JENAI, under
+ * the client's tenant like the transcript, unless they choose to hand it on.
+ */
+export const HEALTH_DETAIL = ["duration", "tried_before", "background", "advice_given", "urgent", "problem_reported", "complication_reported"];
+
+/**
+ * The event as one connection is handed it: of the call's answers
+ * (payload.fields), only the ones its share list (config.share) names, or,
+ * with no list, all but the health detail. A CRM is read by the whole front
+ * office and a webhook goes wherever their developer points it, so health
+ * detail goes only where the client said it may.
+ */
+export function sharedWith(config: Record<string, unknown>, payload: Record<string, unknown>): Record<string, unknown> {
+  const fields = payload.fields;
+  if (!fields || typeof fields !== "object") return payload;
+  const list = Array.isArray(config.share) ? config.share.map(String) : null;
+  return { ...payload, fields: Object.fromEntries(Object.entries(fields).filter(([k]) => (list ? list.includes(k) : !HEALTH_DETAIL.includes(k)))) };
+}
+
 /** Network and 5xx answers are worth retrying; a refusal is not. */
 export function retryable(status: number | undefined): boolean {
   if (status === undefined) return true; // never reached them

@@ -1,5 +1,5 @@
 import { assertClientUrl, toE164 } from "@jenai/voice";
-import { applyMapping, retryable, type Connector, type ConnectorContext, type OutEvent, type SendResult } from "./types";
+import { HEALTH_DETAIL, applyMapping, retryable, type Connector, type ConnectorContext, type OutEvent, type SendResult } from "./types";
 
 /**
  * Zoho CRM. The client keeps running Zoho exactly as they do today; JENAI adds
@@ -272,6 +272,9 @@ interface Writeup {
  * What each kind of event says on their record. A booked visit or an opt-out
  * is not a call: logged as one it read "Outcome: unknown", 00:00, Completed, a
  * call that never happened. A kind with nothing to say here gets no note.
+ * That includes lead.updated: a stage or follow-up date reaches their record
+ * only through the fields they mapped (lead.stage), and with no mapping
+ * nothing is written for it.
  */
 function writeup(e: OutEvent): Writeup | null {
   const p = e.payload;
@@ -284,8 +287,17 @@ function writeup(e: OutEvent): Writeup | null {
     const call = (p.call ?? {}) as Record<string, unknown>;
     const fields = (p.fields ?? {}) as Record<string, unknown>;
     const program = (p.program ?? {}) as Record<string, unknown>;
+    const appointment = (p.appointment ?? {}) as Record<string, unknown>;
+    // What the front desk needs before calling back: which try this was, what
+    // they asked about, how keen they were, and where the call left things.
+    const line = (label: string, v: unknown) => (v === null || v === undefined || v === "" ? "" : `${label}: ${String(v)}`);
     return said(`JENAI call: ${String(program.name ?? "call")}`, [
       `Outcome: ${String(call.outcome ?? call.status ?? "unknown")}`,
+      line("Attempt", call.attempt),
+      line("About", call.concern),
+      line("Interest", call.interest_level),
+      line("Next step", call.next_step),
+      appointment.at ? `Agreed time: ${String(appointment.at)}${appointment.booked ? " (booked)" : ""}` : "",
       call.summary ? `Summary: ${String(call.summary)}` : "",
       Object.entries(fields).length ? `Answers: ${Object.entries(fields).map(([k, v]) => `${k.replace(/_/g, " ")}: ${String(v)}`).join("; ")}` : "",
       call.seconds ? `Length: ${String(call.seconds)} seconds` : "",
@@ -331,6 +343,17 @@ function writes(ctx: ConnectorContext): string {
   return [yes.length ? `Writing ${yes.join(", ")}.` : "", no.length ? `Not granted, so not written: ${no.join(", ")}.` : ""].filter(Boolean).join(" ");
 }
 
+/**
+ * Which of each call's answers reach Zoho, for the Test button. The rest are
+ * left out before the event is queued, so a field mapped to one of them is
+ * left empty.
+ */
+function shares(ctx: ConnectorContext): string {
+  const list = ctx.integration.config.share;
+  if (Array.isArray(list)) return `Answers from calls handed on: ${list.length ? list.map(String).join(", ").replace(/_/g, " ") : "none"}.`;
+  return `Health detail from calls (${HEALTH_DETAIL.join(", ").replace(/_/g, " ")}) stays in JENAI.`;
+}
+
 export const zohoConnector: Connector = {
   kind: "zoho_crm",
   async test(ctx) {
@@ -342,7 +365,7 @@ export const zohoConnector: Connector = {
       if (r.status === 200 || r.status === 204) {
         const where = lookIn(ctx);
         const finding = where.length ? `Finding callers in ${where.join(", then ")}.` : "Not granted to read Leads or Contacts, so no caller can be found.";
-        return { ok: true, message: `Connected to Zoho CRM (${dcOf(ctx)}). ${finding} ${writes(ctx)}` };
+        return { ok: true, message: `Connected to Zoho CRM (${dcOf(ctx)}). ${finding} ${writes(ctx)} ${shares(ctx)}` };
       }
       return { ok: false, message: `Zoho answered ${r.status}: ${r.text.slice(0, 160)}` };
     } catch (e) {
@@ -437,6 +460,10 @@ export const zohoConnector: Connector = {
       if (Object.keys(fields).length) {
         const upd = await call(ctx, `/crm/v2/${module}/${id}`, { method: "PUT", body: JSON.stringify({ data: [fields] }) });
         if (upd.status >= 400) return refused(upd, at, done);
+        if (wrote === "nothing") {
+          wrote = "fields updated";
+          status = upd.status;
+        }
       }
       return { ok: true, httpStatus: status, externalId: id, externalType: module, progress: done, response: `${wrote} on ${module} ${id}${unwritten}` };
     } catch (err) {

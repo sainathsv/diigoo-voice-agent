@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { and, eq } from "drizzle-orm";
-import { agents, calls, clientPrograms, contacts, leads, organizations, programTemplates, type Tx } from "@jenai/db";
+import { and, desc, eq, notInArray, or, sql } from "drizzle-orm";
+import { agents, calls, campaignTargets, clientPrograms, contacts, leads, organizations, programTemplates, type Call, type Tx } from "@jenai/db";
 import { enqueueEvent } from "./queue";
 
 /**
@@ -34,6 +34,22 @@ export function checkRecordingLink(tenantId: string, callId: string, exp: string
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/**
+ * Which try at reaching the person this was, for a call the dialer placed:
+ * the count on its target, while the target is still on this call. Null for
+ * a call they made to us, or once the target has been dialled again, rather
+ * than a number that may be wrong.
+ */
+async function attemptOf(tx: Tx, c: Call): Promise<number | null> {
+  if (c.direction !== "outbound") return null;
+  const [t] = await tx
+    .select({ attemptNo: campaignTargets.attemptNo, runId: campaignTargets.externalRunId })
+    .from(campaignTargets)
+    .where(c.targetId ? eq(campaignTargets.id, c.targetId) : eq(campaignTargets.externalRunId, c.externalRunId))
+    .limit(1);
+  return t && t.runId === c.externalRunId && t.attemptNo > 0 ? t.attemptNo : null;
+}
+
 /** Builds the call payload and queues it for every connected system. */
 export async function emitCallCompleted(tx: Tx, tenantId: string, callId: string): Promise<number> {
   const [row] = await tx
@@ -52,7 +68,18 @@ export async function emitCallCompleted(tx: Tx, tenantId: string, callId: string
         .innerJoin(programTemplates, and(eq(programTemplates.key, clientPrograms.programKey), eq(programTemplates.version, clientPrograms.programVersion)))
         .where(eq(clientPrograms.id, agent.clientProgramId))
     : [];
-  const [lead] = c.contactId ? await tx.select().from(leads).where(eq(leads.contactId, c.contactId)).limit(1) : [];
+  // The lead this call moved, even one it just closed (a program's "paid" is
+  // won), else the person's open lead (the database allows one), newest
+  // first. Never an old closed one: its stage is not where they stand now.
+  const [lead] = c.contactId
+    ? await tx
+        .select()
+        .from(leads)
+        .where(and(eq(leads.contactId, c.contactId), or(eq(leads.lastCallId, c.id), notInArray(leads.stage, ["won", "lost"]))))
+        .orderBy(desc(sql`(${leads.lastCallId} = ${c.id}) is true`), desc(leads.createdAt))
+        .limit(1)
+    : [];
+  const attempt = await attemptOf(tx, c);
 
   const extracted = (c.extracted ?? {}) as Record<string, unknown>;
   const standard = new Set(["caller_name", "concern", "preferred_time", "interest_level", "next_step", "do_not_call", "summary", "outcome"]);
@@ -77,6 +104,12 @@ export async function emitCallCompleted(tx: Tx, tenantId: string, callId: string
       recording_url: recording?.url ?? null,
       recording_expires_at: recording?.expiresAt.toISOString() ?? null,
       agent: agent?.name ?? null,
+      // What the call was about and where it left things, read from the call
+      // itself. The agreed time is under appointment.
+      attempt,
+      concern: (extracted.concern as string) ?? null,
+      interest_level: (extracted.interest_level as string) ?? null,
+      next_step: (extracted.next_step as string) ?? null,
     },
     person: { contact_id: c.contactId, name: contact?.name ?? (extracted.caller_name as string) ?? null, phone },
     fields,
@@ -91,6 +124,44 @@ export async function emitCallCompleted(tx: Tx, tenantId: string, callId: string
     payload,
     idempotencyKey: `call.completed:${c.id}`,
   });
+}
+
+/**
+ * Queued when a lead's stage or follow-up date changes, by a call or by
+ * someone on the team, so a CRM that tracks the same person keeps step. The
+ * key carries the new state and the moment, so each change is one delivery.
+ *
+ * Like an opt-out, the change is already written in the same transaction, and
+ * a queue error rolls back to a savepoint and is logged: handing it on must
+ * never undo the change, or fail the call analysis it came from.
+ */
+export async function emitLeadUpdated(tx: Tx, tenantId: string, leadId: string, changed: Array<"stage" | "next_follow_up_at">, callId: string | null = null): Promise<number> {
+  try {
+    return await tx.transaction(async (sp) => {
+      const [row] = await sp.select({ lead: leads, contact: contacts }).from(leads).leftJoin(contacts, eq(contacts.id, leads.contactId)).where(eq(leads.id, leadId));
+      if (!row) return 0;
+      const { lead, contact } = row;
+      const followUp = lead.nextFollowUpAt?.toISOString() ?? null;
+      return enqueueEvent(sp, tenantId, {
+        kind: "lead.updated",
+        refType: "lead",
+        refId: lead.id,
+        payload: {
+          event: "lead.updated",
+          at: new Date().toISOString(),
+          // The same shape as call.completed's lead, so one field mapping (lead.stage) serves both.
+          lead: { id: lead.id, stage: lead.stage, next_follow_up_at: followUp },
+          changed,
+          source_call: callId,
+          person: { contact_id: lead.contactId, name: contact?.name ?? null, phone: contact?.phoneE164 ?? null },
+        },
+        idempotencyKey: `lead.updated:${lead.id}:${lead.stage}:${followUp ?? ""}:${lead.updatedAt.getTime()}`,
+      });
+    });
+  } catch (e) {
+    console.error(`[integrations] lead.updated not queued for tenant ${tenantId}: ${(e as Error).message}`);
+    return 0;
+  }
 }
 
 /** Queued when a call books a visit, for systems that keep a diary. */

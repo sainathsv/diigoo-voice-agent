@@ -9,7 +9,7 @@
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
-import { agents, calls, leads, suppressions, withTenant } from "@jenai/db";
+import { agents, calls, suppressions, withTenant } from "@jenai/db";
 import { deriveLead, parsePreferredTime } from "./leads";
 import { isOnOwnNetwork } from "./own-network";
 import { CY_POLICE_PROGRAM, latestProgramVersion, programExtraction } from "./programs";
@@ -288,7 +288,12 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
             await caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: merged }, opts.whatsapp, {
               message: Date.now() - c.startedAt.getTime() < FOLLOWUP_WINDOW_MS,
             });
-        } else if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
+        } else if (c.contactId) {
+          // A program says what its own outcomes mean for the lead (paid, disputed, booked).
+          // Set before the call is handed on below, so their CRM gets the stage this call left.
+          const programStage = program && typeof extra.outcome === "string" ? (program.outcomes.find((o) => o.key === extra.outcome)?.stage ?? null) : null;
+          if (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt, programStage })) stats.leads++;
+        }
         // A booking goes straight into the calendar, so the front desk sees it without asking.
         if (merged.next_step === "booked" && typeof merged.preferred_time === "string") {
           const when = parsePreferredTime(merged.preferred_time);
@@ -307,16 +312,6 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
         // Hand the result back to the client's own system (their CRM stays the record of truth).
         await emitCallCompleted(tx, tenantId, c.id);
         if (merged.next_step === "booked" && typeof merged.preferred_time === "string") await emitAppointmentBooked(tx, tenantId, c.id, merged.preferred_time);
-        // A program says what its own outcomes mean for the lead (paid, disputed, booked).
-        if (c.contactId && program && typeof extra.outcome === "string") {
-          const stage = program.outcomes.find((o) => o.key === extra.outcome)?.stage;
-          if (stage) {
-            await tx
-              .update(leads)
-              .set({ stage: stage as never, updatedAt: new Date() })
-              .where(and(eq(leads.tenantId, tenantId), eq(leads.contactId, c.contactId)));
-          }
-        }
       });
       stats.analyzed++;
     } catch {

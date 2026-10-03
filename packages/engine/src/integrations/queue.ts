@@ -2,7 +2,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { externalLinks, integrationEvents, integrations, openSecret, sealSecret, withTenant, type Db, type Integration, type Tx } from "@jenai/db";
 import { webhookConnector, restConnector } from "./http";
 import { zohoConnector } from "./zoho";
-import type { Connector, ConnectorContext, OutEvent } from "./types";
+import { sharedWith, type Connector, type ConnectorContext, type OutEvent } from "./types";
 
 /**
  * Write-backs to the client's own system: queued in the database, delivered by
@@ -85,7 +85,8 @@ export async function enqueueEvent(tx: Tx, tenantId: string, input: EnqueueInput
         // An id their system handed us does not say which kind of record it is.
         externalType: input.externalId ? null : (linked?.externalType ?? null),
         idempotencyKey: key,
-        payload: input.payload,
+        // Stored as handed on, so the delivery log shows what they were given.
+        payload: sharedWith(i.config, input.payload),
       })
       .onConflictDoNothing()
       .returning({ id: integrationEvents.id });

@@ -20,7 +20,7 @@ async function meta(ctx: Awaited<ReturnType<typeof requireWorkspace>>) {
   return { ...actorFields(ctx), tenantId: ctx.org.id, ...(await requestMeta()) };
 }
 
-const EVENTS = ["call.completed", "appointment.booked", "do_not_call.added"] as const;
+const EVENTS = ["call.completed", "appointment.booked", "do_not_call.added", "lead.updated"] as const;
 
 /** Connect the client's own system: a webhook they own, their API, or Zoho CRM. */
 export async function connectSystem(fd: FormData) {
