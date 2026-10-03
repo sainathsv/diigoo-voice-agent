@@ -1,10 +1,15 @@
-import { and, asc, eq, isNull, lt, sql } from "drizzle-orm";
+import { and, asc, eq, gte, isNull, lt, sql } from "drizzle-orm";
 import { whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
 import { handleInbound, type CaseReader } from "./cases";
 import { OpenWaWhatsApp, openWaMediaId, whatsappFor, type InboundMessage, type QueuedMessage, type WhatsAppSender } from "./whatsapp";
 
-/** A message that keeps failing (the model is down, the number cannot be resolved) is given up after this many tries. */
-const MAX_ATTEMPTS = 5;
+/**
+ * A message that keeps failing (the number cannot be resolved, the database is down) is
+ * tried again with a widening gap: 15 s, 30 s, 1 min, 2 min … about an hour in all, then
+ * shown on the WhatsApp page as not read, with a button to read it again.
+ */
+export const INBOX_MAX_ATTEMPTS = 9;
+const dueAt = (receivedAt: Date, attempts: number) => receivedAt.getTime() + 15_000 * (2 ** attempts - 1);
 
 /**
  * Queues one inbound message for the worker. The webhook answers OpenWA at once;
@@ -53,29 +58,40 @@ async function toInbound(m: QueuedMessage, sender: WhatsAppSender): Promise<Inbo
 }
 
 /**
- * Reads the queued WhatsApp messages of one workspace, oldest first, since each
- * reply answers the question asked before it. A failure is retried on the next round.
+ * Reads the queued WhatsApp messages of one workspace, oldest first, since each reply
+ * answers the question asked before it: while one person's message waits for another try,
+ * their later messages wait behind it (other people's do not).
  */
 export async function processInbox(tenantId: string, reader: CaseReader, sender?: WhatsAppSender, limit = 10): Promise<{ handled: number; failed: number }> {
   const stats = { handled: 0, failed: 0 };
   const wa = await withTenant(tenantId, (tx) => whatsappFor(tx, tenantId, sender));
   if (!wa) return stats;
-  const due = await withTenant(tenantId, (tx) =>
+  const pending = await withTenant(tenantId, (tx) =>
     tx
       .select()
       .from(whatsappInbox)
-      .where(and(isNull(whatsappInbox.processedAt), lt(whatsappInbox.attempts, MAX_ATTEMPTS)))
+      .where(and(isNull(whatsappInbox.processedAt), lt(whatsappInbox.attempts, INBOX_MAX_ATTEMPTS)))
       .orderBy(asc(whatsappInbox.receivedAt))
-      .limit(limit),
+      .limit(200),
   );
-  for (const row of due) {
+  const held = new Set<string>();
+  for (const row of pending) {
+    if (stats.handled + stats.failed >= limit) break;
+    const queued = row.message as unknown as QueuedMessage;
+    const who = queued.chatId || queued.from || row.id;
+    if (held.has(who)) continue;
+    if (Date.now() < dueAt(row.receivedAt, row.attempts)) {
+      held.add(who);
+      continue;
+    }
     try {
-      const msg = await toInbound(row.message as unknown as QueuedMessage, wa.sender);
+      const msg = await toInbound(queued, wa.sender);
       if (!msg) throw new Error("WhatsApp did not show this sender's phone number");
       await handleInbound(tenantId, msg, reader, wa.sender);
       await withTenant(tenantId, (tx) => tx.update(whatsappInbox).set({ processedAt: new Date(), lastError: null }).where(eq(whatsappInbox.id, row.id)));
       stats.handled++;
     } catch (e) {
+      held.add(who);
       await withTenant(tenantId, (tx) =>
         tx
           .update(whatsappInbox)
@@ -86,4 +102,16 @@ export async function processInbox(tenantId: string, reader: CaseReader, sender?
     }
   }
   return stats;
+}
+
+/** Puts the messages that could not be read back in the queue (the WhatsApp page's "Read them again"). */
+export async function retryInbox(tenantId: string): Promise<number> {
+  const rows = await withTenant(tenantId, (tx) =>
+    tx
+      .update(whatsappInbox)
+      .set({ attempts: 0, lastError: null })
+      .where(and(isNull(whatsappInbox.processedAt), gte(whatsappInbox.attempts, INBOX_MAX_ATTEMPTS)))
+      .returning({ id: whatsappInbox.id }),
+  );
+  return rows.length;
 }

@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { can, holdsAnywhere } from "@jenai/authz";
 import { audit, cases, sealSecret, whatsappChannels, withTenant } from "@jenai/db";
-import { OpenWaWhatsApp, channelCredentials } from "@jenai/engine";
+import { OpenWaWhatsApp, channelCredentials, retryInbox } from "@jenai/engine";
 import { actorFields, requireWorkspace } from "../access";
 import { requestMeta } from "../session";
 
@@ -152,4 +152,17 @@ export async function saveFormLink(fd: FormData) {
     });
   });
   go(slug, "whatsapp", { ok: url ? "Form link saved" : "Form link removed" });
+}
+
+/** Puts the WhatsApp messages that could not be read back in the queue, for the worker to read again. */
+export async function retryWhatsappInbox(fd: FormData) {
+  const slug = String(fd.get("slug"));
+  const ctx = await requireWorkspace(slug);
+  if (!holdsAnywhere(ctx.access, "integrations:manage")) go(slug, "whatsapp", { error: "Your role cannot set up WhatsApp." });
+  const n = await retryInbox(ctx.org.id);
+  if (n)
+    await withTenant(ctx.org.id, async (tx) =>
+      audit(tx, { ...actorFields(ctx), tenantId: ctx.org.id, ...(await requestMeta()), action: "whatsapp.inbox_retried", targetType: "whatsapp_channel", summary: `${n} unread WhatsApp message(s) put back to be read` }),
+    );
+  go(slug, "whatsapp", { ok: n ? `${n} message(s) will be read again within a minute` : "Nothing was waiting" });
 }

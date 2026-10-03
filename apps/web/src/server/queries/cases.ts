@@ -2,7 +2,7 @@ import "server-only";
 import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { branchesFor, type AccessContext } from "@jenai/authz";
 import { calls, caseEvidence, caseMessages, cases, memberships, user, whatsappChannels, whatsappInbox, withTenant, type WhatsappChannel } from "@jenai/db";
-import { caseNo, openWaFor, scamLabel, withWhatsApp, type OpenWaSession } from "@jenai/engine";
+import { INBOX_MAX_ATTEMPTS, caseNo, openWaFor, scamLabel, withWhatsApp, type OpenWaSession } from "@jenai/engine";
 
 const STATUSES = new Set(["collecting", "ready", "taken_up", "closed"]);
 
@@ -73,10 +73,16 @@ export async function loadWhatsappLink(tenantId: string) {
   const [ch] = await withTenant(tenantId, (tx) => tx.select().from(whatsappChannels).where(eq(whatsappChannels.tenantId, tenantId)).limit(1));
   const [q] = await withTenant(tenantId, (tx) =>
     tx
-      .select({ waiting: sql<number>`count(*) filter (where ${whatsappInbox.processedAt} is null)::int`, stuck: sql<number>`count(*) filter (where ${whatsappInbox.processedAt} is null and ${whatsappInbox.attempts} >= 5)::int` })
+      .select({
+        waiting: sql<number>`count(*) filter (where ${whatsappInbox.processedAt} is null)::int`,
+        stuck: sql<number>`count(*) filter (where ${whatsappInbox.processedAt} is null and ${whatsappInbox.attempts} >= ${INBOX_MAX_ATTEMPTS})::int`,
+        retrying: sql<number>`count(*) filter (where ${whatsappInbox.processedAt} is null and ${whatsappInbox.attempts} between 1 and ${INBOX_MAX_ATTEMPTS - 1})::int`,
+        // Why the newest unread message could not be read, in the reader's words.
+        lastError: sql<string | null>`(array_agg(${whatsappInbox.lastError} order by ${whatsappInbox.receivedAt} desc) filter (where ${whatsappInbox.processedAt} is null and ${whatsappInbox.lastError} is not null))[1]`,
+      })
       .from(whatsappInbox),
   );
-  const queue = { waiting: q?.waiting ?? 0, stuck: q?.stuck ?? 0 };
+  const queue = { waiting: q?.waiting ?? 0, stuck: q?.stuck ?? 0, retrying: q?.retrying ?? 0, lastError: q?.lastError ?? null };
   if (!ch) return { channel: null, live: null as OpenWaSession | null, qr: null as string | null, error: null as string | null, queue };
   const gw = openWaFor(ch);
   if (!gw) return { channel: safe(ch), live: null, qr: null, error: null, queue };

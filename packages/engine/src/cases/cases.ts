@@ -22,6 +22,7 @@ import {
   receivedProofText,
   reminderText,
 } from "./catalog";
+import { fallbackRead, quickRead } from "./quick-read";
 import { whatsappFor, type InboundMessage, type WhatsAppSender } from "./whatsapp";
 
 function one<T>(rows: T[]): T {
@@ -439,20 +440,61 @@ export class LocalCaseReader implements CaseReader {
   }
 }
 
+export interface ReaderHooks {
+  /** Wraps every AI read: the worker uses it to put WhatsApp replies ahead of reading calls. */
+  aiTurn?: <T>(read: () => Promise<T>) => Promise<T>;
+  /** Told when the AI could not read a reply and the plain reading was used instead. */
+  onAiError?: (e: Error) => void;
+}
+
 /**
- * The reply reader this server is configured for: the same model as the call analyser
- * (JENAI_ANALYZER_PROVIDER=local and its base URL, else Bedrock). The police edition reads
- * replies only with a model on its own network.
+ * Reads a WhatsApp reply: plain answers on the spot (quickRead), the rest with the AI. When
+ * the AI cannot be had (busy too long, stopped, out of memory) the reply is kept as written
+ * for the item asked, or that item is asked again, so a complainant is never left waiting.
  */
-export function caseReaderFromEnv(env: Record<string, string | undefined> = process.env): CaseReader {
+export class ResilientReader implements CaseReader {
+  constructor(
+    readonly ai: CaseReader | null,
+    private readonly hooks: ReaderHooks = {},
+  ) {}
+  async read(input: { asking: string | null; text: string; known: Record<string, string> }): Promise<ReadResult> {
+    const quick = quickRead(input);
+    if (quick.confident) return quick.result;
+    const ai = this.ai;
+    if (ai) {
+      try {
+        return await (this.hooks.aiTurn ? this.hooks.aiTurn(() => ai.read(input)) : ai.read(input));
+      } catch (e) {
+        this.hooks.onAiError?.(e as Error);
+      }
+    }
+    return fallbackRead(input);
+  }
+}
+
+/**
+ * The reply reader this server is configured for: plain answers without the AI, the rest
+ * with the same model as the call analyser (JENAI_ANALYZER_PROVIDER=local and its base URL,
+ * else Bedrock). The police edition reads replies only with a model on its own network, and
+ * a police server without its own AI still reads the plain answers.
+ */
+export function caseReaderFromEnv(env: Record<string, string | undefined> = process.env, hooks: ReaderHooks = {}): ResilientReader {
+  return new ResilientReader(aiReaderFromEnv(env), hooks);
+}
+
+function aiReaderFromEnv(env: Record<string, string | undefined>): CaseReader | null {
   const police = env.JENAI_EDITION === "police";
   const provider = (env.JENAI_ANALYZER_PROVIDER ?? (police ? "local" : "bedrock")).toLowerCase();
   if (provider === "local" || provider === "openai") {
     const baseUrl = env.JENAI_ANALYZER_BASE_URL;
     const model = env.JENAI_ANALYZER_MODEL;
-    if (!baseUrl || !model) throw new Error("JENAI_ANALYZER_PROVIDER=local needs JENAI_ANALYZER_BASE_URL and JENAI_ANALYZER_MODEL");
+    if (!baseUrl || !model) {
+      if (police && !env.JENAI_ANALYZER_PROVIDER) return null; // this server has no AI of its own
+      throw new Error("JENAI_ANALYZER_PROVIDER=local needs JENAI_ANALYZER_BASE_URL and JENAI_ANALYZER_MODEL");
+    }
     if (police && !isOnOwnNetwork(baseUrl)) throw new Error("The police edition keeps WhatsApp replies on its own network: JENAI_ANALYZER_BASE_URL must be this server or a private address");
-    return new LocalCaseReader(model, baseUrl, env.JENAI_ANALYZER_API_KEY ?? null, Number(env.JENAI_ANALYZER_TIMEOUT_MS ?? 180_000));
+    // A reply is short; one the AI cannot read in time is kept as written rather than left waiting.
+    return new LocalCaseReader(model, baseUrl, env.JENAI_ANALYZER_API_KEY ?? null, Number(env.JENAI_READER_TIMEOUT_MS ?? 180_000));
   }
   if (police) throw new Error("The police edition keeps WhatsApp replies on this server: use JENAI_ANALYZER_PROVIDER=local");
   return new BedrockCaseReader();

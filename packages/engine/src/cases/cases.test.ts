@@ -9,9 +9,9 @@ import { eq } from "drizzle-orm";
 import { agents, calls, caseCalls, caseEvidence, caseMessages, cases, organizations, platformDb, whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { scamKeyFromText } from "../scams";
-import { caseFromCall, fieldsFromCall, followUpCalls, handleInbound, parseRead, remindPending, type CaseReader, type ReadResult } from "./cases";
+import { ResilientReader, caseFromCall, fieldsFromCall, followUpCalls, handleInbound, parseRead, remindPending, type CaseReader, type ReadResult } from "./cases";
 import { missingFor, questionFor, reminderText } from "./catalog";
-import { processInbox, queueInbound } from "./inbox";
+import { INBOX_MAX_ATTEMPTS, processInbox, queueInbound, retryInbox } from "./inbox";
 import { SimulatedWhatsApp, parseOpenWaWebhook, validSignature, type QueuedMessage } from "./whatsapp";
 import { createHmac } from "node:crypto";
 
@@ -282,6 +282,21 @@ describe("each call is followed once", () => {
     await withTenant(tenant, (tx) => tx.update(whatsappChannels).set({ formUrl: null }));
   });
 
+  it("answers plain replies at once without the AI: half a bank answer gets the hint, the other half completes it", async () => {
+    const wa = new SimulatedWhatsApp();
+    const who = "+919800000051";
+    await at(who, { complaint_type: "UPI fraud", money_lost: "5000", complainant_name: "Kavita Joshi", father_or_husband_name: "F: Mohan Joshi", date_of_birth: "1990-01-01", house_number: "12", present_address: "Rajpur Road, Dehradun", police_station: "Rajpur", district: "Dehradun", pincode: "248001" }, wa);
+    expect(wa.sent.at(-1)!.body).toContain("9. Which bank");
+    const say = (text: string) => handleInbound(tenant, { from: who, id: randomUUID(), at: new Date(), text }, new ResilientReader(null), wa);
+    await say("Hdfc");
+    expect(wa.sent.at(-1)!.body).toContain("both the bank name and the account number");
+    expect(wa.sent.at(-1)!.body).toContain("9. Which bank");
+    await say("50100123456789");
+    const [c] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.complainantE164, who)));
+    expect(c!.fields.victim_bank_and_account).toBe("HDFC; 50100123456789");
+    expect(wa.sent.at(-1)!.body).toContain("11. Send the UTR");
+  });
+
   it("does not message about a call read long after it happened", async () => {
     const wa = new SimulatedWhatsApp();
     const c = await at("+919800000034", { complaint_type: "loan app harassment", how_it_happened: "Loan app threats" }, wa, { message: false });
@@ -398,17 +413,35 @@ describe("WhatsApp through OpenWA", () => {
     expect(await processInbox(tenant, reader, wa)).toEqual({ handled: 0, failed: 0 });
   });
 
-  it("keeps a message it could not read, and retries it", async () => {
+  it("keeps a message it could not read, tries again after a widening gap, and keeps that person's later messages behind it", async () => {
     const wa = new SimulatedWhatsApp();
-    const broken: CaseReader = { read: async () => { throw new Error("model is not running"); } };
-    const m: QueuedMessage = { id: `wa-${randomUUID()}`, chatId: "919800000004@c.us", from: "+919800000004", lid: null, at: new Date().toISOString(), text: "hello" };
-    await queueInbound(tenant, m);
+    const broken: CaseReader = { read: async () => { throw new Error("database went away"); } };
+    const msg = (who: string, text: string): QueuedMessage => ({ id: `wa-${randomUUID()}`, chatId: `${who.slice(1)}@c.us`, from: who, lid: null, at: new Date().toISOString(), text });
+    const first = msg("+919800000004", "hello");
+    await queueInbound(tenant, first);
     expect(await processInbox(tenant, broken, wa)).toEqual({ handled: 0, failed: 1 });
-    const [row] = await withTenant(tenant, (tx) => tx.select().from(whatsappInbox).where(eq(whatsappInbox.externalId, m.id)));
+    const [row] = await withTenant(tenant, (tx) => tx.select().from(whatsappInbox).where(eq(whatsappInbox.externalId, first.id)));
     expect(row!.processedAt).toBeNull();
     expect(row!.attempts).toBe(1);
-    expect(row!.lastError).toMatch(/model is not running/);
+    expect(row!.lastError).toMatch(/database went away/);
+    // Not tried again at once; the same person's next message waits behind it, someone else's does not.
+    await queueInbound(tenant, msg("+919800000004", "second"));
+    const other = msg("+919800000014", "namaste");
+    await queueInbound(tenant, other);
     expect(await processInbox(tenant, new ScriptedReader({}), wa)).toEqual({ handled: 1, failed: 0 });
+    expect(wa.sent.map((s) => s.to)).toEqual(["+919800000014"]);
+    // 15 seconds on, both of the first person's messages are read, in order.
+    await withTenant(tenant, (tx) => tx.update(whatsappInbox).set({ receivedAt: new Date(Date.now() - 20_000) }).where(eq(whatsappInbox.externalId, first.id)));
+    expect(await processInbox(tenant, new ScriptedReader({}), wa)).toEqual({ handled: 2, failed: 0 });
+  });
+
+  it("puts the messages that could not be read back for another try", async () => {
+    const m: QueuedMessage = { id: `wa-${randomUUID()}`, chatId: "919800000024@c.us", from: "+919800000024", lid: null, at: new Date().toISOString(), text: "hello" };
+    await queueInbound(tenant, m);
+    await withTenant(tenant, (tx) => tx.update(whatsappInbox).set({ attempts: INBOX_MAX_ATTEMPTS, lastError: "gave up" }).where(eq(whatsappInbox.externalId, m.id)));
+    expect(await processInbox(tenant, new ScriptedReader({}), new SimulatedWhatsApp())).toEqual({ handled: 0, failed: 0 });
+    expect(await retryInbox(tenant)).toBe(1);
+    expect(await processInbox(tenant, new ScriptedReader({}), new SimulatedWhatsApp())).toEqual({ handled: 1, failed: 0 });
   });
 
   it("stores a photo that arrived inside the webhook without asking the gateway again", async () => {

@@ -86,6 +86,23 @@ const TICK_MS = 3000;
 let stopping = false;
 // Bedrock by default; JENAI_ANALYZER_PROVIDER=local keeps transcripts on this server.
 const extractor = ANALYZE ? extractorFromEnv() : null;
+const LOCAL_AI = (process.env.JENAI_ANALYZER_PROVIDER ?? (POLICE ? "local" : "bedrock")).toLowerCase() !== "bedrock";
+
+/**
+ * An AI on this server reads one thing at a time. A WhatsApp reply that needs it goes
+ * first: reading a call (minutes without a graphics card) is stopped and done again after,
+ * so the complainant is answered at once.
+ */
+const ai = { replies: 0, call: null as AbortController | null };
+async function aiTurn<T>(read: () => Promise<T>): Promise<T> {
+  ai.replies++;
+  ai.call?.abort();
+  try {
+    return await read();
+  } finally {
+    ai.replies--;
+  }
+}
 
 const log = (event: string, data: Record<string, unknown> = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), event, ...data }));
 
@@ -142,7 +159,9 @@ async function analyzeLoop() {
     try {
       for (const t of await connectedTenants()) {
         if (stopping) break;
-        const a = await analyzeCalls(t.id, extractor!, { limit: 10 });
+        while (ai.replies > 0 && !stopping) await new Promise((r) => setTimeout(r, 2_000)); // a WhatsApp reply is using the AI
+        ai.call = new AbortController();
+        const a = await analyzeCalls(t.id, extractor!, { limit: 10, signal: ai.call.signal }).finally(() => (ai.call = null));
         if (a.analyzed || a.failed) log("analyze.tenant", { tenant: t.id.slice(0, 8), ...a });
         if (a.analyzed) progressed = true;
       }
@@ -157,12 +176,16 @@ async function analyzeLoop() {
 async function whatsappLoop() {
   let reader: ReturnType<typeof caseReaderFromEnv>;
   try {
-    reader = caseReaderFromEnv();
+    reader = caseReaderFromEnv(process.env, {
+      ...(LOCAL_AI ? { aiTurn } : {}),
+      onAiError: (e) => log("whatsapp.ai_unavailable", { message: e.message.slice(0, 200) }),
+    });
   } catch (e) {
-    // No model to read replies with (e.g. a police server without its local AI yet): messages stay queued.
+    // A reader set up wrongly (a cloud model on a police server): messages stay queued.
     log("whatsapp.no_reader", { message: (e as Error).message });
     return;
   }
+  log("whatsapp.reader", { ai: reader.ai ? (LOCAL_AI ? "on this server" : "cloud") : "none: plain answers only" });
   let lastReminders = 0;
   while (!stopping) {
     let progressed = false;

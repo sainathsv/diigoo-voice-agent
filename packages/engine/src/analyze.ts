@@ -47,7 +47,8 @@ export interface ProgramAsk {
 
 export interface Extractor {
   readonly model: string;
-  extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }): Promise<unknown>;
+  /** `signal` stops a read part-way (the worker does, to let a WhatsApp reply use the AI first). */
+  extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }, signal?: AbortSignal): Promise<unknown>;
 }
 
 const PLACEHOLDER = /\b(DD|MM|YYYY|Mon|HH)\b|<[^>]+>|\{\{/;
@@ -123,13 +124,14 @@ export class BedrockExtractor implements Extractor {
   constructor(readonly model = process.env.JENAI_ANALYZER_MODEL ?? "deepseek.v3.2", region = process.env.JENAI_ANALYZER_REGION ?? "ap-south-1") {
     this.client = new BedrockRuntimeClient({ region });
   }
-  async extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }) {
+  async extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }, signal?: AbortSignal) {
     const r = await this.client.send(
       new ConverseCommand({
         modelId: this.model,
         messages: [{ role: "user", content: [{ text: prompt(input) }] }],
         inferenceConfig: { maxTokens: input.program ? 900 : 600, temperature: 0 },
       }),
+      signal ? { abortSignal: signal } : {},
     );
     return (r.output?.message?.content ?? []).map((c) => ("text" in c ? c.text : "")).join("");
   }
@@ -148,7 +150,7 @@ export class LocalModelExtractor implements Extractor {
     private readonly timeoutMs = 180_000,
     private readonly fetchImpl: typeof fetch = fetch,
   ) {}
-  async extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }) {
+  async extract(input: { transcript: string; startedAt: Date; domain: string; direction: "inbound" | "outbound"; program?: ProgramAsk | null }, signal?: AbortSignal) {
     const r = await this.fetchImpl(`${this.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}) },
@@ -160,7 +162,7 @@ export class LocalModelExtractor implements Extractor {
         response_format: { type: "json_object" },
       }),
       // A local model on modest hardware can take a while; a stuck one must not hold the worker.
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(this.timeoutMs), signal]) : AbortSignal.timeout(this.timeoutMs),
     });
     const j = (await r.json().catch(() => ({}))) as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } | string };
     if (!r.ok) throw new Error(`Local model refused (${r.status}): ${typeof j.error === "string" ? j.error : (j.error?.message ?? "no detail")}`);
@@ -219,8 +221,11 @@ function cleanProgramFields(raw: unknown, p: ProgramAsk): Record<string, string>
   return out;
 }
 
-/** Analyse finished calls that have a transcript and have not been analysed yet. */
-export async function analyzeCalls(tenantId: string, extractor: Extractor, opts: { limit?: number; whatsapp?: WhatsAppSender } = {}): Promise<AnalyzeStats> {
+/**
+ * Analyse finished calls that have a transcript and have not been analysed yet. `signal`
+ * stops the batch: the call being read is left for the next round.
+ */
+export async function analyzeCalls(tenantId: string, extractor: Extractor, opts: { limit?: number; whatsapp?: WhatsAppSender; signal?: AbortSignal } = {}): Promise<AnalyzeStats> {
   const stats: AnalyzeStats = { analyzed: 0, leads: 0, optOuts: 0, failed: 0 };
   const todo = await withTenant(tenantId, (tx) =>
     tx
@@ -233,6 +238,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
   );
   const programs = new Map<string, ProgramAsk | null>();
   for (const { c, domain } of todo) {
+    if (opts.signal?.aborted) break;
     try {
       let program: ProgramAsk | null = null;
       if (c.agentId) {
@@ -251,7 +257,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
         }
         program = programs.get(CY_POLICE_PROGRAM) ?? null;
       }
-      const raw = await extractor.extract({ transcript: c.transcript!, startedAt: c.startedAt, domain: domain ?? "clinic", direction: c.direction, program });
+      const raw = await extractor.extract({ transcript: c.transcript!, startedAt: c.startedAt, domain: domain ?? "clinic", direction: c.direction, program }, opts.signal);
       const x = cleanExtraction(raw);
       const extra = program ? cleanProgramFields(raw, program) : {};
       await withTenant(tenantId, async (tx) => {
@@ -313,6 +319,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
       });
       stats.analyzed++;
     } catch {
+      if (opts.signal?.aborted) break; // stopped, not failed: read again next round
       stats.failed++;
     }
   }

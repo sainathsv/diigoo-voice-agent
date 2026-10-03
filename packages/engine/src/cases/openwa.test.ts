@@ -105,10 +105,13 @@ describe("OpenWA gateway client", () => {
 describe("reading WhatsApp replies", () => {
   it("uses the model on this server, and never one off its own network in the police edition", () => {
     const local = { JENAI_ANALYZER_PROVIDER: "local", JENAI_ANALYZER_BASE_URL: "http://127.0.0.1:11434/v1", JENAI_ANALYZER_MODEL: "jenai-analyzer" };
-    expect(caseReaderFromEnv(local)).toBeInstanceOf(LocalCaseReader);
-    expect(caseReaderFromEnv({ ...local, JENAI_EDITION: "police" })).toBeInstanceOf(LocalCaseReader);
+    expect(caseReaderFromEnv(local).ai).toBeInstanceOf(LocalCaseReader);
+    expect(caseReaderFromEnv({ ...local, JENAI_EDITION: "police" }).ai).toBeInstanceOf(LocalCaseReader);
     expect(() => caseReaderFromEnv({ ...local, JENAI_EDITION: "police", JENAI_ANALYZER_BASE_URL: "https://api.openai.com/v1" })).toThrow(/own network/);
     expect(() => caseReaderFromEnv({ JENAI_EDITION: "police", JENAI_ANALYZER_PROVIDER: "bedrock" })).toThrow(/police edition/);
-    expect(caseReaderFromEnv({})).toBeInstanceOf(BedrockCaseReader);
+    expect(caseReaderFromEnv({}).ai).toBeInstanceOf(BedrockCaseReader);
+    // A police server without an AI of its own still reads the plain answers.
+    expect(caseReaderFromEnv({ JENAI_EDITION: "police" }).ai).toBeNull();
+    expect(() => caseReaderFromEnv({ JENAI_EDITION: "police", JENAI_ANALYZER_PROVIDER: "local" })).toThrow(/needs JENAI_ANALYZER_BASE_URL/);
   });
 });

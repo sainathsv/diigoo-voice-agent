@@ -3,7 +3,7 @@ import { holdsAnywhere } from "@jenai/authz";
 import { AutoRefresh, ConfirmButton, SubmitButton } from "@/components/client";
 import { Flash, PageHead, Section, fmtDate } from "@/components/ui";
 import { requireWorkspace } from "@/server/access";
-import { linkWhatsapp, saveFormLink, unlinkWhatsapp } from "@/server/actions/cases";
+import { linkWhatsapp, retryWhatsappInbox, saveFormLink, unlinkWhatsapp } from "@/server/actions/cases";
 import { loadWhatsappLink } from "@/server/queries/cases";
 import { deny } from "@/server/security-log";
 
@@ -79,9 +79,17 @@ export default async function WhatsappPage({ params, searchParams }: { params: P
               </div>
               <div className="text-[12.5px] text-grey">
                 Messages waiting to be read: {w.queue.waiting}
-                {w.queue.stuck ? <span className="text-bad"> · {w.queue.stuck} could not be read after 5 tries (check that the local AI is running)</span> : null}
+                {w.queue.retrying ? <span> · {w.queue.retrying} being tried again</span> : null}
+                {w.queue.stuck ? <span className="text-bad"> · {w.queue.stuck} could not be read</span> : null}
                 {w.channel?.updatedAt ? <> · last change {fmtDate(w.channel.updatedAt)}</> : null}
+                {w.queue.lastError && (w.queue.stuck || w.queue.retrying) ? <div className={w.queue.stuck ? "mt-1 text-bad" : "mt-1"}>Reason: {w.queue.lastError}</div> : null}
               </div>
+              {w.queue.stuck ? (
+                <form action={retryWhatsappInbox}>
+                  <input type="hidden" name="slug" value={slug} />
+                  <SubmitButton className="btn" pendingText="Queuing">Read them again</SubmitButton>
+                </form>
+              ) : null}
             </>
           )}
         </div>

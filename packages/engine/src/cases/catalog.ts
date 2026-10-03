@@ -37,6 +37,7 @@ export const FRAUDSTER_KEYS = ["fraudster_mobile", "fraudster_whatsapp", "suspec
 
 /** Items a complainant may honestly not know; "not known" then counts as an answer. */
 const MAY_BE_UNKNOWN = new Set(["house_number", "police_station", "pincode", "card_last4", "fraudster_details"]);
+export const mayBeUnknown = (key: string) => MAY_BE_UNKNOWN.has(key);
 
 export const FIELD_LABELS: Record<string, string> = {
   how_it_happened: "How the fraud happened",
