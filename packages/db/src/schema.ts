@@ -1150,6 +1150,13 @@ export const cases = pgTable(
 );
 export type Case = typeof cases.$inferSelect;
 
+/** The voice engine's token for the complaint status lookup at the start of a call (0022); only its hash. */
+export const voiceStatusTokens = pgTable("voice_status_tokens", {
+  tenantId: uuid("tenant_id").primaryKey(),
+  tokenSha256: text("token_sha256").notNull(),
+  createdAt: ts("created_at").notNull().defaultNow(),
+});
+
 /** Which case each call opened or added to (0021): WhatsApp follows a call once. */
 export const caseCalls = pgTable(
   "case_calls",

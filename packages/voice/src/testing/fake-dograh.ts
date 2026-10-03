@@ -17,6 +17,9 @@ interface Wf {
   published: DograhDefinition;
   draft: DograhDefinition | null;
   tcv: Record<string, unknown>;
+  /** Call settings of the published version, and of the draft while there is one. */
+  configs: Record<string, unknown>;
+  draftConfigs: Record<string, unknown> | null;
   versions: Array<{ id: number; version_number: number; status: string; created_at: string; published_at: string | null; workflow_json: DograhDefinition }>;
 }
 
@@ -30,6 +33,8 @@ export interface FakeDograh {
   /** When true, transcript and recording downloads are refused (403), like a locked media store. */
   refuseArtifacts: boolean;
   triggered: Array<{ uuid: string; body: unknown }>;
+  /** Stored secrets, as the engine keeps them (tokens included, for assertions). */
+  credentials: Array<{ uuid: string; name: string; credential_type: string; credential_data: Record<string, unknown> }>;
   requests: string[];
   /** What a caller dialling in hears: the published start prompt. */
   inboundHears(id: number): string;
@@ -61,6 +66,7 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
   const failRuns = new Set<number>();
   const state = { refuseArtifacts: false };
   const triggered: FakeDograh["triggered"] = [];
+  const credentials: FakeDograh["credentials"] = [];
   const requests: string[] = [];
   let versionSeq = 100;
   let runSeq = 5000;
@@ -94,19 +100,31 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
       if (req.method === "GET" && (m = p.match(/^\/workflow\/fetch\/(\d+)$/))) {
         const w = workflows.get(Number(m[1]));
         if (!w) return send(404, { detail: "not found" });
-        return send(200, { id: w.id, name: w.name, workflow_uuid: w.uuid, workflow_definition: clone(w.draft ?? w.published), template_context_variables: w.tcv, version_status: w.draft ? "draft" : "published" });
+        return send(200, {
+          id: w.id,
+          name: w.name,
+          workflow_uuid: w.uuid,
+          workflow_definition: clone(w.draft ?? w.published),
+          template_context_variables: w.tcv,
+          workflow_configurations: clone(w.draftConfigs ?? w.configs),
+          version_status: w.draft ? "draft" : "published",
+        });
       }
       if (req.method === "POST" && (m = p.match(/^\/workflow\/(\d+)\/create-draft$/))) {
         const w = workflows.get(Number(m[1]))!;
         if (w.draft) return send(400, { detail: "Draft already exists" });
         w.draft = clone(w.published);
+        w.draftConfigs = clone(w.configs);
         return send(200, { ok: true });
       }
       if (req.method === "PUT" && (m = p.match(/^\/workflow\/(\d+)$/))) {
         const w = workflows.get(Number(m[1]))!;
-        const b = (await body(req)) as { workflow_definition: DograhDefinition; template_context_variables?: Record<string, unknown> };
+        const b = (await body(req)) as { workflow_definition: DograhDefinition; template_context_variables?: Record<string, unknown>; workflow_configurations?: Record<string, unknown> };
+        const max = Number(b.workflow_configurations?.max_call_duration ?? 1);
+        if (!(max > 0 && max <= 1200)) return send(422, { detail: "max_call_duration must be between 1 and 1200" });
         w.draft = clone(b.workflow_definition);
         w.tcv = b.template_context_variables ?? w.tcv;
+        if (b.workflow_configurations) w.draftConfigs = clone(b.workflow_configurations);
         return send(200, { ok: true });
       }
       if (req.method === "POST" && (m = p.match(/^\/workflow\/(\d+)\/publish$/))) {
@@ -116,6 +134,8 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
         for (const v of w.versions) if (v.status === "published") v.status = "archived";
         w.published = w.draft;
         w.draft = null;
+        w.configs = w.draftConfigs ?? w.configs;
+        w.draftConfigs = null;
         w.versions.unshift({ id: ++versionSeq, version_number: w.versions.length + 1, status: "published", created_at: new Date().toISOString(), published_at: new Date().toISOString(), workflow_json: clone(w.published) });
         return send(200, { ok: true });
       }
@@ -134,6 +154,18 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
       if (req.method === "GET" && (m = p.match(/^\/workflow\/(\d+)\/runs\/(\d+)$/))) {
         const r = (runs.get(Number(m[1])) ?? []).find((x) => x.id === Number(m![2]));
         return r ? send(200, r) : send(404, { detail: "not found" });
+      }
+      if (req.method === "GET" && p === "/credentials/") return send(200, credentials.map(({ credential_data: _, ...c }) => c));
+      const cred = req.method === "PUT" ? p.match(/^\/credentials\/([^/]+)$/) : null;
+      if ((req.method === "POST" && p === "/credentials/") || cred) {
+        const b = (await body(req)) as { name: string; credential_type: string; credential_data: Record<string, unknown> };
+        const found = cred ? credentials.find((c) => c.uuid === decodeURIComponent(cred[1]!)) : undefined;
+        if (cred && !found) return send(404, { detail: "not found" });
+        if (!cred && credentials.some((c) => c.name === b.name)) return send(400, { detail: "unique_org_credential_name" });
+        const c = found ?? { uuid: `cred-${credentials.length + 1}`, name: b.name, credential_type: b.credential_type, credential_data: {} };
+        Object.assign(c, { name: b.name, credential_type: b.credential_type, credential_data: b.credential_data });
+        if (!found) credentials.push(c);
+        return send(200, { uuid: c.uuid, name: c.name, credential_type: c.credential_type });
       }
       if (req.method === "GET" && p === "/organizations/telephony-configs")
         return send(200, { configurations: [{ id: 3, name: "Vobiz", provider: "vobiz", is_default_outbound: true, phone_number_count: 1 }] });
@@ -166,6 +198,7 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
       state.refuseArtifacts = v;
     },
     triggered,
+    credentials,
     requests,
     inboundHears: (id) => String(workflows.get(id)!.published.nodes.find((n) => n.type === "startCall")!.data!.prompt),
     close: () => new Promise((r) => server.close(() => r())),
@@ -181,6 +214,8 @@ export function addWorkflow(f: FakeDograh, id: number, name: string, prompt: str
     published: def,
     draft: null,
     tcv: {},
+    configs: {},
+    draftConfigs: null,
     versions: [{ id: id * 10, version_number: 1, status: "published", created_at: new Date().toISOString(), published_at: new Date().toISOString(), workflow_json: clone(def) }],
   });
 }

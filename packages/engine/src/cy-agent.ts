@@ -14,12 +14,13 @@ export interface CyProgram {
   extraction: Array<{ name: string; type: string; prompt: string }>;
 }
 
+// The department's instruction (2026-10-03): the call never promises that an officer will call back.
 const VALUES: Record<string, string> = {
   department_name: "Uttarakhand Cyber Crime Police Department",
   freeze_step: "Please stay on the line. I am taking this as an urgent money complaint so our team can act to hold the money straight away.",
-  evidence_channel: "the officer who calls them back will collect them",
-  handover_wording: "I am marking this as urgent for an officer, who will call you back on this number right away.",
-  next_step_wording: "An officer of the Uttarakhand Cyber Crime Police Department will call you back on this number.",
+  evidence_channel: "keep them safe, the police will need them",
+  handover_wording: "I am marking your complaint as most urgent for the officers.",
+  next_step_wording: "Your complaint has been registered, and the Uttarakhand Cyber Crime Police Department will work on it.",
 };
 // The department's instruction: the greeting names the helpline and the recording, without the AI line.
 const GREETING =
@@ -36,18 +37,35 @@ export function cyAgentParts(p: CyProgram) {
   const prompt = r.inboundPrompt.trimEnd();
   const left = prompt.match(/\{\{[a-z_]+\}\}/g);
   if (left) throw new Error(`The program leaves blanks unfilled: ${left.join(", ")}`);
-  const endPrompt = `The complaint is complete. In the caller's language, thank them, tell them: ${VALUES.next_step_wording} Then say goodbye politely and end the call. Do not ask any more questions.`;
+  const endPrompt = `The call is over. In the caller's language say ONLY a short goodbye, in one sentence ("धन्यवाद, नमस्ते।" / "Thank you, goodbye."). Only if you had not yet told them what happens next, first say it in one sentence: with WhatsApp, that the helpline is sending them a message on WhatsApp now and the complaint continues there; without WhatsApp: ${VALUES.next_step_wording} Never say that anyone will call them back. Do not ask anything.`;
   // Saved on the Start step too: a caller who hangs up mid-complaint still leaves what they said.
   const extraction = { extraction_enabled: true, extraction_prompt: EXTRACTION_PROMPT, extraction_variables: p.extraction };
   return { prompt, endPrompt, extraction };
 }
 
-/** The workflow with only its start and end steps' prompts and saved fields replaced. */
+/** When the agent moves to the End step, which hangs up once its goodbye is said. */
+const END_WHEN =
+  "END THE CALL NOW: right after you have told them what happens on WhatsApp (STEP 5); after the closing for a caller without WhatsApp; after the status of a complaint already registered when they have nothing new (STEP 0); after telling them it is not a cyber crime; when the caller is silent, abusive, playing a prank or still not making a complaint after you asked twice; or when the caller says goodbye. Do not wait for the caller to reply first.";
+
+/**
+ * The line must stay free for the next caller (people block helplines by staying on the
+ * line): every call is cut at 10 minutes, and a caller silent for 10 seconds is asked once
+ * whether they are there, then the call ends.
+ */
+export const CY_CALL_SETTINGS = { max_call_duration: 600, max_user_idle_timeout: 10 };
+
+type Edge = { source?: string; target?: string; data?: Record<string, unknown>; [k: string]: unknown };
+
+/** The workflow with only its start and end steps' prompts, saved fields and the rule for ending the call replaced. */
 export function withCyConversation(def: DograhDefinition, parts: ReturnType<typeof cyAgentParts>): DograhDefinition {
   const starts = def.nodes.filter((n) => n.type === "startCall");
   if (starts.length !== 1) throw new Error(`Expected one Start step in the agent, found ${starts.length}; it was not changed.`);
+  const ends = new Set(def.nodes.filter((n) => n.type === "endCall").map((n) => n.id));
+  const edges = (def.edges as Edge[]).map((e) => (e.source === starts[0]!.id && ends.has(e.target) ? { ...e, data: { ...(e.data ?? {}), condition: END_WHEN } } : e));
+  if (!edges.some((e) => e.data?.condition === END_WHEN)) throw new Error("Expected a step from Start to End in the agent; it was not changed.");
   return {
     ...def,
+    edges,
     nodes: def.nodes.map((n) =>
       n.type === "startCall"
         ? { ...n, data: { ...(n.data ?? {}), prompt: parts.prompt, ...parts.extraction } }
@@ -59,19 +77,45 @@ export function withCyConversation(def: DograhDefinition, parts: ReturnType<type
 }
 
 /**
- * Puts a definition live on the workflow: a draft, then publish, then a read back to
- * confirm. Returns what was live before, for the backup file.
+ * As a call comes in, the engine asks this server for the status of a complaint from the
+ * number calling (its pre-call lookup), with the token kept as a credential; the script
+ * reads it as {{complaint_status}}. Null leaves the Start step as it is.
  */
-export async function publishDefinition(client: DograhClient, workflowId: number, next: (current: DograhDefinition) => DograhDefinition) {
+export function withStatusLookup(def: DograhDefinition, lookup: { url: string; credentialUuid: string } | null): DograhDefinition {
+  if (!lookup) return def;
+  return {
+    ...def,
+    nodes: def.nodes.map((n) =>
+      n.type === "startCall"
+        ? { ...n, data: { ...(n.data ?? {}), pre_call_fetch_mode: "inbound", pre_call_fetch_url: lookup.url, pre_call_fetch_credential_uuid: lookup.credentialUuid } }
+        : n,
+    ),
+  };
+}
+
+/**
+ * Puts a definition live on the workflow: a draft, then publish, then a read back to
+ * confirm. `settings` changes the call settings too (the call length and silence limits).
+ * Returns what was live before, for the backup file.
+ */
+export async function publishDefinition(
+  client: DograhClient,
+  workflowId: number,
+  next: (current: DograhDefinition) => DograhDefinition,
+  settings?: (current: Record<string, unknown>) => Record<string, unknown>,
+) {
   const wf = await client.getWorkflow(workflowId);
   const before = structuredClone(wf);
   const definition = next(wf.workflow_definition);
+  const configurations = settings ? settings(wf.workflow_configurations ?? {}) : null;
   await client.createDraft(workflowId);
-  await client.putWorkflow({ id: workflowId, name: wf.name, workflow_definition: definition, template_context_variables: wf.template_context_variables ?? {} });
+  await client.putWorkflow({ id: workflowId, name: wf.name, workflow_definition: definition, template_context_variables: wf.template_context_variables ?? {}, ...(configurations ? { workflow_configurations: configurations } : {}) });
   await client.publish(workflowId);
   const after = await client.getWorkflow(workflowId);
   const live = after.workflow_definition.nodes.find((n) => n.type === "startCall")?.data?.prompt;
   const wanted = definition.nodes.find((n) => n.type === "startCall")?.data?.prompt;
   if (live !== wanted) throw new Error("The engine did not keep the new conversation; check the agent in the Dograh dashboard.");
+  if (configurations && after.workflow_configurations?.max_call_duration !== configurations.max_call_duration)
+    throw new Error("The engine did not keep the call settings; check the agent in the Dograh dashboard.");
   return { before, name: wf.name };
 }

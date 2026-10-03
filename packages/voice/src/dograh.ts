@@ -25,8 +25,16 @@ export interface DograhWorkflow {
   workflow_uuid?: string | null;
   workflow_definition: DograhDefinition;
   template_context_variables?: Record<string, unknown> | null;
+  /** Call settings: max_call_duration (seconds), max_user_idle_timeout (seconds) and more. */
+  workflow_configurations?: Record<string, unknown> | null;
   version_number?: number | null;
   version_status?: string | null;
+}
+/** A secret the engine keeps and sends on outgoing requests (a pre-call lookup, a webhook), never shown again. */
+export interface DograhCredential {
+  uuid: string;
+  name: string;
+  credential_type: string;
 }
 export interface DograhWorkflowListItem {
   id: number;
@@ -168,13 +176,28 @@ export class DograhClient {
   listVersions(id: number, limit = 5) {
     return this.call<DograhVersion[]>("GET", `/workflow/${id}/versions?limit=${limit}`, `versions of workflow ${id}`);
   }
-  /** Writes the DRAFT only. Inbound calls keep using the published version until publish(). */
-  putWorkflow(wf: Pick<DograhWorkflow, "id" | "name" | "workflow_definition" | "template_context_variables">) {
+  /**
+   * Writes the DRAFT only. Inbound calls keep using the published version until publish().
+   * Call settings are replaced only when workflow_configurations is given.
+   */
+  putWorkflow(wf: Pick<DograhWorkflow, "id" | "name" | "workflow_definition" | "template_context_variables" | "workflow_configurations">) {
     return this.call<unknown>("PUT", `/workflow/${wf.id}`, `save draft of workflow ${wf.id}`, {
       name: wf.name,
       workflow_definition: wf.workflow_definition,
       template_context_variables: wf.template_context_variables ?? {},
+      ...(wf.workflow_configurations ? { workflow_configurations: wf.workflow_configurations } : {}),
     });
+  }
+  listCredentials() {
+    return this.call<DograhCredential[]>("GET", "/credentials/", "list credentials");
+  }
+  /** Stores a bearer token under a name (created, or replaced when the name exists). */
+  async saveBearerCredential(name: string, token: string, description: string): Promise<DograhCredential> {
+    const body = { name, description, credential_type: "bearer_token", credential_data: { token } };
+    const existing = (await this.listCredentials()).find((c) => c.name === name);
+    return existing
+      ? this.call<DograhCredential>("PUT", `/credentials/${encodeURIComponent(existing.uuid)}`, `update credential ${name}`, body)
+      : this.call<DograhCredential>("POST", "/credentials/", `create credential ${name}`, body);
   }
   /** Forks the published definition into a draft. Resolves false when a draft already exists. */
   async createDraft(id: number): Promise<boolean> {
