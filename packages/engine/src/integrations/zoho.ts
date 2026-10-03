@@ -1,4 +1,4 @@
-import { assertClientUrl } from "@jenai/voice";
+import { assertClientUrl, toE164 } from "@jenai/voice";
 import { applyMapping, retryable, type Connector, type ConnectorContext, type OutEvent, type SendResult } from "./types";
 
 /**
@@ -96,9 +96,62 @@ function callTimes(p: Record<string, unknown>): { start: string; duration: strin
  * How a Call points at its record. Zoho's Who_Id is always a Contact; a Lead,
  * or any other module, goes in What_Id with $se_module naming the module.
  */
-function linkTo(ctx: ConnectorContext, id: string): Record<string, string> {
-  const module = moduleOf(ctx);
+function linkTo(module: string, id: string): Record<string, string> {
   return module === "Contacts" ? { Who_Id: id } : { What_Id: id, $se_module: module };
+}
+
+/**
+ * Zoho keeps people in two modules, and both have a Phone and a Mobile field.
+ * A Lead that is converted becomes a Contact, and a clinic's own patients
+ * (the ones called back for a reminder or a recall) are usually Contacts.
+ */
+const PEOPLE = ["Leads", "Contacts"];
+
+/**
+ * Where to look for a caller, in order: the module set on the connection (the
+ * one they chose), then Leads, then Contacts. Zoho's search leaves converted
+ * Leads out, so a converted caller is only found in Contacts. Only modules
+ * their admin let us read: a search anywhere else is a 401, which would switch
+ * the whole connection off.
+ */
+function lookIn(ctx: ConnectorContext): string[] {
+  return [...new Set([moduleOf(ctx), ...PEOPLE])].filter((m) => may(ctx, m, "READ"));
+}
+
+/**
+ * The module a record we already know is in, as remembered with its id. An id
+ * their own system handed us does not say (its link reads "record"), and that
+ * one is in the connection's module, as it always was.
+ */
+function moduleOfRecord(ctx: ConnectorContext, e: OutEvent): string {
+  const t = e.externalType;
+  return t && [moduleOf(ctx), ...PEOPLE].includes(t) ? t : moduleOf(ctx);
+}
+
+/**
+ * The ways a front desk may have saved this number: with +91, or as the bare
+ * ten digits. Zoho does not document how its phone search compares numbers,
+ * so each form is asked for.
+ */
+function numberForms(phone: string): string[] {
+  const e164 = toE164(phone) ?? phone;
+  const local = /^\+91(\d{10})$/.exec(e164)?.[1];
+  return local ? [e164, local] : [e164];
+}
+
+/**
+ * The searches for one module, in the order they are tried. The phone search
+ * looks at every phone field; the criteria search is an exact match on Mobile
+ * or Phone, for a number the phone search does not read the way it was saved. Only Leads and
+ * Contacts are known to have both fields. A number holds none of the
+ * characters Zoho asks to be escaped in criteria, and the value is encoded.
+ */
+function searches(module: string, forms: string[]): string[] {
+  const at = `/crm/v2/${module}/search`;
+  return [
+    ...forms.map((n) => `${at}?phone=${encodeURIComponent(n)}`),
+    ...(PEOPLE.includes(module) ? forms.map((n) => `${at}?criteria=${encodeURIComponent(`((Mobile:equals:${n})or(Phone:equals:${n}))`)}`) : []),
+  ];
 }
 
 interface Token {
@@ -164,31 +217,48 @@ async function call(ctx: ConnectorContext, path: string, init: RequestInit = {},
   return { status: res.status, json, text };
 }
 
+/** A record of theirs and the module it is in. */
+interface Found {
+  id: string;
+  module: string;
+}
+
 /**
  * A refusal from Zoho, in the queue's terms. A 401 is our grant (a dead token,
  * a scope their admin did not give) and fails for every record alike. Anything
  * else is about this record.
  */
-function refused(r: { status: number; text: string }, id?: string, progress?: Record<string, string>): SendResult {
-  return { ok: false, httpStatus: r.status, response: r.text, retry: retryable(r.status), connectionBroken: r.status === 401, externalId: id, progress };
+function refused(r: { status: number; text: string }, at?: Found, progress?: Record<string, string>): SendResult {
+  return { ok: false, httpStatus: r.status, response: r.text, retry: retryable(r.status), connectionBroken: r.status === 401, externalId: at?.id, externalType: at?.module, progress };
 }
 
 /** The id Zoho gave a record it just created, from {data: [{details: {id}}]}. */
 const createdId = (r: { json: Record<string, unknown> }) => ((r.json.data as Array<{ details?: { id?: string } }> | undefined) ?? [])[0]?.details?.id;
 
 /**
- * Their record for this person: the one we linked before, else a phone search.
- * A refused search is passed back as it is: read as "no match", a missing
- * search scope would put every caller on the not-in-Zoho list.
+ * Their record for this person: the one we linked before, else the first
+ * match in lookIn's order. A refused search is passed back as it is: read as
+ * "no match", a missing search scope would put every caller on the
+ * not-in-Zoho list.
  */
-async function findRecord(ctx: ConnectorContext, e: OutEvent): Promise<{ id: string | null } | { refused: SendResult }> {
-  if (e.externalId) return { id: e.externalId };
+async function findRecord(ctx: ConnectorContext, e: OutEvent): Promise<{ found: Found | null } | { refused: SendResult }> {
+  if (e.externalId) return { found: { id: e.externalId, module: moduleOfRecord(ctx, e) } };
   const phone = String((e.payload.person as Record<string, unknown> | undefined)?.phone ?? "");
-  if (!phone) return { id: null };
-  const r = await call(ctx, `/crm/v2/${moduleOf(ctx)}/search?phone=${encodeURIComponent(phone)}`);
-  if (r.status >= 400) return { refused: refused(r) };
-  const data = (r.json.data as Array<{ id?: string }> | undefined) ?? [];
-  return { id: data[0]?.id ?? null };
+  if (!phone) return { found: null };
+  const modules = lookIn(ctx);
+  if (!modules.length) {
+    const needed = [...new Set([moduleOf(ctx), ...PEOPLE])].map((m) => scopeFor(m, "READ")).join(" or ");
+    return { refused: { ok: false, retry: false, connectionBroken: true, response: `Zoho was not granted ${needed}, so no caller can be found` } };
+  }
+  for (const module of modules) {
+    for (const path of searches(module, numberForms(phone))) {
+      const r = await call(ctx, path);
+      if (r.status >= 400) return { refused: refused(r) };
+      const id = ((r.json.data as Array<{ id?: string }> | undefined) ?? [])[0]?.id;
+      if (id) return { found: { id, module } };
+    }
+  }
+  return { found: null };
 }
 
 interface Writeup {
@@ -250,7 +320,13 @@ function writes(ctx: ConnectorContext): string {
   if (calls) yes.push("each call as a Call record");
   if (notes) yes.push(calls ? "a note for each booking and opt-out" : "a note for each call, booking and opt-out");
   else no.push(calls ? "notes for bookings and opt-outs" : "anything about calls, bookings or opt-outs");
-  if (Object.keys(ctx.integration.mapping?.fields ?? {}).length) (may(ctx, module, "UPDATE") ? yes : no).push(`the mapped ${module} fields`);
+  if (Object.keys(ctx.integration.mapping?.fields ?? {}).length) {
+    // Written on whichever module the caller was found in.
+    const can = lookIn(ctx).filter((m) => may(ctx, m, "UPDATE"));
+    const cannot = lookIn(ctx).filter((m) => !may(ctx, m, "UPDATE"));
+    if (can.length) yes.push(`the mapped fields on ${can.join(" and ")} records`);
+    if (cannot.length) no.push(`the mapped fields on ${cannot.join(" and ")} records`);
+  }
   if (ctx.integration.config.createIfMissing) (may(ctx, module, "CREATE") ? yes : no).push(`a new ${module} record for a caller not in Zoho`);
   return [yes.length ? `Writing ${yes.join(", ")}.` : "", no.length ? `Not granted, so not written: ${no.join(", ")}.` : ""].filter(Boolean).join(" ");
 }
@@ -264,7 +340,9 @@ export const zohoConnector: Connector = {
       // the test on that would say "not connected" about a working connection.
       const r = await call(ctx, `/crm/v2/${moduleOf(ctx)}?per_page=1`);
       if (r.status === 200 || r.status === 204) {
-        return { ok: true, message: `Connected to Zoho CRM (${dcOf(ctx)}). Reading ${moduleOf(ctx)}. ${writes(ctx)}` };
+        const where = lookIn(ctx);
+        const finding = where.length ? `Finding callers in ${where.join(", then ")}.` : "Not granted to read Leads or Contacts, so no caller can be found.";
+        return { ok: true, message: `Connected to Zoho CRM (${dcOf(ctx)}). ${finding} ${writes(ctx)}` };
       }
       return { ok: false, message: `Zoho answered ${r.status}: ${r.text.slice(0, 160)}` };
     } catch (e) {
@@ -275,36 +353,45 @@ export const zohoConnector: Connector = {
   async send(ctx, e): Promise<SendResult> {
     // What earlier tries already wrote, plus what this one writes.
     const done: Record<string, string> = { ...(e.progress ?? {}) };
+    // The record once found, kept on a failed try so the retry does not search again.
+    let at: Found | undefined;
     try {
       const say = writeup(e);
       // Only the fields they mapped. Without a mapping applyMapping hands back
       // the whole event, and that is not something to PUT on their record.
       const mapping = ctx.integration.mapping?.fields;
       const mapped = mapping && Object.keys(mapping).length ? applyMapping(e.payload, mapping) : {};
-      // And only with the update scope: without it Zoho answers 401, which
-      // would switch the whole connection off over fields it was never given.
-      const fields = may(ctx, moduleOf(ctx), "UPDATE") ? mapped : {};
-      const unwritten = Object.keys(mapped).length && !Object.keys(fields).length ? `; mapped fields left alone, Zoho was not granted ${scopeFor(moduleOf(ctx), "UPDATE")}` : "";
       // Skipped rather than done: nothing reached Zoho, so it says nothing about the connection.
-      if (!say && !Object.keys(fields).length) return { ok: false, retry: false, response: `Nothing to write in Zoho for ${e.kind}${unwritten}` };
+      if (!say && !Object.keys(mapped).length) return { ok: false, retry: false, response: `Nothing to write in Zoho for ${e.kind}` };
 
-      const found = await findRecord(ctx, e);
-      if ("refused" in found) return found.refused;
-      const id = found.id;
-      if (!id) {
+      const looked = await findRecord(ctx, e);
+      if ("refused" in looked) return looked.refused;
+      if (!looked.found) {
         // Their CRM decides who exists. We do not create records unless asked to.
-        if (!ctx.integration.config.createIfMissing) return { ok: false, response: "No matching record in Zoho for this number", retry: false };
-        if (!may(ctx, moduleOf(ctx), "CREATE")) {
-          return { ok: false, response: `No matching ${moduleOf(ctx)} record, and Zoho was not granted permission to create one`, retry: false };
+        if (!ctx.integration.config.createIfMissing) {
+          return { ok: false, response: `No matching record in Zoho for this number (looked in ${lookIn(ctx).join(" and ")})`, retry: false };
         }
-        const created = await call(ctx, `/crm/v2/${moduleOf(ctx)}`, {
+        const module = moduleOf(ctx);
+        if (!may(ctx, module, "CREATE")) {
+          return { ok: false, response: `No matching record in ${lookIn(ctx).join(" or ")}, and Zoho was not granted permission to create one in ${module}`, retry: false };
+        }
+        const created = await call(ctx, `/crm/v2/${module}`, {
           method: "POST",
           body: JSON.stringify({ data: [{ Last_Name: String((e.payload.person as Record<string, unknown>)?.name ?? "Unknown"), Phone: String((e.payload.person as Record<string, unknown>)?.phone ?? ""), Lead_Source: "JENAI call" }] }),
         });
         const newId = createdId(created);
         if (!newId) return refused(created);
-        return this.send(ctx, { ...e, externalId: newId });
+        return this.send(ctx, { ...e, externalId: newId, externalType: module });
       }
+      at = looked.found;
+      const { id, module } = at;
+
+      // And only with the update scope on the module the record is in: without
+      // it Zoho answers 401, which would switch the whole connection off over
+      // fields it was never given.
+      const fields = may(ctx, module, "UPDATE") ? mapped : {};
+      const unwritten = Object.keys(mapped).length && !Object.keys(fields).length ? `; mapped fields left alone, Zoho was not granted ${scopeFor(module, "UPDATE")}` : "";
+      if (!say && !Object.keys(fields).length) return { ok: false, retry: false, externalId: id, externalType: module, response: `Nothing to write in Zoho for ${e.kind}${unwritten}` };
 
       // How it gets recorded, in order of what the client granted. A Call
       // record is the better home for a call: it lands in their activity
@@ -327,10 +414,10 @@ export const zohoConnector: Connector = {
             Call_Duration: t.duration,
             Call_Status: "Completed",
             Description: say.content,
-            ...linkTo(ctx, id),
+            ...linkTo(module, id),
           }] }),
         });
-        if (r.status >= 400) return refused(r, id, done);
+        if (r.status >= 400) return refused(r, at, done);
         // No id back would be odd, but the call is in Zoho all the same.
         done.Calls = createdId(r) ?? "logged";
         wrote = "call logged";
@@ -338,9 +425,9 @@ export const zohoConnector: Connector = {
       } else if (say && may(ctx, "notes", "CREATE")) {
         const r = await call(ctx, `/crm/v2/Notes`, {
           method: "POST",
-          body: JSON.stringify({ data: [{ Note_Title: say.title, Note_Content: say.content, Parent_Id: id, se_module: moduleOf(ctx) }] }),
+          body: JSON.stringify({ data: [{ Note_Title: say.title, Note_Content: say.content, Parent_Id: id, se_module: module }] }),
         });
-        if (r.status >= 400) return refused(r, id, done);
+        if (r.status >= 400) return refused(r, at, done);
         done.Notes = createdId(r) ?? "logged";
         wrote = "note added";
         status = r.status;
@@ -348,13 +435,13 @@ export const zohoConnector: Connector = {
 
       // Fields the client chose to keep in step (for example Lead Status from the outcome).
       if (Object.keys(fields).length) {
-        const upd = await call(ctx, `/crm/v2/${moduleOf(ctx)}/${id}`, { method: "PUT", body: JSON.stringify({ data: [fields] }) });
-        if (upd.status >= 400) return refused(upd, id, done);
+        const upd = await call(ctx, `/crm/v2/${module}/${id}`, { method: "PUT", body: JSON.stringify({ data: [fields] }) });
+        if (upd.status >= 400) return refused(upd, at, done);
       }
-      return { ok: true, httpStatus: status, externalId: id, progress: done, response: `${wrote} on ${moduleOf(ctx)} ${id}${unwritten}` };
+      return { ok: true, httpStatus: status, externalId: id, externalType: module, progress: done, response: `${wrote} on ${module} ${id}${unwritten}` };
     } catch (err) {
       const gone = err instanceof GrantGoneError;
-      return { ok: false, response: (err as Error).message.slice(0, 300), retry: !gone, connectionBroken: gone, progress: done };
+      return { ok: false, response: (err as Error).message.slice(0, 300), retry: !gone, connectionBroken: gone, externalId: at?.id, externalType: at?.module, progress: done };
     }
   },
 };

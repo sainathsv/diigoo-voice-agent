@@ -68,7 +68,7 @@ export async function enqueueEvent(tx: Tx, tenantId: string, input: EnqueueInput
       input.externalId || !ours
         ? []
         : await tx
-            .select({ externalId: externalLinks.externalId })
+            .select({ externalId: externalLinks.externalId, externalType: externalLinks.externalType })
             .from(externalLinks)
             .where(and(eq(externalLinks.integrationId, i.id), eq(externalLinks.ourType, ours.type), eq(externalLinks.ourId, ours.id)));
     const key = `${input.idempotencyKey ?? `${input.kind}:${input.refId}`}:${i.id}`;
@@ -82,6 +82,8 @@ export async function enqueueEvent(tx: Tx, tenantId: string, input: EnqueueInput
         refType: input.refType,
         refId: input.refId,
         externalId: input.externalId ?? linked?.externalId ?? null,
+        // An id their system handed us does not say which kind of record it is.
+        externalType: input.externalId ? null : (linked?.externalType ?? null),
         idempotencyKey: key,
         payload: input.payload,
       })
@@ -161,21 +163,25 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
           .where(eq(integrations.id, i.id));
       },
     };
-    const out: OutEvent = { id: e.id, kind: e.kind, idempotencyKey: e.idempotencyKey, externalId: e.externalId, payload: e.payload, progress: e.progress };
+    const out: OutEvent = { id: e.id, kind: e.kind, idempotencyKey: e.idempotencyKey, externalId: e.externalId, externalType: e.externalType, payload: e.payload, progress: e.progress };
     const r = await connector.send(ctx, out);
+    // The record and its kind are kept together: an id the connector hands
+    // back brings its own kind (or none), never the kind of the one before.
+    const record = r.externalId ? { externalId: r.externalId, externalType: r.externalType ?? null } : { externalId: e.externalId, externalType: e.externalType };
 
     if (r.ok) {
       await tx
         .update(integrationEvents)
-        .set({ status: "done", httpStatus: r.httpStatus ?? null, response: (r.response ?? "").slice(0, 1000), externalId: r.externalId ?? e.externalId, progress: r.progress ?? e.progress, error: null, updatedAt: new Date() })
+        .set({ status: "done", httpStatus: r.httpStatus ?? null, response: (r.response ?? "").slice(0, 1000), ...record, progress: r.progress ?? e.progress, error: null, updatedAt: new Date() })
         .where(eq(integrationEvents.id, e.id));
       await tx.update(integrations).set({ status: "connected", lastOkAt: new Date(), lastError: null, updatedAt: new Date() }).where(eq(integrations.id, i.id));
-      // Remember which of their records this person is, so the next call lands in the same place.
+      // Remember which of their records this person is, and in which module,
+      // so the next call lands in the same place without a search.
       const contactId = payloadContactId({ kind: e.kind, refType: e.refType ?? "", refId: e.refId ?? "", payload: e.payload });
       if (r.externalId && contactId) {
         await tx
           .insert(externalLinks)
-          .values({ tenantId: ref.tenantId, integrationId: i.id, ourType: "contact", ourId: contactId, externalType: String(i.config.module ?? "record"), externalId: r.externalId })
+          .values({ tenantId: ref.tenantId, integrationId: i.id, ourType: "contact", ourId: contactId, externalType: r.externalType ?? String(i.config.module ?? "record"), externalId: r.externalId })
           .onConflictDoNothing();
       }
       return { ok: true, status: "done", message: r.response ?? "" };
@@ -190,7 +196,7 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
         .update(integrationEvents)
         .set({
           status: "skipped",
-          externalId: r.externalId ?? e.externalId,
+          ...record,
           progress: r.progress ?? e.progress,
           httpStatus: r.httpStatus ?? null,
           response: (r.response ?? "").slice(0, 1000),
@@ -211,7 +217,7 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
       .set({
         status: give_up ? "failed" : "queued",
         nextAttemptAt: new Date(Date.now() + wait),
-        externalId: r.externalId ?? e.externalId,
+        ...record,
         progress: r.progress ?? e.progress,
         httpStatus: r.httpStatus ?? null,
         response: (r.response ?? "").slice(0, 1000),

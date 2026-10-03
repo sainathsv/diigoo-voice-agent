@@ -980,6 +980,8 @@ export const integrationEvents = pgTable(
     refType: text("ref_type"),
     refId: text("ref_id"),
     externalId: text("external_id"),
+    /** Which kind of their record externalId is, such as Zoho's Leads or Contacts (migration 0024). */
+    externalType: text("external_type"),
     idempotencyKey: text("idempotency_key").notNull(),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
     /** What already landed in their system (migration 0023), so a retry does not write it twice. */

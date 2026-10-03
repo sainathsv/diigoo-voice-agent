@@ -417,16 +417,22 @@ describe("logging calls on their Zoho records", () => {
   const SCOPES = ["leads.READ", "leads.UPDATE", "contacts.READ", "contacts.UPDATE", "calls.CREATE", "notes.CREATE"].map((s) => `ZohoCRM.modules.${s}`).concat("ZohoCRM.settings.fields.READ");
   let zohoId = "";
   const asked: string[] = [];
+  // Each search, as "Module what=value", in the order asked.
+  const searched: string[] = [];
   // What each request carried, for the ones whose body matters.
   const sent: Array<{ req: string; body: Record<string, unknown> }> = [];
-  // Stands in for Zoho, answering by method and path with the bodies Zoho documents.
-  let zoho: (req: string, token: string) => { status: number; body?: unknown } = () => ({ status: 500 });
+  // Stands in for Zoho, answering by method and path (and the query, for a search) with the bodies Zoho documents.
+  let zoho: (req: string, token: string, query: string) => { status: number; body?: unknown } = () => ({ status: 500 });
   const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const req = `${init?.method ?? "GET"} ${new URL(String(input)).pathname}`;
+    const url = new URL(String(input));
+    const req = `${init?.method ?? "GET"} ${url.pathname}`;
     asked.push(req);
+    // Decoded the way Zoho reads it: a "+" sent unencoded would come back as a space.
+    const query = [...url.searchParams].map(([k, v]) => `${k}=${v}`).join("&");
+    if (url.pathname.endsWith("/search")) searched.push(`${url.pathname.split("/")[3]} ${query}`);
     if (typeof init?.body === "string") sent.push({ req, body: (JSON.parse(init.body) as { data: Array<Record<string, unknown>> }).data[0]! });
     const token = String((init?.headers as Record<string, string> | undefined)?.Authorization ?? "").replace("Zoho-oauthtoken ", "");
-    const r = zoho(req, token);
+    const r = zoho(req, token, query);
     return new Response(r.body === undefined ? null : JSON.stringify(r.body), { status: r.status, headers: { "Content-Type": "application/json" } });
   }) as typeof fetch;
   const added = (id: string) => ({ status: 201, body: { data: [{ code: "SUCCESS", details: { id }, message: "record added", status: "success" }] } });
@@ -444,9 +450,20 @@ describe("logging calls on their Zoho records", () => {
 
   /** One event on its way to Zoho, with an access token cached the way the worker leaves it. */
   async function readyToSend(
-    opts: { externalId?: string; token?: string; kind?: string; payload?: Record<string, unknown>; module?: string; mapping?: Record<string, string>; scopes?: string[]; config?: Record<string, unknown> } = {},
+    opts: {
+      externalId?: string;
+      externalType?: string;
+      token?: string;
+      kind?: string;
+      payload?: Record<string, unknown>;
+      module?: string;
+      mapping?: Record<string, string>;
+      scopes?: string[];
+      config?: Record<string, unknown>;
+    } = {},
   ) {
     asked.length = 0;
+    searched.length = 0;
     sent.length = 0;
     return withTenant(tenant, async (tx) => {
       const credentials = { client_id: "cid", client_secret: "secret", refresh_token: "refresh", access_token: opts.token ?? "cached", access_token_until: String(Date.now() + 3_600_000) };
@@ -469,6 +486,7 @@ describe("logging calls on their Zoho records", () => {
           refType: "call",
           refId: randomUUID(),
           externalId: opts.externalId ?? null,
+          externalType: opts.externalType ?? null,
           idempotencyKey: `zoho-${randomUUID()}`,
           status: "sending",
           attempts: 1,
@@ -483,10 +501,18 @@ describe("logging calls on their Zoho records", () => {
   const errorOf = async (id: string) => (await eventRow(id)).error;
 
   it("skips a caller who is not in Zoho, and keeps logging everyone else", async () => {
-    zoho = (req) => (req === "GET /crm/v2/Leads/search" ? { status: 204 } : { status: 500 });
+    zoho = (req) => (req.endsWith("/search") ? { status: 204 } : { status: 500 });
     const ev = await readyToSend();
     expect((await send(ev.id)).status).toBe("skipped");
-    expect(await errorOf(ev.id)).toMatch(/No matching record in Zoho/); // the front desk's list of people to add
+    expect(await errorOf(ev.id)).toMatch(/No matching record in Zoho for this number \(looked in Leads and Contacts\)/); // the front desk's list of people to add
+    // Every way the number may have been saved, in Leads and then in Contacts.
+    const ways = (m: string) => [
+      `${m} phone=+919800000777`,
+      `${m} phone=9800000777`,
+      `${m} criteria=((Mobile:equals:+919800000777)or(Phone:equals:+919800000777))`,
+      `${m} criteria=((Mobile:equals:9800000777)or(Phone:equals:9800000777))`,
+    ];
+    expect(searched).toEqual([...ways("Leads"), ...ways("Contacts")]);
     expect(await integrationStatus(zohoId)).toBe("connected");
     expect((await withTenant(tenant, (tx) => subscribers(tx, "call.completed"))).map((s) => s.id)).toContain(zohoId);
   });
@@ -633,12 +659,104 @@ describe("logging calls on their Zoho records", () => {
     expect(asked.filter((a) => a === "GET /crm/v2/Leads/search")).toHaveLength(1);
   });
 
+  it("finds a caller kept in Contacts, logs the call on that Contact, and goes straight there next time", async () => {
+    const person = { contact_id: randomUUID(), name: "Meena", phone: "+919800000781" };
+    let calls = 0;
+    zoho = (req, _token, query) => {
+      // Not in Leads in any form; in Contacts, saved as the bare ten digits.
+      if (req === "GET /crm/v2/Contacts/search" && query === "phone=9800000781") return { status: 200, body: { data: [{ id: "ZOHO-CONTACT-21" }] } };
+      if (req.endsWith("/search")) return { status: 204 };
+      if (req === "POST /crm/v2/Calls") return ++calls === 1 ? { status: 500 } : added(`CALL-21-${calls}`);
+      if (req === "PUT /crm/v2/Contacts/ZOHO-CONTACT-21") return updated("ZOHO-CONTACT-21");
+      return { status: 500 };
+    };
+    const ev = await readyToSend({ payload: { ...aCall(), person } });
+    expect((await send(ev.id)).status).toBe("queued"); // Zoho failed on the Call itself
+    expect(searched).toEqual([
+      "Leads phone=+919800000781",
+      "Leads phone=9800000781",
+      "Leads criteria=((Mobile:equals:+919800000781)or(Phone:equals:+919800000781))",
+      "Leads criteria=((Mobile:equals:9800000781)or(Phone:equals:9800000781))",
+      "Contacts phone=+919800000781",
+      "Contacts phone=9800000781",
+    ]);
+    expect(await eventRow(ev.id)).toMatchObject({ externalId: "ZOHO-CONTACT-21", externalType: "Contacts" });
+
+    // The retry writes on the Contact it found, without searching again.
+    expect((await send(ev.id)).status).toBe("done");
+    expect(searched).toHaveLength(6);
+    const call = bodyOf("POST /crm/v2/Calls")!;
+    expect(call).toMatchObject({ Who_Id: "ZOHO-CONTACT-21" });
+    expect(call).not.toHaveProperty("What_Id");
+    expect(asked).toContain("PUT /crm/v2/Contacts/ZOHO-CONTACT-21");
+    const [link] = await withTenant(tenant, (tx) => tx.select().from(externalLinks).where(and(eq(externalLinks.integrationId, zohoId), eq(externalLinks.ourId, person.contact_id))));
+    expect(link).toMatchObject({ externalType: "Contacts", externalId: "ZOHO-CONTACT-21" });
+
+    // Their next call is queued with the Contact, and logged there with no search.
+    const refId = randomUUID();
+    await withTenant(tenant, (tx) => enqueueEvent(tx, tenant, { kind: "call.completed", refType: "call", refId, payload: { ...aCall(), person } }));
+    const [next] = await withTenant(tenant, (tx) => tx.select().from(integrationEvents).where(and(eq(integrationEvents.integrationId, zohoId), eq(integrationEvents.refId, refId))));
+    expect(next).toMatchObject({ externalId: "ZOHO-CONTACT-21", externalType: "Contacts" });
+    asked.length = 0;
+    searched.length = 0;
+    sent.length = 0;
+    expect((await send(next!.id)).status).toBe("done");
+    expect(searched).toEqual([]);
+    expect(bodyOf("POST /crm/v2/Calls")).toMatchObject({ Who_Id: "ZOHO-CONTACT-21" });
+    expect(asked).toEqual(["POST /crm/v2/Calls", "PUT /crm/v2/Contacts/ZOHO-CONTACT-21"]);
+  });
+
+  it("finds a number only an exact match on Mobile or Phone finds, with the + kept", async () => {
+    const exact = "criteria=((Mobile:equals:+919800000777)or(Phone:equals:+919800000777))";
+    zoho = (req, _token, query) =>
+      req === "GET /crm/v2/Leads/search"
+        ? query === exact ? { status: 200, body: { data: [{ id: "ZOHO-LEAD-22" }] } } : { status: 204 }
+        : req === "POST /crm/v2/Calls" ? added("CALL-22") : req.startsWith("PUT ") ? updated("ZOHO-LEAD-22") : { status: 500 };
+    const ev = await readyToSend();
+    expect((await send(ev.id)).status).toBe("done");
+    expect(searched).toEqual(["Leads phone=+919800000777", "Leads phone=9800000777", `Leads ${exact}`]);
+    expect(bodyOf("POST /crm/v2/Calls")).toMatchObject({ What_Id: "ZOHO-LEAD-22", $se_module: "Leads" });
+    expect(await eventRow(ev.id)).toMatchObject({ externalId: "ZOHO-LEAD-22", externalType: "Leads" });
+  });
+
+  it("searches only the modules their admin let it read", async () => {
+    zoho = (req) => (req.endsWith("/search") ? { status: 204 } : { status: 500 });
+    let ev = await readyToSend({ scopes: SCOPES.filter((s) => !s.includes(".contacts.")) });
+    expect((await send(ev.id)).status).toBe("skipped");
+    expect(searched).toHaveLength(4);
+    expect(searched.every((q) => q.startsWith("Leads "))).toBe(true); // a Contacts search would be a 401
+    expect(await errorOf(ev.id)).toMatch(/looked in Leads\)/);
+    expect(await integrationStatus(zohoId)).toBe("connected");
+
+    // Nothing it may read: nobody can be found, which is the connection's problem, not this caller's.
+    ev = await readyToSend({ scopes: ["ZohoCRM.modules.calls.CREATE", "ZohoCRM.modules.notes.CREATE"] });
+    const r = await send(ev.id);
+    expect(r.status).toBe("failed");
+    expect(r.message).toMatch(/not granted ZohoCRM\.modules\.leads\.READ or ZohoCRM\.modules\.contacts\.READ/);
+    expect(asked).toEqual([]);
+    expect(await integrationStatus(zohoId)).toBe("error");
+  });
+
+  it("writes a remembered record in the module remembered with it", async () => {
+    zoho = (req) => (req === "POST /crm/v2/Calls" ? added("CALL-23") : req.startsWith("PUT ") ? updated("REC") : { status: 500 });
+    let ev = await readyToSend({ externalId: "ZOHO-CONTACT-23", externalType: "Contacts" });
+    expect((await send(ev.id)).status).toBe("done");
+    expect(bodyOf("POST /crm/v2/Calls")).toMatchObject({ Who_Id: "ZOHO-CONTACT-23" });
+    expect(asked).toEqual(["POST /crm/v2/Calls", "PUT /crm/v2/Contacts/ZOHO-CONTACT-23"]);
+
+    // An id their own system handed us does not say: it is in the connection's module, as before.
+    ev = await readyToSend({ externalId: "ZOHO-LEAD-23", externalType: "record" });
+    expect((await send(ev.id)).status).toBe("done");
+    expect(bodyOf("POST /crm/v2/Calls")).toMatchObject({ What_Id: "ZOHO-LEAD-23", $se_module: "Leads" });
+    expect(asked).toEqual(["POST /crm/v2/Calls", "PUT /crm/v2/Leads/ZOHO-LEAD-23"]);
+  });
+
   it("does not create a Lead for a new caller when their admin did not grant it", async () => {
-    zoho = (req) => (req === "GET /crm/v2/Leads/search" ? { status: 204 } : { status: 500 });
+    zoho = (req) => (req.endsWith("/search") ? { status: 204 } : { status: 500 });
     const ev = await readyToSend({ config: { createIfMissing: true } });
     expect((await send(ev.id)).status).toBe("skipped");
-    expect(await errorOf(ev.id)).toMatch(/not granted permission to create/);
-    expect(asked).toEqual(["GET /crm/v2/Leads/search"]); // never a POST Zoho would refuse
+    expect(await errorOf(ev.id)).toMatch(/not granted permission to create one in Leads/);
+    expect(asked.every((a) => a.endsWith("/search"))).toBe(true); // never a POST Zoho would refuse
     expect(await integrationStatus(zohoId)).toBe("connected");
   });
 
@@ -678,11 +796,11 @@ describe("logging calls on their Zoho records", () => {
     let r = await tested({ scopes: SCOPES, createIfMissing: true });
     expect(r.ok).toBe(true);
     expect(r.message).toBe(
-      "Connected to Zoho CRM (in). Reading Leads. Writing each call as a Call record, a note for each booking and opt-out, the mapped Leads fields. Not granted, so not written: a new Leads record for a caller not in Zoho.",
+      "Connected to Zoho CRM (in). Finding callers in Leads, then Contacts. Writing each call as a Call record, a note for each booking and opt-out, the mapped fields on Leads and Contacts records. Not granted, so not written: a new Leads record for a caller not in Zoho.",
     );
 
     r = await tested({ scopes: ["ZohoCRM.modules.leads.READ", "ZohoCRM.modules.notes.CREATE"] });
-    expect(r.message).toMatch(/Writing a note for each call, booking and opt-out\. Not granted, so not written: the mapped Leads fields\.$/);
+    expect(r.message).toMatch(/Finding callers in Leads\. Writing a note for each call, booking and opt-out\. Not granted, so not written: the mapped fields on Leads records\.$/);
 
     // An older connection, or one Zoho did not list scopes for: not claimed either way.
     r = await tested({});

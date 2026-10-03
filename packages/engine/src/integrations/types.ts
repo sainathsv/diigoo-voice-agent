@@ -20,6 +20,11 @@ export interface OutEvent {
   idempotencyKey: string;
   /** Their record this is about, when we know it. */
   externalId: string | null;
+  /**
+   * Which kind of record externalId is, for a system that keeps people in more
+   * than one place (Zoho's Leads and Contacts). Null when not known.
+   */
+  externalType?: string | null;
   payload: Record<string, unknown>;
   /**
    * What an earlier try already wrote in their system, as the connector named
@@ -34,6 +39,8 @@ export interface SendResult {
   httpStatus?: number;
   /** Their record id, when the connector created or found one. */
   externalId?: string;
+  /** Which kind of record that is (Zoho's Leads or Contacts), kept beside the id. */
+  externalType?: string;
   response?: string;
   /**
    * false for a permanent refusal: stop retrying. On its own that refusal is
