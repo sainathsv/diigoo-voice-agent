@@ -1,8 +1,8 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { externalLinks, integrationEvents, integrations, openSecret, sealSecret, withTenant, type Db, type Integration, type Tx } from "@jenai/db";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { externalLinks, integrationEvents, integrations, leads, openSecret, sealSecret, withTenant, type Db, type Integration, type Tx } from "@jenai/db";
 import { webhookConnector, restConnector } from "./http";
 import { zohoConnector } from "./zoho";
-import { sharedWith, type Connector, type ConnectorContext, type OutEvent } from "./types";
+import { sharedWith, type Connector, type ConnectorContext, type OutEvent, type Withheld } from "./types";
 
 /**
  * Write-backs to the client's own system: queued in the database, delivered by
@@ -38,13 +38,16 @@ export function sealCredentials(tenantId: string, creds: Record<string, string>)
   return sealSecret(tenantId, PURPOSE, JSON.stringify(creds));
 }
 
-/** Who wants this event: connected integrations that push out and subscribe to it. */
+/**
+ * Who wants this event: every integration that pushes out, subscribes to it,
+ * and would write something for it, whatever its health. One that is paused,
+ * broken or not yet tested gets the event queued all the same, and deliver()
+ * holds it until the connection works again: an opt-out said while their
+ * admin was re-granting a scope must still reach their CRM afterwards.
+ */
 export async function subscribers(tx: Tx, kind: string): Promise<Integration[]> {
-  const rows = await tx
-    .select()
-    .from(integrations)
-    .where(and(inArray(integrations.status, ["connected", "draft"]), inArray(integrations.direction, ["out", "both"])));
-  return rows.filter((i) => i.status === "connected" && (i.events.length === 0 || i.events.includes(kind)));
+  const rows = await tx.select().from(integrations).where(inArray(integrations.direction, ["out", "both"]));
+  return rows.filter((i) => (i.events.length === 0 || i.events.includes(kind)) && CONNECTORS[i.kind]?.wants?.(i, kind) !== false);
 }
 
 export interface EnqueueInput {
@@ -56,6 +59,8 @@ export interface EnqueueInput {
   externalId?: string | null;
   /** Same key twice = one delivery. Defaults to kind + our record id. */
   idempotencyKey?: string;
+  /** What this event holds back from a connection that has not chosen to have it (health detail). */
+  withheld?: Withheld;
 }
 
 /** Hands one event to every integration that wants it. Safe to call twice. */
@@ -86,7 +91,7 @@ export async function enqueueEvent(tx: Tx, tenantId: string, input: EnqueueInput
         externalType: input.externalId ? null : (linked?.externalType ?? null),
         idempotencyKey: key,
         // Stored as handed on, so the delivery log shows what they were given.
-        payload: sharedWith(i.config, input.payload),
+        payload: sharedWith(i.config, input.payload, input.withheld),
       })
       .onConflictDoNothing()
       .returning({ id: integrationEvents.id });
@@ -133,6 +138,87 @@ export interface DeliveryResult {
   message: string;
 }
 
+/**
+ * When an event for a connection that does not work (paused, broken, not yet
+ * tested) is next looked at: not until it works again, when releaseHeld puts
+ * it back. Far ahead rather than in an hour, so a connection left broken for
+ * weeks costs the worker nothing, however much waits for it.
+ */
+const heldUntil = () => new Date(Date.now() + 365 * 86_400_000);
+
+/** Puts the events a connection's trouble held back into the queue, now that it works. */
+export async function releaseHeld(tx: Tx, integrationId: string): Promise<number> {
+  const rows = await tx
+    .update(integrationEvents)
+    .set({ nextAttemptAt: new Date(), updatedAt: new Date() })
+    .where(and(eq(integrationEvents.integrationId, integrationId), eq(integrationEvents.status, "queued"), sql`${integrationEvents.nextAttemptAt} > now() + interval '30 days'`))
+    .returning({ id: integrationEvents.id });
+  return rows.length;
+}
+
+/** How a connector persists what it learns (a refreshed token, a refused scope) on its integration. */
+function saver(tx: Tx, tenantId: string, i: Integration): ConnectorContext["save"] {
+  return async (patch) => {
+    await tx
+      .update(integrations)
+      .set({
+        ...(patch.credentials ? { credentials: sealCredentials(tenantId, patch.credentials) } : {}),
+        ...(patch.config ? { config: { ...i.config, ...patch.config } } : {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(integrations.id, i.id));
+  };
+}
+
+/**
+ * Asks their system whether this connection works, and records the answer on
+ * it: connected, or error with the reason. Events held while it was not
+ * working go with the worker's next round.
+ */
+export async function testConnection(tx: Tx, tenantId: string, i: Integration, fetchImpl: typeof fetch = fetch): Promise<{ ok: boolean; message: string }> {
+  const connector = CONNECTORS[i.kind];
+  if (!connector) return { ok: false, message: "That kind of system is not ready yet." };
+  const res = await connector.test({ integration: i, credentials: credentialsOf(i), fetch: fetchImpl, save: saver(tx, tenantId, i) });
+  await tx
+    .update(integrations)
+    .set({ status: res.ok ? "connected" : "error", lastOkAt: res.ok ? new Date() : i.lastOkAt, lastError: res.ok ? null : res.message, lastErrorAt: res.ok ? i.lastErrorAt : new Date(), updatedAt: new Date() })
+    .where(eq(integrations.id, i.id));
+  if (res.ok) await releaseHeld(tx, i.id);
+  return res;
+}
+
+/**
+ * A lead's stage and follow-up date as they are now, not as they were when
+ * the event was queued. A retry hours later, or an older change delivered
+ * after a newer one, would otherwise write a stage that is no longer true
+ * over one that is.
+ */
+async function withCurrentLead(tx: Tx, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const lead = payload.lead as Record<string, unknown> | null | undefined;
+  if (!lead || typeof lead.id !== "string" || !UUID.test(lead.id)) return payload;
+  const [now] = await tx.select({ stage: leads.stage, followUp: leads.nextFollowUpAt }).from(leads).where(eq(leads.id, lead.id));
+  if (!now) return payload;
+  return { ...payload, lead: { ...lead, stage: now.stage, next_follow_up_at: now.followUp?.toISOString() ?? null } };
+}
+
+/**
+ * After this many deliveries in a row refused by their system, with nothing
+ * getting through, the connection is taken to be the problem: a field their
+ * admin made mandatory, a profile without the right, a mapping their CRM
+ * rejects. Each refusal alone reads like one record's.
+ */
+const REFUSED_IN_A_ROW = 20;
+
+async function refusedEveryTime(tx: Tx, integrationId: string): Promise<boolean> {
+  const last = await tx
+    .select({ status: integrationEvents.status, httpStatus: integrationEvents.httpStatus })
+    .from(integrationEvents)
+    .where(and(eq(integrationEvents.integrationId, integrationId), eq(integrationEvents.direction, "out"), inArray(integrationEvents.status, ["done", "skipped", "failed"])))
+    .orderBy(desc(integrationEvents.updatedAt))
+    .limit(REFUSED_IN_A_ROW);
+  return last.length === REFUSED_IN_A_ROW && last.every((x) => x.status === "skipped" && x.httpStatus !== null);
+}
+
 /** Delivers one claimed event and records what their system said. */
 export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: typeof fetch = fetch): Promise<DeliveryResult> {
   return withTenant(ref.tenantId, async (tx) => {
@@ -144,93 +230,100 @@ export async function deliver(ref: { tenantId: string; id: string }, fetchImpl: 
       await tx.update(integrationEvents).set({ status: "skipped", error: "The connection was removed", updatedAt: new Date() }).where(eq(integrationEvents.id, e.id));
       return { ok: false, status: "skipped", message: "connection removed" };
     }
-    if (i.status === "paused") {
-      await tx.update(integrationEvents).set({ status: "queued", nextAttemptAt: new Date(Date.now() + 3_600_000), updatedAt: new Date() }).where(eq(integrationEvents.id, e.id));
-      return { ok: false, status: "queued", message: "paused" };
+    if (i.status !== "connected") {
+      // The connection does not work (paused, broken, being reconnected): the
+      // event waits for it, and this does not count as a try.
+      await tx.update(integrationEvents).set({ status: "queued", attempts: Math.max(0, e.attempts - 1), nextAttemptAt: heldUntil(), updatedAt: new Date() }).where(eq(integrationEvents.id, e.id));
+      return { ok: false, status: "queued", message: `held: the connection is ${i.status}` };
     }
 
-    const ctx: ConnectorContext = {
-      integration: i,
-      credentials: credentialsOf(i),
-      fetch: fetchImpl,
-      async save(patch) {
-        await tx
-          .update(integrations)
-          .set({
-            ...(patch.credentials ? { credentials: sealCredentials(ref.tenantId, patch.credentials) } : {}),
-            ...(patch.config ? { config: { ...i.config, ...patch.config } } : {}),
-            updatedAt: new Date(),
-          })
-          .where(eq(integrations.id, i.id));
-      },
-    };
-    const out: OutEvent = { id: e.id, kind: e.kind, idempotencyKey: e.idempotencyKey, externalId: e.externalId, externalType: e.externalType, payload: e.payload, progress: e.progress };
+    // One person's events go to one connection one at a time. Two at once
+    // would each search, each find nothing, and each create the same person
+    // in their CRM. In turn, the second finds the record the first linked.
+    const contactId = payloadContactId({ kind: e.kind, refType: e.refType ?? "", refId: e.refId ?? "", payload: e.payload });
+    let linked: { externalId: string | null; externalType: string | null } = { externalId: e.externalId, externalType: e.externalType };
+    if (contactId) {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`${i.id}:${contactId}`}, 0))`);
+      if (!e.externalId) {
+        const [l] = await tx
+          .select({ externalId: externalLinks.externalId, externalType: externalLinks.externalType })
+          .from(externalLinks)
+          .where(and(eq(externalLinks.integrationId, i.id), eq(externalLinks.ourType, "contact"), eq(externalLinks.ourId, contactId)));
+        if (l) linked = l;
+      }
+    }
+    const payload = await withCurrentLead(tx, e.payload);
+
+    const ctx: ConnectorContext = { integration: i, credentials: credentialsOf(i), fetch: fetchImpl, save: saver(tx, ref.tenantId, i) };
+    const out: OutEvent = { id: e.id, kind: e.kind, idempotencyKey: e.idempotencyKey, ...linked, payload, progress: e.progress };
     const r = await connector.send(ctx, out);
     // The record and its kind are kept together: an id the connector hands
     // back brings its own kind (or none), never the kind of the one before.
-    const record = r.externalId ? { externalId: r.externalId, externalType: r.externalType ?? null } : { externalId: e.externalId, externalType: e.externalType };
+    // One gone from their system is let go, so the next try searches.
+    const record = r.externalId ? { externalId: r.externalId, externalType: r.externalType ?? null } : r.forget ? { externalId: null, externalType: null } : linked;
+    // Stored as sent, so the delivery log shows what they were given.
+    const kept = { ...record, payload, progress: r.progress ?? e.progress, httpStatus: r.httpStatus ?? null, response: (r.response ?? "").slice(0, 1000) };
+
+    // Which of their records this person is, and in which module, so the next
+    // call lands in the same place without a search. A record found or made
+    // now replaces the one before (a Lead converted to a Contact); one their
+    // system no longer has is let go.
+    const link = and(eq(externalLinks.integrationId, i.id), eq(externalLinks.ourType, "contact"), eq(externalLinks.ourId, contactId ?? ""));
+    if (contactId && (r.forget || (r.ok && r.externalId))) await tx.delete(externalLinks).where(link);
+    if (contactId && r.ok && r.externalId) {
+      // Left unlinked when their record is already another contact's: the next call searches.
+      await tx
+        .insert(externalLinks)
+        .values({ tenantId: ref.tenantId, integrationId: i.id, ourType: "contact", ourId: contactId, externalType: r.externalType ?? String(i.config.module ?? "record"), externalId: r.externalId })
+        .onConflictDoNothing();
+    }
 
     if (r.ok) {
-      await tx
-        .update(integrationEvents)
-        .set({ status: "done", httpStatus: r.httpStatus ?? null, response: (r.response ?? "").slice(0, 1000), ...record, progress: r.progress ?? e.progress, error: null, updatedAt: new Date() })
-        .where(eq(integrationEvents.id, e.id));
+      await tx.update(integrationEvents).set({ status: "done", ...kept, error: null, updatedAt: new Date() }).where(eq(integrationEvents.id, e.id));
       await tx.update(integrations).set({ status: "connected", lastOkAt: new Date(), lastError: null, updatedAt: new Date() }).where(eq(integrations.id, i.id));
-      // Remember which of their records this person is, and in which module,
-      // so the next call lands in the same place without a search.
-      const contactId = payloadContactId({ kind: e.kind, refType: e.refType ?? "", refId: e.refId ?? "", payload: e.payload });
-      if (r.externalId && contactId) {
-        await tx
-          .insert(externalLinks)
-          .values({ tenantId: ref.tenantId, integrationId: i.id, ourType: "contact", ourId: contactId, externalType: r.externalType ?? String(i.config.module ?? "record"), externalId: r.externalId })
-          .onConflictDoNothing();
-      }
       return { ok: true, status: "done", message: r.response ?? "" };
     }
 
     // A refusal about this one record (a caller who is not in their CRM, a
-    // stale id) must not stop the calls after it reaching their system. It is
-    // skipped with its reason, and those rows are the list of people to add on
-    // their side. The connection's status is left as it is.
+    // value it rejects) must not stop the calls after it reaching their
+    // system. It is skipped with its reason, and "Send again" puts it back
+    // once they have fixed it on their side. The reason also goes on the
+    // connection, where the client looks; it stays connected unless their
+    // system has refused everything for a while.
     if (r.retry === false && !r.connectionBroken) {
+      const reason = (r.response ?? "refused").slice(0, 500);
+      await tx.update(integrationEvents).set({ status: "skipped", ...kept, error: reason, updatedAt: new Date() }).where(eq(integrationEvents.id, e.id));
+      const stuck = r.httpStatus !== undefined && (await refusedEveryTime(tx, i.id));
       await tx
-        .update(integrationEvents)
+        .update(integrations)
         .set({
-          status: "skipped",
-          ...record,
-          progress: r.progress ?? e.progress,
-          httpStatus: r.httpStatus ?? null,
-          response: (r.response ?? "").slice(0, 1000),
-          error: (r.response ?? "refused").slice(0, 500),
+          ...(stuck ? { status: "error" as const } : {}),
+          lastError: (stuck ? `Their system refused the last ${REFUSED_IN_A_ROW} deliveries. The latest: ${reason}` : reason).slice(0, 300),
+          lastErrorAt: new Date(),
           updatedAt: new Date(),
         })
-        .where(eq(integrationEvents.id, e.id));
+        .where(eq(integrations.id, i.id));
       return { ok: false, status: "skipped", message: r.response ?? "" };
     }
 
-    // Only a refused connection, or a day of failed tries, marks it broken.
     // The record found and what already landed are kept, so the next try
     // carries on from there instead of writing the same call again.
-    const give_up = r.connectionBroken === true || e.attempts >= BACKOFF_MS.length;
+    const exhausted = e.attempts >= BACKOFF_MS.length;
+    const giveUp = r.connectionBroken === true || exhausted;
+    // A refused connection is broken. One event failing for a day is that
+    // event's problem while others still get through; only a day in which
+    // nothing at all got through says the same about the connection.
+    const broken = r.connectionBroken === true || (exhausted && (!i.lastOkAt || i.lastOkAt < e.createdAt));
     const wait = BACKOFF_MS[Math.min(e.attempts, BACKOFF_MS.length - 1)]!;
     await tx
       .update(integrationEvents)
-      .set({
-        status: give_up ? "failed" : "queued",
-        nextAttemptAt: new Date(Date.now() + wait),
-        ...record,
-        progress: r.progress ?? e.progress,
-        httpStatus: r.httpStatus ?? null,
-        response: (r.response ?? "").slice(0, 1000),
-        error: (r.response ?? "could not deliver").slice(0, 500),
-        updatedAt: new Date(),
-      })
+      .set({ status: giveUp ? "failed" : "queued", nextAttemptAt: new Date(Date.now() + wait), ...kept, error: (r.response ?? "could not deliver").slice(0, 500), updatedAt: new Date() })
       .where(eq(integrationEvents.id, e.id));
     await tx
       .update(integrations)
-      .set({ status: give_up ? "error" : i.status, lastError: (r.response ?? "could not deliver").slice(0, 300), lastErrorAt: new Date(), updatedAt: new Date() })
+      .set({ status: broken ? "error" : i.status, lastError: (r.response ?? "could not deliver").slice(0, 300), lastErrorAt: new Date(), updatedAt: new Date() })
       .where(eq(integrations.id, i.id));
-    return { ok: false, status: give_up ? "failed" : "queued", message: r.response ?? "" };
+    return { ok: false, status: giveUp ? "failed" : "queued", message: r.response ?? "" };
   });
 }
 

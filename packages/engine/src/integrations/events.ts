@@ -1,7 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { and, desc, eq, notInArray, or, sql } from "drizzle-orm";
 import { agents, calls, campaignTargets, clientPrograms, contacts, leads, organizations, programTemplates, type Call, type Tx } from "@jenai/db";
+import { verticalOf } from "../safety/cases";
 import { enqueueEvent } from "./queue";
+import type { Withheld } from "./types";
 
 /**
  * What JENAI hands back to the client's own system after a call. This shape is
@@ -50,6 +52,27 @@ async function attemptOf(tx: Tx, c: Call): Promise<number | null> {
   return t && t.runId === c.externalRunId && t.attemptNo > 0 ? t.attemptNo : null;
 }
 
+/**
+ * What a health call holds back from a system that has not chosen to have it
+ * (sharedWith): the model's summary, which retells the whole conversation,
+ * what they asked about, the recording, every answer, and the outcome, unless
+ * the program marks that answer or outcome shareable. An allow list, so a
+ * new program that forgets to mark its health questions still keeps them in.
+ * An outcome held back reads as the lead stage it means, which the lead says
+ * anyway. A call on no program has only the standard questions, and those
+ * are the health history.
+ */
+export function healthWithheld(
+  fields: Record<string, unknown>,
+  outcome: string | null,
+  program: { extraction: Array<{ name: string; shareable?: boolean }>; outcomes: Array<{ key: string; stage?: string; shareable?: boolean }> } | null,
+): Withheld {
+  const shareable = new Set((program?.extraction ?? []).filter((x) => x.shareable).map((x) => x.name));
+  const names = ["summary", "concern", "recording", ...Object.keys(fields).filter((k) => !shareable.has(k))];
+  const o = program?.outcomes.find((x) => x.key === outcome);
+  return o && !o.shareable ? { names: [...names, "outcome"], outcome: o.stage ?? null } : { names };
+}
+
 /** Builds the call payload and queues it for every connected system. */
 export async function emitCallCompleted(tx: Tx, tenantId: string, callId: string): Promise<number> {
   const [row] = await tx
@@ -60,10 +83,10 @@ export async function emitCallCompleted(tx: Tx, tenantId: string, callId: string
     .where(eq(calls.id, callId));
   if (!row) return 0;
   const { c, agent, contact } = row;
-  const [org] = await tx.select({ id: organizations.id, name: organizations.name }).from(organizations).where(eq(organizations.id, tenantId));
+  const [org] = await tx.select({ id: organizations.id, name: organizations.name, vertical: organizations.vertical }).from(organizations).where(eq(organizations.id, tenantId));
   const [program] = agent?.clientProgramId
     ? await tx
-        .select({ key: programTemplates.key, name: clientPrograms.name, outcomes: programTemplates.outcomes })
+        .select({ key: programTemplates.key, name: clientPrograms.name, vertical: programTemplates.vertical, extraction: programTemplates.extraction, outcomes: programTemplates.outcomes })
         .from(clientPrograms)
         .innerJoin(programTemplates, and(eq(programTemplates.key, clientPrograms.programKey), eq(programTemplates.version, clientPrograms.programVersion)))
         .where(eq(clientPrograms.id, agent.clientProgramId))
@@ -117,13 +140,26 @@ export async function emitCallCompleted(tx: Tx, tenantId: string, callId: string
     appointment: extracted.preferred_time ? { at: String(extracted.preferred_time), booked: extracted.next_step === "booked" } : null,
   };
 
+  // A health call is one on a health program, or for a health client when on none (as a safety check reads it).
+  const health = verticalOf(program?.vertical ?? org?.vertical) === "health";
   return enqueueEvent(tx, tenantId, {
     kind: "call.completed",
     refType: "call",
     refId: c.id,
     payload,
     idempotencyKey: `call.completed:${c.id}`,
+    withheld: health ? healthWithheld(fields, typeof extracted.outcome === "string" ? extracted.outcome : null, program ?? null) : undefined,
   });
+}
+
+/**
+ * Why a queue write failed, without what it was writing. Drizzle's message
+ * carries the statement's parameters (the person's phone and name, the
+ * payload), and process logs leave the tenant boundary.
+ */
+function failure(e: unknown): string {
+  const cause = (e as { cause?: { code?: string; constraint_name?: string } }).cause;
+  return [cause?.code ? `postgres ${cause.code}` : "", cause?.constraint_name ?? ""].filter(Boolean).join(" ") || (e as Error).name || "error";
 }
 
 /**
@@ -159,7 +195,7 @@ export async function emitLeadUpdated(tx: Tx, tenantId: string, leadId: string, 
       });
     });
   } catch (e) {
-    console.error(`[integrations] lead.updated not queued for tenant ${tenantId}: ${(e as Error).message}`);
+    console.error(`[integrations] lead.updated not queued for tenant ${tenantId}: ${failure(e)}`);
     return 0;
   }
 }
@@ -203,7 +239,7 @@ export async function emitDoNotCall(tx: Tx, tenantId: string, phone: string, con
       }),
     );
   } catch (e) {
-    console.error(`[integrations] do_not_call.added not queued for tenant ${tenantId}: ${(e as Error).message}`);
+    console.error(`[integrations] do_not_call.added not queued for tenant ${tenantId}: ${failure(e)}`);
     return 0;
   }
 }

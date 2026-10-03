@@ -1,5 +1,5 @@
 import { and, eq } from "drizzle-orm";
-import { integrations, type Integration, type Tx } from "@jenai/db";
+import { externalLinks, integrations, type Integration, type Tx } from "@jenai/db";
 import { assertClientUrl } from "@jenai/voice";
 import { sealCredentials } from "./queue";
 import { ACCOUNTS, zohoScopes } from "./zoho";
@@ -65,8 +65,12 @@ export async function exchangeGrantCode(input: {
   };
 }
 
-/** What a new Zoho connection takes: every event it can write something for. */
-const ZOHO_EVENTS = ["call.completed", "lead.created", "lead.updated", "appointment.booked", "do_not_call.added"];
+/**
+ * What a new Zoho connection takes: every event it can write something for.
+ * A lead's stage reaches Zoho only through a field mapping, so lead.updated is
+ * taken only once one is set (zohoConnector.wants).
+ */
+const ZOHO_EVENTS = ["call.completed", "lead.updated", "appointment.booked", "do_not_call.added"];
 
 /**
  * Puts a Zoho grant on the client's Zoho connection, or makes the connection
@@ -74,15 +78,32 @@ const ZOHO_EVENTS = ["call.completed", "lead.created", "lead.updated", "appointm
  *
  * Connecting again is how their admin re-grants a scope, so it must not undo
  * what the client set up: record creation, what to pull, the field mapping,
- * the name, and which events it takes stay unless the caller passes new ones.
+ * the name, and which events it takes stay. `setup` is for a new connection
+ * only; `module` changes the module on purpose (the script's --module).
+ *
  * The scopes are the new grant's, or none recorded when Zoho did not list
- * them: the old ones went with the old token, and the new grant may give less.
- * It stays a draft until a test shows Zoho answers.
+ * them: the old ones went with the old token, and keeping them would hide a
+ * scope the new grant adds. Unknown scopes are safe, because a write Zoho
+ * refuses for lack of one is remembered and left out (zoho.ts), not taken as
+ * the connection failing; what was refused under the old grant is forgotten.
+ *
+ * A grant from another data centre is another Zoho account, where the
+ * records we linked people to do not exist, so those links go.
+ *
+ * It stays a draft until a test shows Zoho answers. Events are still queued
+ * for it meanwhile, and wait.
  */
 export async function saveZohoConnection(
   tx: Tx,
   tenantId: string,
-  grant: { dc: string; credentials: Record<string, string>; scopes: string[] | null; module?: string; name?: string; events?: string[]; createdBy?: string },
+  grant: {
+    dc: string;
+    credentials: Record<string, string>;
+    scopes: string[] | null;
+    module?: string;
+    setup?: { name?: string; module?: string; events?: string[] };
+    createdBy?: string;
+  },
 ): Promise<{ integration: Integration; reconnected: boolean }> {
   const [existing] = await tx
     .select()
@@ -92,17 +113,20 @@ export async function saveZohoConnection(
     .limit(1);
   const kept: Record<string, unknown> = { ...existing?.config };
   delete kept.scopes;
+  delete kept.denied;
+  const module = grant.module ?? (existing ? String(kept.module ?? "Leads") : (grant.setup?.module ?? "Leads"));
   const row = {
-    name: grant.name ?? existing?.name ?? `Zoho CRM (${grant.dc})`,
+    name: existing?.name ?? grant.setup?.name ?? `Zoho CRM (${grant.dc})`,
     status: "draft" as const,
-    config: { ...kept, dc: grant.dc, module: grant.module ?? String(kept.module ?? "Leads"), ...(grant.scopes ? { scopes: grant.scopes } : {}) },
-    events: grant.events ?? existing?.events ?? ZOHO_EVENTS,
+    config: { ...kept, dc: grant.dc, module, ...(grant.scopes ? { scopes: grant.scopes } : {}) },
+    events: existing?.events ?? grant.setup?.events ?? ZOHO_EVENTS,
     credentials: sealCredentials(tenantId, grant.credentials),
     lastError: null,
     lastErrorAt: null,
     updatedAt: new Date(),
   };
   if (existing) {
+    if (String(existing.config.dc ?? "in") !== grant.dc) await tx.delete(externalLinks).where(eq(externalLinks.integrationId, existing.id));
     const [i] = await tx.update(integrations).set(row).where(and(eq(integrations.tenantId, tenantId), eq(integrations.id, existing.id))).returning();
     return { integration: i!, reconnected: true };
   }

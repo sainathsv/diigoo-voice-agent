@@ -24,19 +24,19 @@
     { "name": "booking_number", "label": "Number to give if they want to call back", "required": true, "example": "89777 59580" }
   ],
   "extraction": [
-    { "name": "interest_level", "type": "string", "prompt": "hot if they agreed to a consultation, warm if interested but undecided, cold if not interested. Null if the call never got that far." },
+    { "name": "interest_level", "type": "string", "prompt": "hot if they agreed to a consultation, warm if interested but undecided, cold if not interested. Null if the call never got that far.", "shareable": true },
     { "name": "interest_area", "type": "string", "prompt": "In ENGLISH, 3 to 8 words, the service they showed interest in (hair fall, laser hair removal, acne, weight). Null if they did not name one." },
-    { "name": "preferred_time", "type": "string", "prompt": "The agreed appointment date and time, exactly like '20 Aug 2026, 2:00 PM'. Null if nothing was agreed." },
+    { "name": "preferred_time", "type": "string", "prompt": "The agreed appointment date and time, exactly like '20 Aug 2026, 2:00 PM'. Null if nothing was agreed.", "shareable": true },
     { "name": "refusal_reason", "type": "string", "prompt": "In ENGLISH, 3 to 8 words, why they said no (too far, too costly, goes elsewhere, not needed). Null if they did not refuse." },
-    { "name": "do_not_call", "type": "string", "prompt": "yes if they asked not to be called again, else null" }
+    { "name": "do_not_call", "type": "string", "prompt": "yes if they asked not to be called again, else null", "shareable": true }
   ],
   "outcomes": [
-    { "key": "booked", "label": "First consultation booked", "stage": "booked" },
-    { "key": "interested", "label": "Interested, call again", "stage": "callback" },
-    { "key": "heard_out", "label": "Listened but undecided", "stage": "contacted" },
-    { "key": "not_interested", "label": "Not interested", "stage": "lost" },
-    { "key": "do_not_call", "label": "Asked not to be called again", "stage": "lost" },
-    { "key": "wrong_number", "label": "Wrong number", "stage": "lost" }
+    { "key": "booked", "label": "First consultation booked", "stage": "booked", "shareable": true },
+    { "key": "interested", "label": "Interested, call again", "stage": "callback", "shareable": true },
+    { "key": "heard_out", "label": "Listened but undecided", "stage": "contacted", "shareable": true },
+    { "key": "not_interested", "label": "Not interested", "stage": "lost", "shareable": true },
+    { "key": "do_not_call", "label": "Asked not to be called again", "stage": "lost", "shareable": true },
+    { "key": "wrong_number", "label": "Wrong number", "stage": "lost", "shareable": true }
   ],
   "defaults": {
     "windows": { "days": [1, 2, 3, 4, 5, 6], "start": "10:00", "end": "19:00" },

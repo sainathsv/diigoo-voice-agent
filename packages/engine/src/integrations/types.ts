@@ -61,6 +61,12 @@ export interface SendResult {
    * on the next try as OutEvent.progress.
    */
   progress?: Record<string, string>;
+  /**
+   * The record we remembered for this person is gone from their system
+   * (converted, merged or deleted) and no other was found. The event and the
+   * person's link let go of it, so the next event searches afresh.
+   */
+  forget?: boolean;
 }
 
 export interface Connector {
@@ -68,6 +74,12 @@ export interface Connector {
   /** A one-line answer for the client: does this connection work right now. */
   test(ctx: ConnectorContext): Promise<{ ok: boolean; message: string }>;
   send(ctx: ConnectorContext, e: OutEvent): Promise<SendResult>;
+  /**
+   * Whether this connection would write anything for a kind of event. False
+   * means the event is not queued for it at all, rather than queued and then
+   * skipped with "nothing to write", which buries the skips that matter.
+   */
+  wants?(integration: Integration, kind: string): boolean;
 }
 
 /** Reads a value out of the event payload by a dotted path, for field mapping. */
@@ -91,25 +103,68 @@ export function applyMapping(payload: Record<string, unknown>, mapping: Record<s
 }
 
 /**
- * Health detail a call gathers: the history the advisor asks for (how long,
- * what they tried, background, the advice given, whether it is urgent) and a
- * problem a follow-up or feedback call hears about. It stays in JENAI, under
- * the client's tenant like the transcript, unless they choose to hand it on.
+ * Health detail the standard questions gather on every call: the history the
+ * advisor asks for (how long, what they tried, background, the advice given,
+ * whether it is urgent) and a problem a follow-up or feedback call hears
+ * about. It stays in JENAI, under the client's tenant like the transcript,
+ * unless they choose to hand it on.
  */
 export const HEALTH_DETAIL = ["duration", "tried_before", "background", "advice_given", "urgent", "problem_reported", "complication_reported"];
 
 /**
- * The event as one connection is handed it: of the call's answers
- * (payload.fields), only the ones its share list (config.share) names, or,
- * with no list, all but the health detail. A CRM is read by the whole front
+ * What a call says outside its answers that can carry health detail, by the
+ * name a share list (config.share) uses for it, and the keys it fills under
+ * payload.call: the model's summary of the conversation, what they asked
+ * about, the link to the recording, and how the call ended.
+ */
+export const CALL_DETAIL: Record<string, string[]> = {
+  summary: ["summary"],
+  concern: ["concern"],
+  recording: ["recording_url", "recording_expires_at"],
+  outcome: ["outcome", "outcome_label"],
+};
+
+/**
+ * What one event holds back unless a share list names it, decided where the
+ * event is made, which is the only place that knows the call's program.
+ */
+export interface Withheld {
+  /** Answer keys (payload.fields) and CALL_DETAIL names. */
+  names: string[];
+  /** What call.outcome reads when the outcome is held back: its lead stage, which says no more than the lead does. */
+  outcome?: string | null;
+}
+
+/**
+ * The event as one connection is handed it. A CRM is read by the whole front
  * office and a webhook goes wherever their developer points it, so health
  * detail goes only where the client said it may.
+ *
+ * Of the call's answers (payload.fields), only the ones its share list names,
+ * or, with no list, all but the health detail and what the event holds back.
+ * What the event holds back outside the answers (a health call's summary, for
+ * one) is emptied unless the list names it. The keys stay, empty, so a
+ * client's code reading them does not break.
  */
-export function sharedWith(config: Record<string, unknown>, payload: Record<string, unknown>): Record<string, unknown> {
-  const fields = payload.fields;
-  if (!fields || typeof fields !== "object") return payload;
+export function sharedWith(config: Record<string, unknown>, payload: Record<string, unknown>, withheld: Withheld = { names: [] }): Record<string, unknown> {
   const list = Array.isArray(config.share) ? config.share.map(String) : null;
-  return { ...payload, fields: Object.fromEntries(Object.entries(fields).filter(([k]) => (list ? list.includes(k) : !HEALTH_DETAIL.includes(k)))) };
+  const held = (name: string) => withheld.names.includes(name) && !list?.includes(name);
+  const out = { ...payload };
+  const fields = payload.fields;
+  if (fields && typeof fields === "object") {
+    out.fields = Object.fromEntries(Object.entries(fields).filter(([k]) => (list ? list.includes(k) : !HEALTH_DETAIL.includes(k) && !held(k))));
+  }
+  const call = payload.call;
+  if (call && typeof call === "object") {
+    const c = { ...(call as Record<string, unknown>) };
+    for (const [name, keys] of Object.entries(CALL_DETAIL)) {
+      if (!held(name)) continue;
+      for (const k of keys) if (k in c) c[k] = null;
+      if (name === "outcome" && "outcome" in c) c.outcome = withheld.outcome ?? null;
+    }
+    out.call = c;
+  }
+  return out;
 }
 
 /** Network and 5xx answers are worth retrying; a refusal is not. */

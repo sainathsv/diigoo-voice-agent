@@ -820,6 +820,16 @@ export interface ProgramOutcome {
   key: string;
   label: string;
   stage?: "new" | "contacted" | "callback" | "booked" | "won" | "lost";
+  /** On a health program, an outcome that says nothing about their health and may go to the client's CRM. */
+  shareable?: boolean;
+}
+/** One question a program's analysis answers. */
+export interface ProgramExtraction {
+  name: string;
+  type: string;
+  prompt: string;
+  /** On a health program, an answer that says nothing about their health and may go to the client's CRM. */
+  shareable?: boolean;
 }
 export interface ProgramDefaults {
   windows?: { days: number[]; start: string; end: string };
@@ -901,7 +911,7 @@ export const programTemplates = pgTable(
     opening: text("opening").notNull(),
     variables: jsonb("variables").$type<ProgramVariable[]>().notNull().default([]),
     clientFields: jsonb("client_fields").$type<ProgramField[]>().notNull().default([]),
-    extraction: jsonb("extraction").$type<Array<{ name: string; type: string; prompt: string }>>().notNull().default([]),
+    extraction: jsonb("extraction").$type<ProgramExtraction[]>().notNull().default([]),
     outcomes: jsonb("outcomes").$type<ProgramOutcome[]>().notNull().default([]),
     defaults: jsonb("defaults").$type<ProgramDefaults>().notNull().default({}),
     requirements: jsonb("requirements").$type<ProgramRequirements>().notNull().default({}),

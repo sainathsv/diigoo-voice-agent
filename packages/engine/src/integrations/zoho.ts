@@ -1,5 +1,5 @@
 import { assertClientUrl, toE164 } from "@jenai/voice";
-import { HEALTH_DETAIL, applyMapping, retryable, type Connector, type ConnectorContext, type OutEvent, type SendResult } from "./types";
+import { CALL_DETAIL, HEALTH_DETAIL, applyMapping, retryable, type Connector, type ConnectorContext, type OutEvent, type SendResult } from "./types";
 
 /**
  * Zoho CRM. The client keeps running Zoho exactly as they do today; JENAI adds
@@ -7,9 +7,11 @@ import { HEALTH_DETAIL, applyMapping, retryable, type Connector, type ConnectorC
  * and can create a follow-up task. We never copy their database out.
  *
  * Setup on their side: a Self Client or server-based app in the Zoho API
- * console, scopes ZohoCRM.modules.ALL and ZohoCRM.settings.READ, and the
- * refresh token pasted into JENAI. Data centre matters: India accounts use
- * .in, others .com, .eu, .com.au, .jp.
+ * console, scopes ZohoCRM.modules.ALL (or the narrower ones below),
+ * ZohoSearch.securesearch.READ and ZohoCRM.settings.READ, and the refresh
+ * token pasted into JENAI. Zoho's search needs the securesearch scope on top
+ * of the module's read: without it no caller can be found by number. Data
+ * centre matters: India accounts use .in, others .com, .eu, .com.au, .jp.
  */
 
 export const ACCOUNTS: Record<string, string> = {
@@ -42,19 +44,49 @@ function granted(ctx: ConnectorContext): Set<string> {
   return new Set(Array.isArray(raw) ? raw.map(String) : []);
 }
 
-type Op = "READ" | "CREATE" | "UPDATE" | "ALL";
+/**
+ * Scopes Zoho has refused (OAUTH_SCOPE_MISMATCH) since this grant was made,
+ * learned from its own answers. A grant's scopes are fixed until their admin
+ * makes a new one, so asking again would only be refused again; reconnecting
+ * clears the list.
+ */
+function denied(ctx: ConnectorContext): Set<string> {
+  const raw = ctx.integration.config.denied;
+  return new Set(Array.isArray(raw) ? raw.map(String) : []);
+}
+
+type Op = "READ" | "CREATE" | "UPDATE";
 const scopeFor = (module: string, op: Op) => `ZohoCRM.modules.${module.toLowerCase()}.${op}`;
+
+/** Zoho's v2 activities are Calls, Tasks and Events: a grant on them covers each. */
+const ACTIVITIES = ["calls", "tasks", "events"];
 
 /**
  * Whether their admin granted this operation on this module. A broader grant
- * covers it: every operation on the module (ZohoCRM.modules.calls.ALL), or on
- * every module (ZohoCRM.modules.ALL).
- * Unknown scopes (Zoho did not say, or an older connection) means assume allowed, as before.
+ * covers it: every operation (ALL), or every write (WRITE, which Zoho's insert
+ * and update pages both accept), on the module, on the activities a Call is
+ * one of, or on every module (ZohoCRM.modules.READ reads them all).
+ * Unknown scopes (Zoho did not say, or a token pasted in the form) means try,
+ * unless Zoho has refused it since.
  */
 const may = (ctx: ConnectorContext, module: string, op: Op) => {
+  const m = module.toLowerCase();
+  if (denied(ctx).has(scopeFor(m, op))) return false;
   const g = granted(ctx);
-  return g.size === 0 || [scopeFor(module, op), scopeFor(module, "ALL"), "ZohoCRM.modules.ALL"].some((s) => g.has(s));
+  if (!g.size) return true;
+  const ops = op === "READ" ? ["READ", "ALL"] : [op, "WRITE", "ALL"];
+  const on = [`ZohoCRM.modules.${m}`, "ZohoCRM.modules", ...(ACTIVITIES.includes(m) ? ["ZohoCRM.modules.activities"] : [])];
+  return on.some((s) => ops.some((o) => g.has(`${s}.${o}`)));
 };
+
+/** Remembers a scope Zoho refused, so the events after this one do not ask for it again. */
+async function deny(ctx: ConnectorContext, scope: string): Promise<void> {
+  const d = denied(ctx);
+  if (d.has(scope)) return;
+  const list = [...d, scope];
+  ctx.integration.config = { ...ctx.integration.config, denied: list };
+  await ctx.save({ config: { denied: list } });
+}
 
 /**
  * The scopes a Zoho token answer lists, in the form may() compares
@@ -111,8 +143,8 @@ const PEOPLE = ["Leads", "Contacts"];
  * Where to look for a caller, in order: the module set on the connection (the
  * one they chose), then Leads, then Contacts. Zoho's search leaves converted
  * Leads out, so a converted caller is only found in Contacts. Only modules
- * their admin let us read: a search anywhere else is a 401, which would switch
- * the whole connection off.
+ * their admin let us read, as far as we know: one Zoho refuses anyway is left
+ * out from then on, and the search goes on in the others.
  */
 function lookIn(ctx: ConnectorContext): string[] {
   return [...new Set([moduleOf(ctx), ...PEOPLE])].filter((m) => may(ctx, m, "READ"));
@@ -194,7 +226,13 @@ async function accessToken(ctx: ConnectorContext, fresh = false): Promise<string
   return j.access_token;
 }
 
-async function call(ctx: ConnectorContext, path: string, init: RequestInit = {}, fresh = false): Promise<{ status: number; json: Record<string, unknown>; text: string }> {
+interface Answer {
+  status: number;
+  json: Record<string, unknown>;
+  text: string;
+}
+
+async function call(ctx: ConnectorContext, path: string, init: RequestInit = {}, fresh = false): Promise<Answer> {
   const token = await accessToken(ctx, fresh);
   const url = `${API[dcOf(ctx)] ?? API.in}${path}`;
   await assertClientUrl(url);
@@ -224,41 +262,168 @@ interface Found {
 }
 
 /**
- * A refusal from Zoho, in the queue's terms. A 401 is our grant (a dead token,
- * a scope their admin did not give) and fails for every record alike. Anything
- * else is about this record.
+ * What Zoho said about the one record a request was about. Its code sits at
+ * the top of the answer or, for a write, in data[0], and a write's answer can
+ * carry an error there under a 2xx status.
  */
-function refused(r: { status: number; text: string }, at?: Found, progress?: Record<string, string>): SendResult {
-  return { ok: false, httpStatus: r.status, response: r.text, retry: retryable(r.status), connectionBroken: r.status === 401, externalId: at?.id, externalType: at?.module, progress };
+function verdict(r: Answer): { code: string; message: string; field: string } {
+  const row = ((r.json.data as Array<Record<string, unknown>> | undefined) ?? [])[0] ?? {};
+  const details = (row.details ?? r.json.details ?? {}) as Record<string, unknown>;
+  return { code: String(row.code ?? r.json.code ?? ""), message: String(row.message ?? r.json.message ?? ""), field: String(details.api_name ?? "") };
 }
 
-/** The id Zoho gave a record it just created, from {data: [{details: {id}}]}. */
-const createdId = (r: { json: Record<string, unknown> }) => ((r.json.data as Array<{ details?: { id?: string } }> | undefined) ?? [])[0]?.details?.id;
+/**
+ * The id of the record a write made or changed, only when Zoho says it
+ * succeeded. Anything else did not land, whatever the HTTP status, so it is
+ * never counted as written and a retry writes it properly.
+ */
+function written(r: Answer): string | undefined {
+  if (r.status >= 400) return undefined;
+  const row = ((r.json.data as Array<{ status?: string; details?: { id?: string } }> | undefined) ?? [])[0];
+  return row?.status === "success" ? row.details?.id : undefined;
+}
+
+/**
+ * Refusals about what this connection may do, not about the record: a scope
+ * the grant lacks (401 OAUTH_SCOPE_MISMATCH), or a right the profile of the
+ * Zoho user who made the token lacks (403 NO_PERMISSION, 400
+ * AUTHORIZATION_FAILED). Each is about one operation, so the others go on.
+ */
+const NOT_ALLOWED = new Set(["OAUTH_SCOPE_MISMATCH", "NO_PERMISSION", "AUTHORIZATION_FAILED"]);
+
+/**
+ * What a Zoho refusal means for us:
+ *   later        an outage or a rate limit, worth trying again
+ *   not-allowed  this connection may not do this one thing (see NOT_ALLOWED)
+ *   connection   every record would get it: a dead token, a module they do not have
+ *   gone         the record named is not there any more: converted, merged or
+ *                deleted (Zoho calls the id invalid, on a Call's What_Id or
+ *                Who_Id, a Note's Parent_Id, or the record a PUT names)
+ *   record       about this record and what we sent
+ */
+function judge(r: Answer): "later" | "not-allowed" | "connection" | "gone" | "record" {
+  const v = verdict(r);
+  if (retryable(r.status)) return "later";
+  if (NOT_ALLOWED.has(v.code)) return "not-allowed";
+  if (r.status === 401 || v.code === "INVALID_MODULE") return "connection";
+  if (v.code === "RECORD_NOT_FOUND") return "gone";
+  if (v.code === "INVALID_DATA" && (["What_Id", "Who_Id", "Parent_Id", "id"].includes(v.field) || /\bid given seems to be invalid/i.test(v.message))) return "gone";
+  return "record";
+}
+
+/** A refusal from Zoho, in the queue's terms. */
+function refused(r: Answer, at?: Found, progress?: Record<string, string>): SendResult {
+  const j = judge(r);
+  const connection = j === "connection" || j === "not-allowed";
+  return { ok: false, httpStatus: r.status, response: r.text, retry: j === "later", connectionBroken: connection, externalId: at?.id, externalType: at?.module, progress };
+}
+
+/**
+ * Remembers a scope Zoho said the grant lacks. A profile's missing right is
+ * not remembered: their admin can give it without a new grant.
+ */
+async function learn(ctx: ConnectorContext, r: Answer, scope: string): Promise<void> {
+  if (verdict(r).code === "OAUTH_SCOPE_MISMATCH") await deny(ctx, scope);
+}
+
+/** Zoho's code for a refusal, or its status when it gave none, for the delivery log. */
+const said = (r: Answer) => verdict(r).code || `HTTP ${r.status}`;
+
+interface Looked {
+  found: Found | null;
+  /** Found through the id we remembered for this person, not by a search just now. */
+  remembered: boolean;
+  /** Where the number was searched, and where Zoho would not let us search. */
+  looked: string[];
+  unread: string[];
+}
 
 /**
  * Their record for this person: the one we linked before, else the first
- * match in lookIn's order. A refused search is passed back as it is: read as
- * "no match", a missing search scope would put every caller on the
- * not-in-Zoho list.
+ * match in lookIn's order. A module Zoho will not let us search is left for
+ * the next, and only when no module can be searched is the connection
+ * refused: a missing search scope would otherwise put every caller on the
+ * not-in-Zoho list. Any other refused search is passed back as it is.
  */
-async function findRecord(ctx: ConnectorContext, e: OutEvent): Promise<{ found: Found | null } | { refused: SendResult }> {
-  if (e.externalId) return { found: { id: e.externalId, module: moduleOfRecord(ctx, e) } };
+async function findRecord(ctx: ConnectorContext, e: OutEvent): Promise<Looked | { refused: SendResult }> {
+  if (e.externalId) return { found: { id: e.externalId, module: moduleOfRecord(ctx, e) }, remembered: true, looked: [], unread: [] };
   const phone = String((e.payload.person as Record<string, unknown> | undefined)?.phone ?? "");
-  if (!phone) return { found: null };
+  if (!phone) return { found: null, remembered: false, looked: [], unread: [] };
   const modules = lookIn(ctx);
   if (!modules.length) {
     const needed = [...new Set([moduleOf(ctx), ...PEOPLE])].map((m) => scopeFor(m, "READ")).join(" or ");
     return { refused: { ok: false, retry: false, connectionBroken: true, response: `Zoho was not granted ${needed}, so no caller can be found` } };
   }
-  for (const module of modules) {
+  const looked: string[] = [];
+  const unread: Array<{ module: string; r: Answer }> = [];
+  // Only a refusal another module's search did not get is about the module.
+  // When every search is refused, it is the search itself
+  // (ZohoSearch.securesearch.READ), and remembering each module as unreadable
+  // would say the wrong thing.
+  const learnUnread = async () => {
+    for (const u of unread) await learn(ctx, u.r, scopeFor(u.module, "READ"));
+  };
+  next: for (const module of modules) {
     for (const path of searches(module, numberForms(phone))) {
       const r = await call(ctx, path);
-      if (r.status >= 400) return { refused: refused(r) };
+      if (r.status >= 400) {
+        if (judge(r) !== "not-allowed") return { refused: refused(r) };
+        unread.push({ module, r });
+        continue next;
+      }
       const id = ((r.json.data as Array<{ id?: string }> | undefined) ?? [])[0]?.id;
-      if (id) return { found: { id, module } };
+      if (id) {
+        await learnUnread();
+        return { found: { id, module }, remembered: false, looked: [...looked, module], unread: unread.map((u) => `${u.module} (${said(u.r)})`) };
+      }
     }
+    looked.push(module);
   }
-  return { found: null };
+  if (!looked.length) {
+    const last = unread.at(-1)!.r;
+    return {
+      refused: {
+        ok: false,
+        retry: false,
+        connectionBroken: true,
+        httpStatus: last.status,
+        response: `Zoho refused the search in ${unread.map((u) => `${u.module} (${said(u.r)})`).join(" and ")}, so no caller can be found. Searching needs ZohoSearch.securesearch.READ and the module's READ scope. ${last.text}`.slice(0, 1000),
+      },
+    };
+  }
+  await learnUnread();
+  return { found: null, remembered: false, looked, unread: unread.map((u) => `${u.module} (${said(u.r)})`) };
+}
+
+/**
+ * The record this event goes on: found, or made when the client asked for
+ * callers who are not in Zoho to be added. A result instead when there is
+ * none to write on.
+ */
+async function resolve(ctx: ConnectorContext, e: OutEvent): Promise<{ at: Found; remembered: boolean } | { result: SendResult }> {
+  const looked = await findRecord(ctx, e);
+  if ("refused" in looked) return { result: looked.refused };
+  if (looked.found) return { at: looked.found, remembered: looked.remembered };
+  if (!looked.looked.length) return { result: { ok: false, retry: false, response: "No phone number to find this person by in Zoho" } };
+  const where = `looked in ${looked.looked.join(" and ")}${looked.unread.length ? `; Zoho would not let us search ${looked.unread.join(" or ")}` : ""}`;
+  // Their CRM decides who exists. We do not create records unless asked to.
+  if (!ctx.integration.config.createIfMissing) return { result: { ok: false, retry: false, response: `No matching record in Zoho for this number (${where})` } };
+  const module = moduleOf(ctx);
+  if (!may(ctx, module, "CREATE")) {
+    return { result: { ok: false, retry: false, response: `No matching record in ${looked.looked.join(" or ")}, and Zoho was not granted permission to create one in ${module}` } };
+  }
+  const person = (e.payload.person ?? {}) as Record<string, unknown>;
+  const created = await call(ctx, `/crm/v2/${module}`, {
+    method: "POST",
+    body: JSON.stringify({ data: [{ Last_Name: String(person.name ?? "Unknown"), Phone: String(person.phone ?? ""), Lead_Source: "JENAI call" }] }),
+  });
+  const id = written(created);
+  if (id) return { at: { id, module }, remembered: false };
+  if (judge(created) === "not-allowed") {
+    await learn(ctx, created, scopeFor(module, "CREATE"));
+    return { result: { ok: false, retry: false, httpStatus: created.status, response: `No matching record in ${looked.looked.join(" or ")}, and Zoho refused to create one in ${module} (${said(created)})` } };
+  }
+  return { result: refused(created) };
 }
 
 interface Writeup {
@@ -317,13 +482,133 @@ function writeup(e: OutEvent): Writeup | null {
   return null;
 }
 
+/** The kinds writeup() has something to say for. Any other reaches Zoho only through mapped fields. */
+const WRITTEN_UP = ["call.completed", "appointment.booked", "do_not_call.added"];
+
+/**
+ * Writes one event on one record, in order of what the client granted. A
+ * Call record is the better home for a call: it lands in their activity
+ * history with a type, a time and a duration, rather than as loose text.
+ * Whatever already landed (done) is not written again.
+ *
+ * "gone" when Zoho says the record is not there, for send() to look again.
+ */
+async function writeOn(ctx: ConnectorContext, e: OutEvent, say: Writeup | null, mapped: Record<string, unknown>, at: Found, done: Record<string, string>): Promise<SendResult | { gone: Answer }> {
+  const { id, module } = at;
+  // What was left out and why, for the delivery log, and the last refusal from Zoho behind it.
+  const left: string[] = [];
+  let refusal: Answer | undefined;
+  // Mapped fields only with the update scope on the module the record is in.
+  const fields = may(ctx, module, "UPDATE") ? mapped : {};
+  if (Object.keys(mapped).length && !Object.keys(fields).length) left.push(`mapped fields left alone, Zoho was not granted ${scopeFor(module, "UPDATE")}`);
+  if (!say && !Object.keys(fields).length) return { ok: false, retry: false, externalId: id, externalType: module, progress: done, response: [`Nothing to write in Zoho for ${e.kind}`, ...left].join("; ") };
+
+  let wrote = "";
+  let status = 200;
+  const logged = done.Calls ?? done.Notes;
+  if (say && logged) {
+    wrote = `${done.Calls ? "call" : "note"} ${logged} already logged`;
+  } else if (say) {
+    let asNote = !say.call;
+    if (say.call && !may(ctx, "calls", "CREATE")) {
+      asNote = true;
+      left.push(`not logged as a Call, Zoho was not granted ${scopeFor("calls", "CREATE")}`);
+    } else if (say.call) {
+      const t = callTimes(e.payload);
+      const direction = String(((e.payload.call ?? {}) as Record<string, unknown>).direction ?? "outbound");
+      const r = await call(ctx, `/crm/v2/Calls`, {
+        method: "POST",
+        body: JSON.stringify({ data: [{
+          Subject: say.title,
+          Call_Type: direction === "inbound" ? "Inbound" : "Outbound",
+          Call_Start_Time: t.start,
+          Call_Duration: t.duration,
+          Call_Status: "Completed",
+          Description: say.content,
+          ...linkTo(module, id),
+        }] }),
+      });
+      const callId = written(r);
+      const j = callId ? null : judge(r);
+      if (callId) {
+        done.Calls = callId;
+        wrote = "call logged";
+        status = r.status;
+      } else if (j === "later" || j === "connection") {
+        return refused(r, at, done);
+      } else if (j === "gone") {
+        return { gone: r };
+      } else {
+        // Their Calls will not take it: a scope or a right not given, a field
+        // their layout makes mandatory, a value it reads differently. That is
+        // true of every call, so the same words go in a Note instead.
+        await learn(ctx, r, scopeFor("calls", "CREATE"));
+        left.push(`not logged as a Call, Zoho answered ${said(r)}`);
+        refusal = r;
+        asNote = true;
+      }
+    }
+    if (asNote && !may(ctx, "notes", "CREATE")) {
+      left.push(`no note, Zoho was not granted ${scopeFor("notes", "CREATE")}`);
+    } else if (asNote) {
+      const r = await call(ctx, `/crm/v2/Notes`, {
+        method: "POST",
+        body: JSON.stringify({ data: [{ Note_Title: say.title, Note_Content: say.content, Parent_Id: id, se_module: module }] }),
+      });
+      const noteId = written(r);
+      const j = noteId ? null : judge(r);
+      if (noteId) {
+        done.Notes = noteId;
+        wrote = "note added";
+        status = r.status;
+      } else if (j === "gone") {
+        return { gone: r };
+      } else if (j === "not-allowed") {
+        await learn(ctx, r, scopeFor("notes", "CREATE"));
+        left.push(`no note, Zoho answered ${said(r)}`);
+        refusal = r;
+      } else {
+        return refused(r, at, done);
+      }
+    }
+  }
+
+  // Fields the client chose to keep in step (for example Lead Status from the outcome).
+  if (Object.keys(fields).length) {
+    const upd = await call(ctx, `/crm/v2/${module}/${id}`, { method: "PUT", body: JSON.stringify({ data: [fields] }) });
+    const j = written(upd) ? null : judge(upd);
+    if (!j) {
+      if (!wrote) {
+        wrote = "fields updated";
+        status = upd.status;
+      }
+    } else if (j === "gone") {
+      return { gone: upd };
+    } else if (j === "not-allowed") {
+      await learn(ctx, upd, scopeFor(module, "UPDATE"));
+      left.push(`mapped fields left alone, Zoho answered ${said(upd)}`);
+      refusal = upd;
+    } else {
+      return refused(upd, at, done);
+    }
+  }
+
+  // Nothing reached their record. Skipped with the reason rather than done,
+  // or the log would show as handed on an opt-out Zoho never got.
+  if (!wrote) return { ok: false, retry: false, httpStatus: refusal?.status, externalId: id, externalType: module, progress: done, response: `Nothing written on ${module} ${id} for ${e.kind}: ${left.join("; ")}` };
+  return { ok: true, httpStatus: status, externalId: id, externalType: module, progress: done, response: [`${wrote} on ${module} ${id}`, ...left].join("; ") };
+}
+
 /**
  * What this connection will write, from what their admin granted, for the
  * Test button. What was not granted is said as plainly as what was: a client
  * expecting Lead Status to change after each call hears here that it will not.
  */
 function writes(ctx: ConnectorContext): string {
-  if (!granted(ctx).size) return "Zoho did not say which scopes it granted, so each write is tried and a refusal shows on its delivery.";
+  if (!granted(ctx).size) {
+    const no = [...denied(ctx)];
+    return `Zoho did not say which scopes it granted, so each write is tried, and one Zoho refuses is left out from then on${no.length ? ` (refused so far: ${no.join(", ")})` : ""}.`;
+  }
   const module = moduleOf(ctx);
   const calls = may(ctx, "calls", "CREATE");
   const notes = may(ctx, "notes", "CREATE");
@@ -343,31 +628,66 @@ function writes(ctx: ConnectorContext): string {
   return [yes.length ? `Writing ${yes.join(", ")}.` : "", no.length ? `Not granted, so not written: ${no.join(", ")}.` : ""].filter(Boolean).join(" ");
 }
 
+/** How the Test button names what a call says outside its answers. */
+const DETAIL_NAMES: Record<string, string> = { summary: "the summary", concern: "what it was about", recording: "the recording link", outcome: "an outcome its program does not mark shareable" };
+
+const listed = (xs: string[]) => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}` : (xs[0] ?? ""));
+
 /**
- * Which of each call's answers reach Zoho, for the Test button. The rest are
- * left out before the event is queued, so a field mapped to one of them is
- * left empty.
+ * What of each call reaches Zoho, for the Test button: the rules sharedWith
+ * applied before the event was queued, so a field mapped to something left
+ * out stays empty.
  */
 function shares(ctx: ConnectorContext): string {
-  const list = ctx.integration.config.share;
-  if (Array.isArray(list)) return `Answers from calls handed on: ${list.length ? list.map(String).join(", ").replace(/_/g, " ") : "none"}.`;
-  return `Health detail from calls (${HEALTH_DETAIL.join(", ").replace(/_/g, " ")}) stays in JENAI.`;
+  const raw = ctx.integration.config.share;
+  const list = Array.isArray(raw) ? raw.map(String) : null;
+  const kept = Object.keys(CALL_DETAIL).filter((k) => !list?.includes(k)).map((k) => DETAIL_NAMES[k]!);
+  const health = kept.length ? ` On a health call, ${listed(kept)} stay in JENAI.` : "";
+  if (list) {
+    const answers = list.filter((k) => !(k in CALL_DETAIL));
+    return `Answers from calls handed on: ${answers.length ? answers.join(", ").replace(/_/g, " ") : "none"}.${health}`;
+  }
+  return `Health answers (${HEALTH_DETAIL.join(", ").replace(/_/g, " ")}) stay in JENAI, and so does any answer a health program does not mark shareable.${health}`;
 }
+
+/** A number nobody has, for the Test button's search: Zoho answers it with nothing found when searching is allowed. */
+const PROBE = "0000000000";
 
 export const zohoConnector: Connector = {
   kind: "zoho_crm",
+
+  wants(integration, kind) {
+    // A kind with nothing to say on a record reaches Zoho only through the
+    // fields they mapped: queued without a mapping, it could only be skipped.
+    return WRITTEN_UP.includes(kind) || Object.keys(integration.mapping?.fields ?? {}).length > 0;
+  },
+
   async test(ctx) {
     try {
       // Reading one record needs only the module read scope. Listing the
       // modules needs a settings scope most admins do not grant, and failing
       // the test on that would say "not connected" about a working connection.
       const r = await call(ctx, `/crm/v2/${moduleOf(ctx)}?per_page=1`);
-      if (r.status === 200 || r.status === 204) {
-        const where = lookIn(ctx);
-        const finding = where.length ? `Finding callers in ${where.join(", then ")}.` : "Not granted to read Leads or Contacts, so no caller can be found.";
-        return { ok: true, message: `Connected to Zoho CRM (${dcOf(ctx)}). ${finding} ${writes(ctx)} ${shares(ctx)}` };
+      if (r.status !== 200 && r.status !== 204) return { ok: false, message: `Zoho answered ${r.status}: ${r.text.slice(0, 160)}` };
+      // Reading a record does not prove a caller can be found: Zoho's search
+      // also needs ZohoSearch.securesearch.READ. Asked here, a missing scope
+      // fails the Test instead of the first delivery for a caller not yet linked.
+      const where: string[] = [];
+      const unread: Array<{ module: string; r: Answer }> = [];
+      for (const module of lookIn(ctx)) {
+        const s = await call(ctx, `/crm/v2/${module}/search?phone=${PROBE}`);
+        if (s.status < 400) where.push(module);
+        else if (judge(s) === "not-allowed") unread.push({ module, r: s });
+        else return { ok: false, message: `Zoho answered a search in ${module} with ${s.status}: ${s.text.slice(0, 160)}` };
       }
-      return { ok: false, message: `Zoho answered ${r.status}: ${r.text.slice(0, 160)}` };
+      const cannot = unread.map((u) => `${u.module} (${said(u.r)})`).join(" or ");
+      if (!where.length) {
+        const why = cannot ? `Zoho would not let JENAI search ${cannot}` : "Not granted to read Leads or Contacts";
+        return { ok: false, message: `Connected to Zoho CRM (${dcOf(ctx)}), but no caller can be found. ${why}: the grant needs ZohoSearch.securesearch.READ and the READ scope of Leads or Contacts.` };
+      }
+      for (const u of unread) await learn(ctx, u.r, scopeFor(u.module, "READ"));
+      const finding = `Finding callers in ${where.join(", then ")}${cannot ? `; Zoho would not let JENAI search ${cannot}` : ""}.`;
+      return { ok: true, message: `Connected to Zoho CRM (${dcOf(ctx)}). ${finding} ${writes(ctx)} ${shares(ctx)}` };
     } catch (e) {
       return { ok: false, message: (e as Error).message.slice(0, 200) };
     }
@@ -387,85 +707,23 @@ export const zohoConnector: Connector = {
       // Skipped rather than done: nothing reached Zoho, so it says nothing about the connection.
       if (!say && !Object.keys(mapped).length) return { ok: false, retry: false, response: `Nothing to write in Zoho for ${e.kind}` };
 
-      const looked = await findRecord(ctx, e);
-      if ("refused" in looked) return looked.refused;
-      if (!looked.found) {
-        // Their CRM decides who exists. We do not create records unless asked to.
-        if (!ctx.integration.config.createIfMissing) {
-          return { ok: false, response: `No matching record in Zoho for this number (looked in ${lookIn(ctx).join(" and ")})`, retry: false };
-        }
-        const module = moduleOf(ctx);
-        if (!may(ctx, module, "CREATE")) {
-          return { ok: false, response: `No matching record in ${lookIn(ctx).join(" or ")}, and Zoho was not granted permission to create one in ${module}`, retry: false };
-        }
-        const created = await call(ctx, `/crm/v2/${module}`, {
-          method: "POST",
-          body: JSON.stringify({ data: [{ Last_Name: String((e.payload.person as Record<string, unknown>)?.name ?? "Unknown"), Phone: String((e.payload.person as Record<string, unknown>)?.phone ?? ""), Lead_Source: "JENAI call" }] }),
-        });
-        const newId = createdId(created);
-        if (!newId) return refused(created);
-        return this.send(ctx, { ...e, externalId: newId, externalType: module });
+      let got = await resolve(ctx, e);
+      if ("result" in got) return got.result;
+      at = got.at;
+      let r = await writeOn(ctx, e, say, mapped, at, done);
+      if ("gone" in r && got.remembered) {
+        // The record we remembered for this person is not there any more. In a
+        // clinic that is the usual life of a Lead: converted to a Contact once
+        // they become a patient, or merged as a duplicate. Look again by
+        // number, now, so this event lands on the record they keep today.
+        const was = `${at.module} ${at.id}`;
+        got = await resolve(ctx, { ...e, externalId: null, externalType: null });
+        if ("result" in got) return { ...got.result, forget: true, progress: done, response: `The record we had for this person (${was}) is gone from Zoho. ${got.result.response ?? ""}`.slice(0, 1000) };
+        at = got.at;
+        r = await writeOn(ctx, e, say, mapped, at, done);
       }
-      at = looked.found;
-      const { id, module } = at;
-
-      // And only with the update scope on the module the record is in: without
-      // it Zoho answers 401, which would switch the whole connection off over
-      // fields it was never given.
-      const fields = may(ctx, module, "UPDATE") ? mapped : {};
-      const unwritten = Object.keys(mapped).length && !Object.keys(fields).length ? `; mapped fields left alone, Zoho was not granted ${scopeFor(module, "UPDATE")}` : "";
-      if (!say && !Object.keys(fields).length) return { ok: false, retry: false, externalId: id, externalType: module, response: `Nothing to write in Zoho for ${e.kind}${unwritten}` };
-
-      // How it gets recorded, in order of what the client granted. A Call
-      // record is the better home for a call: it lands in their activity
-      // history with a type, a time and a duration, rather than as loose text.
-      // Written once: a retry after the field update failed finds it in done.
-      let wrote = "nothing";
-      let status = 200;
-      const logged = done.Calls ?? done.Notes;
-      if (say && logged) {
-        wrote = `${done.Calls ? "call" : "note"} ${logged} already logged`;
-      } else if (say?.call && may(ctx, "calls", "CREATE")) {
-        const t = callTimes(e.payload);
-        const direction = String(((e.payload.call ?? {}) as Record<string, unknown>).direction ?? "outbound");
-        const r = await call(ctx, `/crm/v2/Calls`, {
-          method: "POST",
-          body: JSON.stringify({ data: [{
-            Subject: say.title,
-            Call_Type: direction === "inbound" ? "Inbound" : "Outbound",
-            Call_Start_Time: t.start,
-            Call_Duration: t.duration,
-            Call_Status: "Completed",
-            Description: say.content,
-            ...linkTo(module, id),
-          }] }),
-        });
-        if (r.status >= 400) return refused(r, at, done);
-        // No id back would be odd, but the call is in Zoho all the same.
-        done.Calls = createdId(r) ?? "logged";
-        wrote = "call logged";
-        status = r.status;
-      } else if (say && may(ctx, "notes", "CREATE")) {
-        const r = await call(ctx, `/crm/v2/Notes`, {
-          method: "POST",
-          body: JSON.stringify({ data: [{ Note_Title: say.title, Note_Content: say.content, Parent_Id: id, se_module: module }] }),
-        });
-        if (r.status >= 400) return refused(r, at, done);
-        done.Notes = createdId(r) ?? "logged";
-        wrote = "note added";
-        status = r.status;
-      }
-
-      // Fields the client chose to keep in step (for example Lead Status from the outcome).
-      if (Object.keys(fields).length) {
-        const upd = await call(ctx, `/crm/v2/${module}/${id}`, { method: "PUT", body: JSON.stringify({ data: [fields] }) });
-        if (upd.status >= 400) return refused(upd, at, done);
-        if (wrote === "nothing") {
-          wrote = "fields updated";
-          status = upd.status;
-        }
-      }
-      return { ok: true, httpStatus: status, externalId: id, externalType: module, progress: done, response: `${wrote} on ${module} ${id}${unwritten}` };
+      if ("gone" in r) return refused(r.gone, at, done);
+      return r;
     } catch (err) {
       const gone = err instanceof GrantGoneError;
       return { ok: false, response: (err as Error).message.slice(0, 300), retry: !gone, connectionBroken: gone, externalId: at?.id, externalType: at?.module, progress: done };

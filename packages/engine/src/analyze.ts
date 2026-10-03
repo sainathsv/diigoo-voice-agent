@@ -43,6 +43,8 @@ export interface ProgramAsk {
   key: string;
   extraction: Array<{ name: string; type: string; prompt: string }>;
   outcomes: Array<{ key: string; label: string; stage?: string }>;
+  /** What the program's calls are for (consent purpose): an opt-out heard only as its own answer covers calls of that kind. */
+  purpose?: string;
 }
 
 export interface Extractor {
@@ -222,6 +224,28 @@ function cleanProgramFields(raw: unknown, p: ProgramAsk): Record<string, string>
 }
 
 /**
+ * Whether the call heard "do not call me again", from any of the ways it is
+ * recorded: the standard answer, a program's own do_not_call or
+ * asked_to_stop_calling answer, or a program outcome of do_not_call. The
+ * standard answer means every call. One heard only through the program, on a
+ * promotional program, is taken as about that kind of call ("stop calling me
+ * with offers") and leaves their appointment reminders alone; on any other
+ * program it means every call, the safe reading.
+ */
+export function heardOptOut(
+  x: Extraction | null,
+  merged: Record<string, unknown>,
+  extra: Record<string, string>,
+  program: ProgramAsk | null,
+): { scope: "promotional" | null } | null {
+  if (x?.do_not_call === true || merged.do_not_call === true) return { scope: null };
+  const yes = (v: unknown) => typeof v === "string" && /^(yes|true)$/i.test(v.trim());
+  const heard = yes(extra.do_not_call) || yes(extra.asked_to_stop_calling) || extra.outcome === "do_not_call";
+  if (!heard) return null;
+  return { scope: program?.purpose === "promotional" ? "promotional" : null };
+}
+
+/**
  * Analyse finished calls that have a transcript and have not been analysed yet. `signal`
  * stops the batch: the call being read is left for the next round.
  */
@@ -244,7 +268,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
       if (c.agentId) {
         if (!programs.has(c.agentId)) {
           const row = await withTenant(tenantId, (tx) => programExtraction(tx, tenantId, c.agentId!));
-          programs.set(c.agentId, row ? { key: row.key, extraction: row.extraction, outcomes: row.outcomes } : null);
+          programs.set(c.agentId, row ? { key: row.key, extraction: row.extraction, outcomes: row.outcomes, purpose: row.purpose } : null);
         }
         program = programs.get(c.agentId) ?? null;
       }
@@ -253,7 +277,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
       if (!program && cyber) {
         if (!programs.has(CY_POLICE_PROGRAM)) {
           const p = await withTenant(tenantId, (tx) => latestProgramVersion(tx, CY_POLICE_PROGRAM).catch(() => null));
-          programs.set(CY_POLICE_PROGRAM, p ? { key: p.key, extraction: p.extraction, outcomes: p.outcomes } : null);
+          programs.set(CY_POLICE_PROGRAM, p ? { key: p.key, extraction: p.extraction, outcomes: p.outcomes, purpose: p.purpose } : null);
         }
         program = programs.get(CY_POLICE_PROGRAM) ?? null;
       }
@@ -271,14 +295,14 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
           .update(calls)
           .set({ extracted: merged, summary: x?.summary ?? c.summary, disposition: cyber ? c.disposition : ((x?.next_step as string) ?? c.disposition), analyzedAt: new Date(), analysisModel: extractor.model })
           .where(eq(calls.id, c.id));
-        if (x?.do_not_call && c.contactId) {
-          const phone = c.direction === "inbound" ? c.fromE164 : c.toE164;
-          if (phone) {
-            await tx.insert(suppressions).values({ tenantId, phoneE164: phone, reason: "opt_out", scope: null, source: `said on call ${c.externalRunId}` }).onConflictDoNothing();
-            // Handing it on runs in its own savepoint, so a queue error cannot undo the opt-out above.
-            await emitDoNotCall(tx, tenantId, phone, c.contactId, `said so on call ${c.id}`);
-            stats.optOuts++;
-          }
+        const stop = heardOptOut(x, merged, extra, program);
+        const phone = c.direction === "inbound" ? c.fromE164 : c.toE164;
+        if (stop && phone) {
+          // From the number, whether or not the caller is a contact here: it is the number that is not to be called.
+          await tx.insert(suppressions).values({ tenantId, phoneE164: phone, reason: "opt_out", scope: stop.scope, source: `said on call ${c.externalRunId}` }).onConflictDoNothing();
+          // Handing it on runs in its own savepoint, so a queue error cannot undo the opt-out above.
+          await emitDoNotCall(tx, tenantId, phone, c.contactId, `said so on call ${c.id}`);
+          stats.optOuts++;
         }
         // A complaint is not a sales lead: it opens (or adds to) the complainant's case, and
         // WhatsApp collects what the call did not. A call that was not a cyber crime opens nothing.

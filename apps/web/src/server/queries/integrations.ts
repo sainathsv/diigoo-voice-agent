@@ -1,5 +1,5 @@
 import "server-only";
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { apiKeys, clientPrograms, integrationEvents, integrations, withTenant } from "@jenai/db";
 
 /** Connections to the client's own systems, their keys, and what the last deliveries did. */
@@ -16,9 +16,18 @@ export async function loadIntegrations(tenantId: string) {
         waiting: sql<number>`count(*) filter (where status = 'queued')::int`,
         failed: sql<number>`count(*) filter (where status = 'failed')::int`,
         sentToday: sql<number>`count(*) filter (where status = 'done' and updated_at > now() - interval '24 hours')::int`,
+        skippedToday: sql<number>`count(*) filter (where status = 'skipped' and updated_at > now() - interval '24 hours')::int`,
       })
       .from(integrationEvents);
-    return { conns, keys, recent, programs, counts: counts ?? { waiting: 0, failed: 0, sentToday: 0 } };
+    // Per connection: a skip is a delivery that did not land, and one that
+    // hits every event looks like a quiet connection unless it is counted.
+    const skips = await tx
+      .select({ integrationId: integrationEvents.integrationId, n: sql<number>`count(*)::int` })
+      .from(integrationEvents)
+      .where(and(eq(integrationEvents.status, "skipped"), sql`${integrationEvents.updatedAt} > now() - interval '24 hours'`))
+      .groupBy(integrationEvents.integrationId);
+    const skippedToday = Object.fromEntries(skips.map((s) => [s.integrationId ?? "", s.n]));
+    return { conns, keys, recent, programs, skippedToday, counts: counts ?? { waiting: 0, failed: 0, sentToday: 0, skippedToday: 0 } };
   });
 }
 

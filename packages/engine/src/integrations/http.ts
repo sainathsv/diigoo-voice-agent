@@ -30,7 +30,26 @@ export function verifySignature(secret: string, body: string, header: string, no
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-async function post(ctx: ConnectorContext, url: string, headers: Record<string, string>, body: string, method = "POST"): Promise<SendResult> {
+/**
+ * The refusals that can be about the one event sent: a body their code
+ * rejects (400, 422), a clash with what they hold (409), one too big (413).
+ */
+const ABOUT_THE_EVENT = [400, 409, 413, 422];
+
+/**
+ * A refusal that every event would get: our key (401), a gateway or allow
+ * list (403), an endpoint moved or gone (404, 405, 410). A webhook has no
+ * records of its own to be missing, so skipping these one event at a time
+ * would lose every result while the connection still read "connected".
+ * Only an address that names their record ({{external_id}}) can be missing
+ * for one event alone.
+ */
+function aboutTheEndpoint(status: number, recordInUrl: boolean): boolean {
+  if (recordInUrl && (status === 404 || status === 410)) return false;
+  return status >= 400 && status < 500 && !retryable(status) && !ABOUT_THE_EVENT.includes(status);
+}
+
+async function post(ctx: ConnectorContext, url: string, headers: Record<string, string>, body: string, method = "POST", recordInUrl = false): Promise<SendResult> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
@@ -38,8 +57,7 @@ async function post(ctx: ConnectorContext, url: string, headers: Record<string, 
     await assertClientUrl(url);
     const res = await ctx.fetch(url, { method, headers, body, signal: ctrl.signal, redirect: "error" });
     const text = (await res.text().catch(() => "")).slice(0, 2000);
-    // A 401 is about the key we hold, not the record we sent: every send after it fails the same way.
-    return { ok: res.ok, httpStatus: res.status, response: text, retry: retryable(res.status), connectionBroken: res.status === 401 };
+    return { ok: res.ok, httpStatus: res.status, response: text, retry: retryable(res.status), connectionBroken: aboutTheEndpoint(res.status, recordInUrl) };
   } catch (e) {
     // The address belongs to the connection, so a refused one stops every send.
     const blocked = (e as Error).name === "BlockedUrlError";
@@ -88,7 +106,7 @@ export const restConnector: Connector = {
     if (!route?.url) return { ok: false, response: `No route configured for ${e.kind}`, retry: false };
     const url = route.url.replace(/\{\{\s*external_id\s*\}\}/g, e.externalId ?? "");
     const body = JSON.stringify(applyMapping(e.payload, ctx.integration.mapping?.[e.kind]));
-    return post(ctx, url, { "Content-Type": "application/json", ...authHeaders(ctx) }, body, route.method ?? "POST");
+    return post(ctx, url, { "Content-Type": "application/json", ...authHeaders(ctx) }, body, route.method ?? "POST", url !== route.url);
   },
 };
 

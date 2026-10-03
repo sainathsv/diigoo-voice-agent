@@ -24,18 +24,18 @@
     { "name": "front_desk_number", "label": "Front desk number", "required": true, "example": "89777 59580" }
   ],
   "extraction": [
-    { "name": "confirmed", "type": "string", "prompt": "yes if they clearly said they will come, no if they said they will not, null if it stayed unclear" },
-    { "name": "new_preferred_time", "type": "string", "prompt": "The new appointment date and time if they moved it, exactly like '20 Aug 2026, 2:00 PM'. Null if they did not reschedule." },
-    { "name": "cancelled", "type": "string", "prompt": "yes if they cancelled the appointment, else null" },
+    { "name": "confirmed", "type": "string", "prompt": "yes if they clearly said they will come, no if they said they will not, null if it stayed unclear", "shareable": true },
+    { "name": "new_preferred_time", "type": "string", "prompt": "The new appointment date and time if they moved it, exactly like '20 Aug 2026, 2:00 PM'. Null if they did not reschedule.", "shareable": true },
+    { "name": "cancelled", "type": "string", "prompt": "yes if they cancelled the appointment, else null", "shareable": true },
     { "name": "change_reason", "type": "string", "prompt": "In ENGLISH, 3 to 8 words, why they moved or cancelled (out of station, office work, family function, feeling better). Null if they confirmed." },
     { "name": "question_for_clinic", "type": "string", "prompt": "In ENGLISH, 3 to 12 words, anything they asked that the agent could not answer and the front desk must call back about. Null if none." }
   ],
   "outcomes": [
-    { "key": "confirmed", "label": "Appointment confirmed", "stage": "won" },
-    { "key": "rescheduled", "label": "Moved to a new time", "stage": "booked" },
-    { "key": "callback", "label": "Will confirm later", "stage": "callback" },
-    { "key": "cancelled", "label": "Appointment cancelled", "stage": "lost" },
-    { "key": "wrong_number", "label": "Wrong number", "stage": "lost" }
+    { "key": "confirmed", "label": "Appointment confirmed", "stage": "won", "shareable": true },
+    { "key": "rescheduled", "label": "Moved to a new time", "stage": "booked", "shareable": true },
+    { "key": "callback", "label": "Will confirm later", "stage": "callback", "shareable": true },
+    { "key": "cancelled", "label": "Appointment cancelled", "stage": "lost", "shareable": true },
+    { "key": "wrong_number", "label": "Wrong number", "stage": "lost", "shareable": true }
   ],
   "defaults": {
     "windows": { "days": [1, 2, 3, 4, 5, 6], "start": "10:00", "end": "20:00" },

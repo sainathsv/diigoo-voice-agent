@@ -246,7 +246,7 @@ export async function campaignFromProgram(tx: Tx, tenantId: string, input: Campa
 /** What the analyser should pull out of a call made by this program. */
 export async function programExtraction(tx: Tx, tenantId: string, agentId: string) {
   const [row] = await tx
-    .select({ extraction: programTemplates.extraction, outcomes: programTemplates.outcomes, key: programTemplates.key })
+    .select({ extraction: programTemplates.extraction, outcomes: programTemplates.outcomes, key: programTemplates.key, purpose: programTemplates.purpose })
     .from(agents)
     .innerJoin(clientPrograms, eq(clientPrograms.id, agents.clientProgramId))
     .innerJoin(programTemplates, and(eq(programTemplates.key, clientPrograms.programKey), eq(programTemplates.version, clientPrograms.programVersion)))

@@ -21,19 +21,19 @@
     { "name": "reschedule_contact", "label": "Number to give if they want to change the time later", "required": true, "example": "89777 59580" }
   ],
   "extraction": [
-    { "name": "booked", "type": "string", "prompt": "yes if a day AND an exact time were agreed and read back, else no" },
-    { "name": "preferred_time", "type": "string", "prompt": "The agreed appointment date and time, exactly like '20 Aug 2026, 2:00 PM'. Null if nothing was agreed." },
+    { "name": "booked", "type": "string", "prompt": "yes if a day AND an exact time were agreed and read back, else no", "shareable": true },
+    { "name": "preferred_time", "type": "string", "prompt": "The agreed appointment date and time, exactly like '20 Aug 2026, 2:00 PM'. Null if nothing was agreed.", "shareable": true },
     { "name": "not_now_reason", "type": "string", "prompt": "In ENGLISH, 3 to 8 words, why they did not book (travelling, cost, went elsewhere, feeling fine). Null if they booked." },
     { "name": "symptom_mentioned", "type": "string", "prompt": "Any symptom or problem the patient described, in ENGLISH, 3 to 8 words. Null if none." },
-    { "name": "call_again_on", "type": "string", "prompt": "Date to call again if they asked to be called later, like '20 Aug 2026'. Null otherwise." }
+    { "name": "call_again_on", "type": "string", "prompt": "Date to call again if they asked to be called later, like '20 Aug 2026'. Null otherwise.", "shareable": true }
   ],
   "outcomes": [
-    { "key": "booked", "label": "Visit booked", "stage": "booked" },
-    { "key": "callback", "label": "Call again later", "stage": "callback" },
-    { "key": "not_interested", "label": "Not coming back", "stage": "lost" },
-    { "key": "already_visited", "label": "Already came in", "stage": "won" },
-    { "key": "wrong_number", "label": "Wrong number", "stage": "lost" },
-    { "key": "do_not_call", "label": "Asked not to be called", "stage": "lost" }
+    { "key": "booked", "label": "Visit booked", "stage": "booked", "shareable": true },
+    { "key": "callback", "label": "Call again later", "stage": "callback", "shareable": true },
+    { "key": "not_interested", "label": "Not coming back", "stage": "lost", "shareable": true },
+    { "key": "already_visited", "label": "Already came in", "stage": "won", "shareable": true },
+    { "key": "wrong_number", "label": "Wrong number", "stage": "lost", "shareable": true },
+    { "key": "do_not_call", "label": "Asked not to be called", "stage": "lost", "shareable": true }
   ],
   "defaults": {
     "windows": { "days": [1, 2, 3, 4, 5, 6], "start": "10:00", "end": "19:00" },

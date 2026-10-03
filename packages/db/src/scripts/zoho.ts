@@ -10,11 +10,16 @@
  * once, and what gets stored is the refresh token, which does not expire.
  * Connecting again keeps the connection's settings; --module changes only
  * which records it writes to.
+ *
+ * Their admin grants, in the Zoho API console: ZohoCRM.modules.ALL (or the
+ * READ, CREATE and UPDATE scopes of the modules JENAI writes to),
+ * ZohoSearch.securesearch.READ, without which no caller can be found by
+ * number, and ZohoCRM.settings.READ.
  */
 import "./env";
-import { eq, and } from "drizzle-orm";
-import { credentialsOf, exchangeGrantCode, saveZohoConnection, sealCredentials, zohoConnector } from "@jenai/engine";
-import { integrations, organizations, platformDb, withTenant } from "../index";
+import { eq } from "drizzle-orm";
+import { exchangeGrantCode, saveZohoConnection, testConnection } from "@jenai/engine";
+import { organizations, platformDb, withTenant } from "../index";
 
 const arg = (name: string, fallback = "") => {
   const i = process.argv.indexOf(`--${name}`);
@@ -36,7 +41,7 @@ async function connect() {
   console.log(`\n${org.name}: exchanging the grant code at the ${dc} data centre`);
   const t = await exchangeGrantCode({ dc, clientId: need("ZOHO_CLIENT_ID"), clientSecret: need("ZOHO_CLIENT_SECRET"), code: need("ZOHO_CODE") });
   console.log(`  got a refresh token${t.apiDomain ? `, api domain ${t.apiDomain}` : ""}`);
-  console.log(t.scopes ? `  granted: ${t.scopes.join(" ")}` : "  Zoho did not list the scopes it granted, so none are recorded: each write will be tried.");
+  console.log(t.scopes ? `  granted: ${t.scopes.join(" ")}` : "  Zoho did not list the scopes it granted, so none are recorded: each write will be tried, and one Zoho refuses is left out from then on.");
 
   const saved = await withTenant(org.id, (tx) =>
     saveZohoConnection(tx, org.id, {
@@ -52,30 +57,11 @@ async function connect() {
       },
     }),
   );
-  const id = saved.integration.id;
 
   // Ask Zoho whether this actually works before calling it connected. Holding a
   // valid token proves the handshake, not that the CRM will answer: an account
   // without API access authorises happily and then refuses every request.
-  const state = await withTenant(org.id, async (tx) => {
-    const [i] = await tx.select().from(integrations).where(and(eq(integrations.id, id), eq(integrations.tenantId, org.id)));
-    const res = await zohoConnector.test({
-      integration: i!,
-      credentials: credentialsOf(i!),
-      fetch,
-      async save(patch) {
-        // sealCredentials, never sealSecret by hand: the purpose is part of the
-        // seal, and a mismatch stores a blob nothing can open.
-        await tx.update(integrations)
-          .set({ ...(patch.credentials ? { credentials: sealCredentials(org.id, patch.credentials) } : {}), ...(patch.config ? { config: { ...i!.config, ...patch.config } } : {}), updatedAt: new Date() })
-          .where(and(eq(integrations.id, i!.id), eq(integrations.tenantId, org.id)));
-      },
-    });
-    await tx.update(integrations)
-      .set({ status: res.ok ? "connected" : "error", lastOkAt: res.ok ? new Date() : null, lastError: res.ok ? null : res.message, lastErrorAt: res.ok ? null : new Date(), updatedAt: new Date() })
-      .where(and(eq(integrations.id, i!.id), eq(integrations.tenantId, org.id)));
-    return res;
-  });
+  const state = await withTenant(org.id, (tx) => testConnection(tx, org.id, saved.integration));
 
   console.log(`  ${saved.reconnected ? "reconnected, settings kept" : "stored"} against ${org.name}, writing to ${String(saved.integration.config.module)}.`);
   console.log(state.ok ? `  VERIFIED: ${state.message}` : `  STORED BUT NOT WORKING: ${state.message}`);

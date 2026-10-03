@@ -27,7 +27,7 @@ export default async function IntegrationsPage({ params, searchParams }: { param
   if (!can(ctx.access, "integrations:manage") && !can(ctx.access, "apikeys:manage")) return deny(ctx, { perm: "integrations:manage" });
   const manage = can(ctx.access, "integrations:manage");
   const keysAllowed = can(ctx.access, "apikeys:manage");
-  const { conns, keys, recent, programs, counts } = await loadIntegrations(ctx.org.id);
+  const { conns, keys, recent, programs, counts, skippedToday } = await loadIntegrations(ctx.org.id);
   const base = process.env.JENAI_PUBLIC_URL ?? "http://localhost:3100";
   const example = programs[0]?.key ?? "clinic.appointment_reminder";
 
@@ -45,11 +45,12 @@ export default async function IntegrationsPage({ params, searchParams }: { param
         </div>
       ) : null}
 
-      <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-5">
         <Stat label="Connected systems" value={conns.filter((c) => c.status === "connected").length} />
         <Stat label="Sent, last 24 h" value={counts.sentToday} />
         <Stat label="Waiting to send" value={counts.waiting} tone={counts.waiting > 50 ? "warn" : undefined} />
         <Stat label="Could not be sent" value={counts.failed} tone={counts.failed > 0 ? "bad" : undefined} />
+        <Stat label="Skipped, last 24 h" value={counts.skippedToday} tone={counts.skippedToday > 0 ? "warn" : undefined} />
       </div>
 
       <Section title="Connected systems" sub="Each one gets the call result within seconds. If it is down, JENAI keeps trying for a day.">
@@ -70,7 +71,8 @@ export default async function IntegrationsPage({ params, searchParams }: { param
                     <td className="text-[12.5px]">{c.events.length ? c.events.join(", ") : "everything"}</td>
                     <td><StatusBadge status={c.status} /></td>
                     <td className="whitespace-nowrap text-[12.5px] text-ink-soft">
-                      {c.lastError ? <span className="text-bad">{c.lastError.slice(0, 60)}</span> : c.lastOkAt ? `worked ${fmtDate(c.lastOkAt)}` : "not tested"}
+                      {c.lastError ? <span className="text-bad" title={c.lastError}>{c.lastError.slice(0, 60)}</span> : c.lastOkAt ? `worked ${fmtDate(c.lastOkAt)}` : "not tested"}
+                      {skippedToday[c.id] ? <div className="text-warn">{skippedToday[c.id]} skipped in 24 h</div> : null}
                     </td>
                     {manage ? (
                       <td>
@@ -78,7 +80,7 @@ export default async function IntegrationsPage({ params, searchParams }: { param
                           <Act slug={slug} id={c.id} action={testSystem} label="Test" />
                           {c.kind === "webhook_out" ? <Act slug={slug} id={c.id} action={revealSigningSecret} label="Signing secret" /> : null}
                           {c.status === "paused" ? <Act slug={slug} id={c.id} action={setSystemStatus} label="Resume" to="connected" /> : <Act slug={slug} id={c.id} action={setSystemStatus} label="Pause" to="paused" />}
-                          <Act slug={slug} id={c.id} action={retryDeliveries} label="Send failed again" />
+                          <Act slug={slug} id={c.id} action={retryDeliveries} label="Send again what did not go" />
                           <Act slug={slug} id={c.id} action={setSystemStatus} label="Remove" to="removed" danger />
                         </div>
                       </td>
@@ -116,7 +118,7 @@ export default async function IntegrationsPage({ params, searchParams }: { param
               <div className="flex flex-wrap gap-4 text-[13.5px]">
                 <label className="flex items-center gap-2"><input type="checkbox" name="event_call.completed" defaultChecked /> Call results</label>
                 <label className="flex items-center gap-2"><input type="checkbox" name="event_appointment.booked" defaultChecked /> Bookings</label>
-                <label className="flex items-center gap-2"><input type="checkbox" name="event_do_not_call.added" /> Do-not-call requests</label>
+                <label className="flex items-center gap-2"><input type="checkbox" name="event_do_not_call.added" defaultChecked /> Do-not-call requests</label>
                 <label className="flex items-center gap-2"><input type="checkbox" name="event_lead.updated" /> Lead stage and follow-up changes</label>
               </div>
             </fieldset>
@@ -143,7 +145,7 @@ export default async function IntegrationsPage({ params, searchParams }: { param
                 <div><label className="label" htmlFor="client_id">Client id</label><input className="input" id="client_id" name="client_id" maxLength={200} /></div>
                 <div><label className="label" htmlFor="client_secret">Client secret</label><input className="input" id="client_secret" name="client_secret" type="password" maxLength={200} /></div>
                 <div className="md:col-span-2"><label className="label" htmlFor="refresh_token">Refresh token</label><input className="input" id="refresh_token" name="refresh_token" type="password" maxLength={400} /></div>
-                <p className="md:col-span-2 text-[12px] text-grey">From your Zoho API console: a Self Client with the CRM modules scope. JENAI stores these encrypted and uses them only to write your call results back.</p>
+                <p className="md:col-span-2 text-[12px] text-grey">From your Zoho API console: a Self Client with the scopes ZohoCRM.modules.ALL and ZohoSearch.securesearch.READ (the second is how JENAI finds a caller by number). Connecting Zoho again takes only these credentials and keeps the connection&apos;s settings. JENAI stores them encrypted and uses them only to write your call results back.</p>
               </div>
             </details>
             <div className="lg:col-span-2">
@@ -234,12 +236,13 @@ curl ${base}/api/v1/programs -H "Authorization: Bearer jk_live_..."`}</pre>
         ) : (
           <div className="tbl-wrap">
             <table className="tbl">
-              <thead><tr><th>When</th><th>What</th><th>Direction</th><th>State</th><th>Their answer</th></tr></thead>
+              <thead><tr><th>When</th><th>What</th><th>Who</th><th>Direction</th><th>State</th><th>Their answer</th></tr></thead>
               <tbody>
                 {recent.map((e) => (
                   <tr key={e.id}>
                     <td className="whitespace-nowrap text-ink-soft">{fmtDate(e.createdAt)}</td>
                     <td className="font-mono text-[12px]">{e.kind}</td>
+                    <td className="whitespace-nowrap text-[12.5px]">{who(e.payload)}</td>
                     <td>{e.direction === "out" ? "to your system" : "from your system"}</td>
                     <td><StatusBadge status={e.status === "done" ? "passed" : e.status === "failed" ? "failed" : e.status} /></td>
                     <td className="max-w-[320px] truncate text-[12.5px] text-ink-soft">{e.error ?? e.response ?? (e.httpStatus ? `HTTP ${e.httpStatus}` : "")}</td>
@@ -252,6 +255,12 @@ curl ${base}/api/v1/programs -H "Authorization: Bearer jk_live_..."`}</pre>
       </Section>
     </>
   );
+}
+
+/** The person a delivery was about, so a skipped one can be acted on (added to their CRM, say). */
+function who(payload: Record<string, unknown>): string {
+  const p = (payload.person ?? {}) as Record<string, unknown>;
+  return [p.name, p.phone].filter((x) => typeof x === "string" && x).join(", ");
 }
 
 function Stat({ label, value, tone }: { label: string; value: number; tone?: "warn" | "bad" }) {
