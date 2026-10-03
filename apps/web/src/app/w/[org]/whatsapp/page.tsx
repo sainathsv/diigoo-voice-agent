@@ -83,6 +83,11 @@ export default async function WhatsappPage({ params, searchParams }: { params: P
                 {w.queue.stuck ? <span className="text-bad"> · {w.queue.stuck} could not be read</span> : null}
                 {w.channel?.updatedAt ? <> · last change {fmtDate(w.channel.updatedAt)}</> : null}
                 {w.queue.lastError && (w.queue.stuck || w.queue.retrying) ? <div className={w.queue.stuck ? "mt-1 text-bad" : "mt-1"}>Reason: {w.queue.lastError}</div> : null}
+                {w.outbox.failed ? (
+                  <div className="mt-1 text-bad">
+                    Replies WhatsApp did not take in the last day: {w.outbox.failed} (sent again by itself every 2 minutes){w.outbox.lastError ? <> · Reason: {w.outbox.lastError}</> : null}
+                  </div>
+                ) : null}
               </div>
               {w.queue.stuck ? (
                 <form action={retryWhatsappInbox}>

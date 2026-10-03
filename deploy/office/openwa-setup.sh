@@ -35,7 +35,6 @@ if ! sudo test -f $OW/.env; then
   sudo tee $OW/.env >/dev/null <<ENVFILE
 API_MASTER_KEY=$(openssl rand -hex 32)
 ENGINE_TYPE=whatsapp-web.js
-SEND_PACING_ENABLED=true
 SSRF_ALLOWED_HOSTS=host.docker.internal
 UPDATE_CHECK_ENABLED=false
 ENABLE_SWAGGER=false
@@ -44,6 +43,13 @@ ENVFILE
   sudo chmod 600 $OW/.env
   echo "gateway key made and kept in $OW/.env (root only)"
 fi
+# No sending limits: the cyber cell answers every complainant (the department's decision,
+# 2026-10-03). OpenWA's API limits sit far above what this server sends; it listens here only.
+owset() { if sudo grep -q "^$1=" $OW/.env; then sudo sed -i "s#^$1=.*#$1=$2#" $OW/.env; else echo "$1=$2" | sudo tee -a $OW/.env >/dev/null; fi; }
+owset SEND_PACING_ENABLED false
+owset RATE_LIMIT_SHORT_LIMIT 1000
+owset RATE_LIMIT_MEDIUM_LIMIT 20000
+owset RATE_LIMIT_LONG_LIMIT 1000000
 sudo tee $OW/docker-compose.yml >/dev/null <<COMPOSE
 services:
   openwa:
@@ -72,7 +78,7 @@ services:
 volumes:
   openwa-data:
 COMPOSE
-sudo docker compose --project-directory $OW -f $OW/docker-compose.yml pull -q && sudo docker compose --project-directory $OW -f $OW/docker-compose.yml up -d
+sudo docker compose --project-directory $OW -f $OW/docker-compose.yml pull -q && sudo docker compose --project-directory $OW -f $OW/docker-compose.yml up -d --force-recreate
 printf "waiting for OpenWA"
 for _ in $(seq 1 60); do curl -sf http://127.0.0.1:2785/api/health/ready >/dev/null && break; printf "."; sleep 3; done
 echo

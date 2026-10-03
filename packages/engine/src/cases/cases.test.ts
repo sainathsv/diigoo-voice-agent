@@ -9,10 +9,10 @@ import { eq } from "drizzle-orm";
 import { agents, calls, caseCalls, caseEvidence, caseMessages, cases, organizations, platformDb, whatsappChannels, whatsappInbox, withTenant } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { scamKeyFromText } from "../scams";
-import { ResilientReader, caseFromCall, complainantNumber, fieldsFromCall, followUpCalls, handleInbound, parseRead, remindPending, type CaseReader, type ReadResult } from "./cases";
+import { ResilientReader, caseFromCall, complainantNumber, fieldsFromCall, followUpCalls, handleInbound, parseRead, remindPending, resendFailed, type CaseReader, type ReadResult } from "./cases";
 import { missingFor, questionFor, reminderText } from "./catalog";
 import { INBOX_MAX_ATTEMPTS, processInbox, queueInbound, retryInbox } from "./inbox";
-import { SimulatedWhatsApp, chatIdFor, parseOpenWaWebhook, validSignature, type QueuedMessage } from "./whatsapp";
+import { SimulatedWhatsApp, chatIdFor, parseOpenWaWebhook, validSignature, type QueuedMessage, type WhatsAppSender } from "./whatsapp";
 import { createHmac } from "node:crypto";
 
 let tenant = "";
@@ -333,6 +333,32 @@ describe("each call is followed once", () => {
     expect(wa.sent).toHaveLength(1);
     expect(k!.fields.district).toBe("Almora");
     expect(await withTenant(tenant, (tx) => tx.select().from(caseCalls).where(eq(caseCalls.callId, fresh!.id)))).toHaveLength(1);
+  });
+});
+
+describe("replies WhatsApp refused", () => {
+  const refusing = (why: string): WhatsAppSender => ({
+    mode: "openwa",
+    sendText: async () => Promise.reject(new Error(why)),
+    fetchMedia: async () => Promise.reject(new Error("no media")),
+  });
+  const opened = (who: string, sender: WhatsAppSender) =>
+    withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id: randomUUID(), phone: who, contactId: null, branchId: null, extracted: { complaint_type: "UPI fraud", money_lost: "900", how_it_happened: "Paid a fake seller" } }, sender));
+
+  it("are sent again when the gateway takes them, once, and only when the refusal can pass", async () => {
+    const paced = await opened("+919800000081", refusing("OpenWA refused POST /sessions/:session/messages/send-text (429): Daily send allowance of 40 reached for a session 1 day(s) old"));
+    await opened("+919800000082", refusing("OpenWA refused POST /sessions/:session/messages/send-text (400): chatId must be a WhatsApp id"));
+    const [m] = await withTenant(tenant, (tx) => tx.select().from(caseMessages).where(eq(caseMessages.caseId, paced!.id)));
+    expect(m!.status).toBe("failed");
+    // Still refused: kept for the next round, with the newest reason.
+    expect(await resendFailed(tenant, refusing("OpenWA refused POST /sessions/:session/messages/send-text (409): Session is not connected"))).toBe(0);
+    const wa = new SimulatedWhatsApp();
+    expect(await resendFailed(tenant, wa)).toBe(1); // the 400 is not tried again
+    expect(wa.sent).toEqual([{ to: "+919800000081", body: m!.body }]);
+    const [again] = await withTenant(tenant, (tx) => tx.select().from(caseMessages).where(eq(caseMessages.id, m!.id)));
+    expect(again!.status).toBe("simulated");
+    expect(again!.error).toBeNull();
+    expect(await resendFailed(tenant, wa)).toBe(0);
   });
 });
 

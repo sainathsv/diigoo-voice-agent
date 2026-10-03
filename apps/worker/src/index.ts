@@ -50,6 +50,7 @@ import {
   followUpCalls,
   processInbox,
   remindPending,
+  resendFailed,
   claimDeliveries,
   claimSafetyChecks,
   deliver,
@@ -187,6 +188,7 @@ async function whatsappLoop() {
   }
   log("whatsapp.reader", { ai: reader.ai ? (LOCAL_AI ? "on this server" : "cloud") : "none: plain answers only" });
   let lastReminders = 0;
+  let lastResend = 0;
   while (!stopping) {
     let progressed = false;
     try {
@@ -196,6 +198,14 @@ async function whatsappLoop() {
         const r = await processInbox(t.id, reader);
         if (r.handled || r.failed) log("whatsapp.inbox", { tenant: t.id.slice(0, 8), ...r });
         if (r.handled) progressed = true;
+      }
+      // A message WhatsApp could not take (gateway busy, disconnected, pacing) goes again.
+      if (Date.now() - lastResend > 2 * 60_000) {
+        lastResend = Date.now();
+        for (const t of tenants) {
+          const n = await resendFailed(t.id);
+          if (n) log("whatsapp.resent", { tenant: t.id.slice(0, 8), count: n });
+        }
       }
       if (Date.now() - lastReminders > 10 * 60_000) {
         lastReminders = Date.now();

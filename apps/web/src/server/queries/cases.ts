@@ -83,14 +83,22 @@ export async function loadWhatsappLink(tenantId: string) {
       .from(whatsappInbox),
   );
   const queue = { waiting: q?.waiting ?? 0, stuck: q?.stuck ?? 0, retrying: q?.retrying ?? 0, lastError: q?.lastError ?? null };
-  if (!ch) return { channel: null, live: null as OpenWaSession | null, qr: null as string | null, error: null as string | null, queue };
+  // Replies WhatsApp did not take in the last day (the worker sends them again by itself).
+  const [o] = await withTenant(tenantId, (tx) =>
+    tx
+      .select({ failed: sql<number>`count(*)::int`, lastError: sql<string | null>`(array_agg(${caseMessages.error} order by ${caseMessages.at} desc))[1]` })
+      .from(caseMessages)
+      .where(and(eq(caseMessages.direction, "out"), eq(caseMessages.status, "failed"), sql`${caseMessages.at} > now() - interval '1 day'`)),
+  );
+  const outbox = { failed: o?.failed ?? 0, lastError: o?.lastError ?? null };
+  if (!ch) return { channel: null, live: null as OpenWaSession | null, qr: null as string | null, error: null as string | null, queue, outbox };
   const gw = openWaFor(ch);
-  if (!gw) return { channel: safe(ch), live: null, qr: null, error: null, queue };
+  if (!gw) return { channel: safe(ch), live: null, qr: null, error: null, queue, outbox };
   try {
     const live = await gw.session();
     const qr = live.status === "qr_ready" ? await gw.qr().catch(() => null) : null;
-    return { channel: safe(ch), live, qr, error: null, queue };
+    return { channel: safe(ch), live, qr, error: null, queue, outbox };
   } catch (e) {
-    return { channel: safe(ch), live: null, qr: null, error: (e as Error).message.slice(0, 300), queue };
+    return { channel: safe(ch), live: null, qr: null, error: (e as Error).message.slice(0, 300), queue, outbox };
   }
 }

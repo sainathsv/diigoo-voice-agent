@@ -710,3 +710,42 @@ export async function remindPending(tenantId: string, now = new Date(), policy =
     return sent;
   });
 }
+
+// ------------------------------------------------------------------ sending again
+
+/** A refusal that can pass on another try: the gateway busy, disconnected or pacing sends, a timeout. */
+const TRANSIENT = /\((408|409|425|429|5\d\d)\)|timed? ?out|abort|fetch failed|ECONNREFUSED|ECONNRESET|not connected|not ready/i;
+
+/**
+ * Messages WhatsApp could not take at the time are sent again: for each complaint its newest
+ * message, when that one failed for a reason that can pass (the gateway was busy, disconnected
+ * or pacing sends), within two days. Earlier failed ones are not repeated: the newest message
+ * already says where the complaint stands. Stops at the first refusal, to try again later.
+ */
+export async function resendFailed(tenantId: string, sender?: WhatsAppSender, limit = 10): Promise<number> {
+  return withTenant(tenantId, async (tx) => {
+    const wa = await whatsappFor(tx, tenantId, sender);
+    if (!wa) return 0;
+    const newest = await tx
+      .selectDistinctOn([caseMessages.caseId])
+      .from(caseMessages)
+      .where(gte(caseMessages.at, new Date(Date.now() - 2 * 86_400_000)))
+      .orderBy(caseMessages.caseId, desc(caseMessages.at));
+    const due = newest.filter((m) => m.direction === "out" && m.status === "failed" && m.body && !m.body.startsWith("(") && TRANSIENT.test(m.error ?? "")).slice(0, limit);
+    let sent = 0;
+    for (const m of due) {
+      const [c] = await tx.select().from(cases).where(eq(cases.id, m.caseId));
+      if (!c || c.status === "closed") continue;
+      try {
+        const r = await wa.sender.sendText(chatOf(c), m.body!);
+        await tx.update(caseMessages).set({ status: wa.sender.mode === "simulated" ? "simulated" : "sent", externalId: r.id, error: null, at: new Date() }).where(eq(caseMessages.id, m.id));
+        await tx.update(cases).set({ lastOutboundAt: new Date() }).where(eq(cases.id, c.id));
+        sent++;
+      } catch (e) {
+        await tx.update(caseMessages).set({ error: (e as Error).message.slice(0, 300) }).where(eq(caseMessages.id, m.id));
+        break;
+      }
+    }
+    return sent;
+  });
+}
