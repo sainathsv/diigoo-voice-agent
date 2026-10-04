@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { externalLinks, integrationEvents, integrations, leads, openSecret, sealSecret, withTenant, type Db, type Integration, type Tx } from "@jenai/db";
 import { webhookConnector, restConnector } from "./http";
 import { zohoConnector } from "./zoho";
+import { zenotiConnector } from "./zenoti";
 import { sharedWith, type Connector, type ConnectorContext, type OutEvent, type Withheld } from "./types";
 
 /**
@@ -14,6 +15,7 @@ export const CONNECTORS: Record<string, Connector> = {
   webhook_out: webhookConnector,
   rest_generic: restConnector,
   zoho_crm: zohoConnector,
+  zenoti: zenotiConnector,
 };
 
 const PURPOSE = "integration-credentials";
