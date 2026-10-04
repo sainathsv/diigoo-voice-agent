@@ -5,10 +5,11 @@
  *   JENAI_REAL_DIALS=true   place real calls (still only for clients in managed mode with an API key)
  *   JENAI_SYNC=true         pull calls from the voice engine every JENAI_SYNC_SECONDS (default 300)
  *   JENAI_ANALYZE=true      read new transcripts with the analyzer (Bedrock Mumbai, or a local model)
- *   JENAI_PULL=true         read each client's CRM (Zoho Leads and Contacts, read only) every
- *                           config.pull.intervalMinutes (default 10), JENAI_PULL_PAGES requests
- *                           a read (default 5), and plan everyone's calls again after each read;
- *                           clients with visits but no CRM read are planned again hourly
+ *   JENAI_PULL=true         read the CRM (Zoho Leads and Contacts, read only) of each client who
+ *                           switched their call plan on, every config.pull.intervalMinutes
+ *                           (default 10), JENAI_PULL_PAGES requests a read (default 5, at least 2
+ *                           a module), JENAI_PULL_CONCURRENCY reads at a time (default 3), and plan
+ *                           their calls again when a read brings something new
  * Without them the dialer uses the simulated carrier and nothing touches the live engine.
  * The call plan is a preview: the pull never dials, never creates campaign targets and never
  * writes to a client's CRM.
@@ -18,6 +19,11 @@
  * the suite or model changes, or after JENAI_SAFETY_RECHECK_DAYS (default 90).
  * Cost control for a large fleet: at most JENAI_SAFETY_SWEEP_PER_HOUR (default
  * 100) re-checks are queued per hour; publish checks always go first.
+ *
+ * The plan refresh loop is ON by default (JENAI_PLAN_REFRESH=false turns it off): every
+ * client's call plan is worked out again at least hourly, and within a minute or so of
+ * someone being added to or taken off a do-not-call list, JENAI_PLAN_REFRESH_CONCURRENCY
+ * clients at a time (default 2). It reads only JENAI's own tables and never dials.
  *
  * The integrations loop is ON by default (JENAI_INTEGRATIONS=false turns it
  * off): it hands call results back to each client's own system (their CRM),
@@ -71,7 +77,9 @@ import {
   logNotifier,
   notifyPending,
   maintainSecurityEvents,
-  plansToRefresh,
+  claimReplans,
+  deferReplan,
+  errorText,
   pullAndPlan,
   replanTenant,
   requeueStuckPulls,
@@ -96,11 +104,13 @@ const INTEGRATIONS = !POLICE && process.env.JENAI_INTEGRATIONS !== "false";
 const WHATSAPP = process.env.JENAI_WHATSAPP !== "false";
 const DELIVERY_BATCH = Math.max(1, Number(process.env.JENAI_INTEGRATIONS_BATCH ?? 10));
 const PULL = !POLICE && process.env.JENAI_PULL === "true"; // a police server sends nothing elsewhere
-const PULL_PAGES = Math.max(1, Number(process.env.JENAI_PULL_PAGES ?? 5) || 5);
-/** Connections read at once by this worker. Each is a different client's CRM, so they do not wait on each other. */
-const PULL_BATCH = 3;
-/** Clients planned again per pass of the hourly refresh, so a large fleet is spread over passes. */
-const REPLAN_BATCH = 50;
+/** Requests a read may make. Each module is sure of 2 whatever this says (crm-sync), so a low number cannot starve one. */
+const PULL_PAGES = Math.max(2, Number(process.env.JENAI_PULL_PAGES ?? 5) || 5);
+/** Reads under way at once on this worker. Each is a different client's CRM; a slow one holds only its own slot. */
+const PULL_CONCURRENCY = Math.max(1, Number(process.env.JENAI_PULL_CONCURRENCY ?? 3) || 3);
+const REFRESH = !POLICE && process.env.JENAI_PLAN_REFRESH !== "false";
+/** Plans worked out at once by the refresh loop. */
+const REFRESH_CONCURRENCY = Math.max(1, Number(process.env.JENAI_PLAN_REFRESH_CONCURRENCY ?? 2) || 2);
 const SYNC_MS = Math.max(60, Number(process.env.JENAI_SYNC_SECONDS ?? 300)) * 1000;
 const TICK_MS = 3000;
 let stopping = false;
@@ -332,73 +342,109 @@ async function integrationsLoop() {
 }
 
 /**
- * Keeps every client's call plan current. Reads due CRM connections a few at
- * a time and plans that client again after each read; every few minutes,
- * plans again the clients whose plan is over an hour old and that no read
- * will plan soon. One client failing is logged and the rest carry on. Never
- * dials and never creates campaign targets.
+ * Runs up to `slots` jobs at once: as each ends, `claim` is asked for more,
+ * so one slow job holds only its own slot. Waits `idleMs` when nothing was
+ * claimed and nothing is running. `beforeClaim` runs at most once a minute.
  */
-async function planLoop() {
-  let lastRequeue = 0;
-  let lastRefresh = 0;
-  /** A client whose plan failed is not tried again for an hour, so one fault does not fill the log. */
-  const failed = new Map<string, number>();
+async function pool<T>(name: string, slots: number, claim: (n: number) => Promise<T[]>, run: (job: T) => Promise<void>, idleMs: number, beforeClaim?: () => Promise<void>) {
+  const running = new Set<Promise<void>>();
+  let lastHousekeeping = 0;
   while (!stopping) {
-    let claimed: Array<{ tenantId: string; id: string }> = [];
     try {
-      if (Date.now() - lastRequeue > 60_000) {
-        lastRequeue = Date.now();
-        const stuck = await acrossDatabases(async (db) => [await requeueStuckPulls(db)]);
-        const n = stuck.rows.reduce((a, b) => a + b, 0);
-        if (n) log("plan.pull_requeued", { count: n });
-        for (const e of stuck.errors) log("plan.error", { message: e });
+      if (beforeClaim && Date.now() - lastHousekeeping > 60_000) {
+        lastHousekeeping = Date.now();
+        await beforeClaim();
       }
-      const due = await acrossDatabases((db) => claimPulls(db, PULL_BATCH));
-      for (const e of due.errors) log("plan.error", { message: e });
-      claimed = due.rows;
-      await Promise.all(
-        claimed.map(async (c) => {
-          try {
-            const r = await pullAndPlan(c.tenantId, c.id, { pageBudget: PULL_PAGES, scheduled: true });
-            log("plan.pulled", {
-              tenant: c.tenantId.slice(0, 8),
-              read: r.sync.modules.reduce((n, m) => n + m.read, 0),
-              deleted: r.sync.modules.reduce((n, m) => n + m.deleted, 0),
-              pages: r.sync.pages,
-              caughtUp: r.sync.done,
-              planned: r.plan?.rows ?? null,
-              error: (r.planError ?? r.sync.error)?.slice(0, 160),
-            });
-          } catch (e) {
-            log("plan.pull_error", { tenant: c.tenantId.slice(0, 8), message: (e as Error).message.slice(0, 200) });
-          }
-        }),
-      );
-      if (Date.now() - lastRefresh > 5 * 60_000) {
-        lastRefresh = Date.now();
-        // Asked for as many more as are resting after a failure, so they never crowd out the rest.
-        const old = await acrossDatabases((db) => plansToRefresh(db, REPLAN_BATCH + failed.size));
-        for (const e of old.errors) log("plan.error", { message: e });
-        let done = 0;
-        for (const tenantId of old.rows) {
-          if (stopping || done >= REPLAN_BATCH) break;
-          if (Date.now() - (failed.get(tenantId) ?? 0) < 3_600_000) continue;
-          done++;
-          try {
-            const p = await replanTenant(tenantId);
-            failed.delete(tenantId);
-            log("plan.refreshed", { tenant: tenantId.slice(0, 8), people: p.people, rows: p.rows, removed: p.removed });
-          } catch (e) {
-            failed.set(tenantId, Date.now());
-            log("plan.refresh_error", { tenant: tenantId.slice(0, 8), message: (e as Error).message.slice(0, 200) });
-          }
-        }
+      const free = slots - running.size;
+      const jobs = free > 0 ? await claim(free) : [];
+      for (const job of jobs) {
+        const p: Promise<void> = run(job)
+          .catch((e) => log(`${name}.error`, { message: errorText(e).slice(0, 200) }))
+          .finally(() => running.delete(p));
+        running.add(p);
       }
+      if (!running.size) await new Promise((r) => setTimeout(r, idleMs));
+      else if (!jobs.length || running.size >= slots) await Promise.race([...running, new Promise((r) => setTimeout(r, 5_000))]);
     } catch (e) {
-      log("plan.error", { message: (e as Error).message });
+      log(`${name}.error`, { message: errorText(e).slice(0, 200) });
+      await new Promise((r) => setTimeout(r, idleMs));
     }
-    if (!claimed.length) await new Promise((r) => setTimeout(r, 15_000));
   }
+  await Promise.allSettled([...running]);
+}
+
+/**
+ * Reads the CRM of each client who switched their call plan on, when it is
+ * due, PULL_CONCURRENCY at a time, and plans that client again when a read
+ * brings something new. One client failing is logged and the rest carry on.
+ * Never dials and never creates campaign targets.
+ */
+async function pullLoop() {
+  await pool(
+    "plan",
+    PULL_CONCURRENCY,
+    async (n) => {
+      const due = await acrossDatabases((db) => claimPulls(db, n));
+      for (const e of due.errors) log("plan.error", { message: e });
+      // Claimed on every database at once, so this can hand back more than asked for; all of it is read.
+      return due.rows;
+    },
+    async (c) => {
+      try {
+        const r = await pullAndPlan(c.tenantId, c.id, { pageBudget: PULL_PAGES, scheduled: true });
+        log("plan.pulled", {
+          tenant: c.tenantId.slice(0, 8),
+          read: r.sync.modules.reduce((n, m) => n + m.read, 0),
+          changed: r.sync.modules.reduce((n, m) => n + m.changed, 0),
+          deleted: r.sync.modules.reduce((n, m) => n + m.deleted, 0),
+          pages: r.sync.pages,
+          caughtUp: r.sync.done,
+          planned: r.plan?.rows ?? null,
+          broken: r.sync.connectionBroken ?? false,
+          // Notes name modules and counts, never a person.
+          notes: r.sync.modules.flatMap((m) => m.notes ?? []).map((x) => x.slice(0, 200)),
+          error: (r.planError ?? r.sync.error)?.slice(0, 160),
+        });
+      } catch (e) {
+        log("plan.pull_error", { tenant: c.tenantId.slice(0, 8), message: errorText(e).slice(0, 200) });
+      }
+    },
+    15_000,
+    async () => {
+      const stuck = await acrossDatabases(async (db) => [await requeueStuckPulls(db)]);
+      const n = stuck.rows.reduce((a, b) => a + b, 0);
+      if (n) log("plan.pull_requeued", { count: n });
+      for (const e of stuck.errors) log("plan.error", { message: e });
+    },
+  );
+}
+
+/**
+ * Works out again every client plan that is due on its own clock (hourly,
+ * sooner after a do-not-call change), REFRESH_CONCURRENCY at a time, claimed
+ * so that several workers never do the same client. Runs whether or not
+ * CRMs are read: a plan moves on with the days.
+ */
+async function refreshLoop() {
+  await pool(
+    "plan",
+    REFRESH_CONCURRENCY,
+    async (n) => {
+      const due = await acrossDatabases((db) => claimReplans(db, n));
+      for (const e of due.errors) log("plan.error", { message: e });
+      return due.rows;
+    },
+    async (tenantId) => {
+      try {
+        const p = await replanTenant(tenantId);
+        log("plan.refreshed", { tenant: tenantId.slice(0, 8), people: p.people, rows: p.rows, written: p.written, removed: p.removed });
+      } catch (e) {
+        await deferReplan(tenantId).catch(() => undefined);
+        log("plan.refresh_error", { tenant: tenantId.slice(0, 8), message: errorText(e).slice(0, 200) });
+      }
+    },
+    60_000,
+  );
 }
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -409,7 +455,7 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
-log("worker.started", { whatsapp: WHATSAPP, edition: POLICE ? "police" : "full", realDials: REAL, sync: SYNC, analyze: ANALYZE, syncSeconds: SYNC_MS / 1000, security: SECURITY, alertTopic: ALERT_TOPIC ? "sns" : "log", safety: SAFETY, safetyRecheckDays: RECHECK_DAYS, integrations: INTEGRATIONS, pull: PULL, pullPages: PULL_PAGES });
+log("worker.started", { whatsapp: WHATSAPP, edition: POLICE ? "police" : "full", realDials: REAL, sync: SYNC, analyze: ANALYZE, syncSeconds: SYNC_MS / 1000, security: SECURITY, alertTopic: ALERT_TOPIC ? "sns" : "log", safety: SAFETY, safetyRecheckDays: RECHECK_DAYS, integrations: INTEGRATIONS, pull: PULL, pullPages: PULL_PAGES, pullConcurrency: PULL_CONCURRENCY, planRefresh: REFRESH });
 void dialerLoop();
 if (SYNC) void syncLoop();
 if (SYNC && ANALYZE) void analyzeLoop();
@@ -417,7 +463,8 @@ if (SECURITY) void securityLoop();
 if (SAFETY) void safetyLoop();
 if (INTEGRATIONS) void integrationsLoop();
 if (WHATSAPP) void whatsappLoop();
-if (PULL) void planLoop();
+if (PULL) void pullLoop();
+if (REFRESH) void refreshLoop();
 try {
   const line = lineConfigFromEnv();
   if (line) void lineLoop(line);

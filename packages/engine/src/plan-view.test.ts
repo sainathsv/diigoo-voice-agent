@@ -6,11 +6,12 @@
 import "@jenai/db/env";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { inArray } from "drizzle-orm";
-import { PLANNED_CALL_VERDICTS, branches, crmRecords, integrations, organizations, plannedCalls, platformDb, withTenant } from "@jenai/db";
+import { eq, inArray } from "drizzle-orm";
+import { PLANNED_CALL_VERDICTS, branches, crmRecords, integrations, organizations, plannedCalls, platformDb, suppressions, withTenant } from "@jenai/db";
 import { PLAN_JOURNEYS } from "./care-plan";
 import { importVisits } from "./visits-import";
 import { PLAN_VIEW_PAGE, planView } from "./plan-view";
+import { planSummary } from "./plan-refresh";
 
 let clinic = "";
 let other = "";
@@ -175,6 +176,37 @@ describe("the call plan page", () => {
 
     const none = await planView(clinic, { branchIds: [] });
     expect(none).toMatchObject({ total: 0, rows: [], byJourney: [] });
+  });
+
+  it("shows someone who asks not to be called since the plan was worked out as kept out at once", async () => {
+    const before = await planView(clinic, { journey: "visit_feedback" });
+    const anitha = before.rows.find((r) => r.name === "Anitha")!;
+    expect(anitha.verdict).not.toBe("kept_out");
+    await withTenant(clinic, (tx) => tx.insert(suppressions).values({ tenantId: clinic, phoneE164: ANITHA, reason: "opt_out", scope: null, source: "call" }));
+    try {
+      const after = await planView(clinic, { journey: "visit_feedback" });
+      expect(after.rows.find((r) => r.id === anitha.id)).toMatchObject({ verdict: "kept_out", reason: "Asked not to be called.", callAt: null });
+      const feedbackOut = (v: typeof before) => v.byJourney.find((j) => j.journey === "visit_feedback")!.kept_out;
+      expect(feedbackOut(after)).toBe(feedbackOut(before) + 1);
+      expect(after.byVerdict.kept_out).toBeGreaterThan(before.byVerdict.kept_out);
+      expect((await planView(clinic, { verdict: "kept_out", journey: "visit_feedback" })).rows.map((r) => r.id)).toContain(anitha.id);
+      expect((await planSummary(clinic)).next.every((n) => !n.phone.endsWith("1111"))).toBe(true);
+      // An opt-out from offers only, or the DND register, stops none of these calls.
+      await withTenant(clinic, async (tx) => {
+        await tx.delete(suppressions).where(eq(suppressions.tenantId, clinic));
+        await tx.insert(suppressions).values({ tenantId: clinic, phoneE164: ANITHA, reason: "opt_out", scope: "promotional", source: "call" });
+      });
+      expect((await planView(clinic, { journey: "visit_feedback" })).rows.find((r) => r.id === anitha.id)!.verdict).toBe(anitha.verdict);
+    } finally {
+      await withTenant(clinic, (tx) => tx.delete(suppressions).where(eq(suppressions.tenantId, clinic)));
+    }
+  });
+
+  it("says whether the plan is switched on, when it was worked out and the upload it can take out", async () => {
+    const v = await planView(clinic);
+    expect(v).toMatchObject({ enabled: false, canEnable: true, timezone: "Asia/Kolkata", callingWindow: { start: "10:00", end: "19:00" } });
+    expect(v.visits.lastUpload!.batch).toMatch(/^[0-9a-f-]{36}$/);
+    expect(v.sources[0]!.lastPullNotes).toEqual([]);
   });
 
   it("shows another client nothing of this one, and an upload that stored nothing", async () => {

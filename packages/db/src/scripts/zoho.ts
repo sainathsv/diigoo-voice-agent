@@ -5,12 +5,14 @@
  *   ZOHO_CLIENT_ID=... ZOHO_CLIENT_SECRET=... ZOHO_CODE=... \
  *     pnpm --filter @jenai/db zoho connect --tenant zennara --dc in --module Leads
  *
- *   pnpm --filter @jenai/db zoho pull --tenant zennara [--pages 10]
+ *   pnpm --filter @jenai/db zoho pull --tenant zennara [--pages 10] [--from-start]
  *
  * pull reads what changed in their Leads and Contacts since the last read
  * (read only), plans everyone's calls again and prints counts: per module,
- * and per journey and verdict. Nothing is dialled and nothing is written to
- * Zoho. It never prints a name or number.
+ * and per journey and verdict. --from-start reads every record again, as
+ * after a change to which fields are read; a record not listed any more is
+ * then taken as deleted in Zoho. Nothing is dialled and nothing is written
+ * to Zoho. It never prints a name or number.
  *
  * The three secrets come from the environment, never from arguments, so they
  * stay out of shell history and the process list. The grant code is spent here
@@ -25,8 +27,8 @@
  */
 import "./env";
 import { eq } from "drizzle-orm";
-import { exchangeGrantCode, pullAndPlan, pullableConnections, saveZohoConnection, testConnection } from "@jenai/engine";
-import { organizations, platformDb, withTenant } from "../index";
+import { errorText, exchangeGrantCode, pullAndPlan, pullableConnections, saveZohoConnection, testConnection } from "@jenai/engine";
+import { integrations, organizations, platformDb, withTenant } from "../index";
 import { planTable, when } from "./plan-text";
 
 const arg = (name: string, fallback = "") => {
@@ -79,7 +81,9 @@ async function connect() {
 async function pull() {
   const slug = arg("tenant");
   if (!slug) throw new Error("need --tenant <address>");
-  const pages = Math.max(1, Math.floor(Number(arg("pages", "10")) || 10));
+  // Each module is sure of 2 requests whatever this says (a listing and the deletions check).
+  const pages = Math.max(2, Math.floor(Number(arg("pages", "10")) || 10));
+  const fromStart = process.argv.includes("--from-start");
   const [org] = await platformDb().select().from(organizations).where(eq(organizations.slug, slug));
   if (!org || org.kind !== "client") throw new Error(`No client with the address "${slug}".`);
   const connections = await pullableConnections(org.id);
@@ -89,7 +93,8 @@ async function pull() {
   }
 
   for (const c of connections) {
-    console.log(`\n${org.name}: reading ${c.name} (${c.status}), up to ${pages} requests`);
+    if (fromStart) await withTenant(org.id, (tx) => tx.update(integrations).set({ pullCursor: {} }).where(eq(integrations.id, c.id)));
+    console.log(`\n${org.name}: reading ${c.name} (${c.status}), up to ${pages} requests${fromStart ? ", every record again" : ""}`);
     const r = await pullAndPlan(org.id, c.id, { pageBudget: pages });
     if (!r.sync.ran) {
       console.log("  Another read of this connection is running now. Try again in a few minutes.");
@@ -97,12 +102,13 @@ async function pull() {
     }
     for (const m of r.sync.modules) {
       const state = m.skipped ? "left out" : m.error ? "stopped" : m.done ? "caught up" : "more to read";
-      console.log(`  ${m.module.padEnd(10)} ${String(m.read).padStart(6)} read  ${String(m.deleted).padStart(5)} deleted  ${state}`);
+      console.log(`  ${m.module.padEnd(10)} ${String(m.read).padStart(6)} read  ${String(m.changed).padStart(6)} new or changed  ${String(m.deleted).padStart(5)} deleted  ${state}`);
       for (const n of m.notes ?? []) console.log(`    note: ${n}`);
     }
     console.log(`  requests   ${r.sync.pages}`);
     if (r.sync.error) console.log(`  problem    ${r.sync.error}`);
     if (r.planError) console.log(`  problem    ${r.planError}`);
+    if (r.sync.connectionBroken) console.log("  Zoho refused the connection itself: it is marked not working until it is connected again.");
     if (r.plan) {
       console.log(`\n  call plan  ${r.plan.people} people, ${r.plan.rows} rows (${r.plan.removed} no longer apply)`);
       for (const line of planTable(r.plan.byVerdict, r.plan.byJourney)) console.log(`  ${line}`);
@@ -113,12 +119,18 @@ async function pull() {
 }
 
 const command = process.argv[2];
-if (command === "connect") await connect();
-else if (command === "pull") await pull();
-else {
+try {
+  if (command === "connect") await connect();
+  else if (command === "pull") await pull();
+} catch (e) {
+  // A failed query's message carries the rows it was writing: only Postgres's code is shown.
+  console.error(`\n  Stopped: ${errorText(e)}\n`);
+  process.exit(1);
+}
+if (command !== "connect" && command !== "pull") {
   console.log(
     "usage: zoho connect --tenant <address> [--dc in] [--module Leads]\n  with ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_CODE in the environment\n" +
-      "       zoho pull --tenant <address> [--pages 10]",
+      "       zoho pull --tenant <address> [--pages 10] [--from-start]",
   );
   process.exit(1);
 }

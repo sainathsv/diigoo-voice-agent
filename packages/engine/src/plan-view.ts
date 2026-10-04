@@ -4,21 +4,55 @@
  * of call, and one page of rows with filters. Read only; numbers are always
  * masked to the last 4 digits, because the page lists everyone a client has
  * on record.
+ *
+ * Someone added to a do-not-call list since the plan was worked out shows as
+ * kept out at once, by the plan's own rule, without waiting for the next plan.
  */
 import { and, asc, desc, eq, gte, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { maskPhone } from "@jenai/authz";
-import { PLANNED_CALL_VERDICTS, auditEvents, contacts, crmRecords, integrations, plannedCalls, user, visits, withTenant, type PlannedCallVerdict } from "@jenai/db";
-import { PLAN_JOURNEYS, type PlanJourney } from "./care-plan";
-import { pullKinds } from "./plan-refresh";
+import { PLANNED_CALL_VERDICTS, auditEvents, callPlanSettings, contacts, crmRecords, integrations, organizations, plannedCalls, user, visits, withTenant, type PlannedCallVerdict } from "@jenai/db";
+import { PLAN_JOURNEYS, PROGRAM_PURPOSE, planSettingsOf, suppressionText, type PlanJourney, type SuppressionReason } from "./care-plan";
+import type { Windows } from "./dialer/time";
+import { pullKinds } from "./integrations/crm-sync";
+import { verticalOf } from "./safety/cases";
 
 /** Rows per page. */
 export const PLAN_VIEW_PAGE = 50;
 
 const VERDICTS = new Set<string>(PLANNED_CALL_VERDICTS);
-/** Due calls first, then what has a time, then what waits, then who is kept out. */
-const VERDICT_RANK = sql`case ${plannedCalls.verdict} when 'call_now' then 0 when 'scheduled' then 1 when 'waiting' then 2 else 3 end`;
 /** How far back the audit log is searched for a visit list upload that stored nothing. */
 const UPLOAD_LOOKBACK_MS = 30 * 86_400_000;
+
+/**
+ * The live do-not-call entry that stops a planned call now, by the plan's
+ * rule (care-plan suppressionFor, which is the dialer's): never the DND
+ * register, since no planned call is promotional; an entry with a scope only
+ * for calls of that purpose. Null when none does.
+ */
+export function stoppedBy(): SQL<SuppressionReason | null> {
+  // Written out, not bound: the same text in a select and its group by, and every value is a constant of ours.
+  const purpose = sql.raw(
+    Object.entries(PROGRAM_PURPOSE)
+      .filter(([program]) => /^[a-z0-9_.]+$/.test(program))
+      .map(([program, p]) => `when '${program}' then '${p}'`)
+      .join(" "),
+  );
+  return sql<SuppressionReason | null>`(select s.reason::text from suppressions s
+    where s.phone_e164 = ${plannedCalls.phoneE164}
+      and (s.expires_at is null or s.expires_at > now())
+      and s.reason <> 'dnd_registry'
+      and (s.scope is null or s.scope::text = (case ${plannedCalls.programKey} ${purpose} else 'service' end))
+    order by array_position(array['opt_out', 'complaint', 'legal', 'wrong_number']::text[], s.reason::text)
+    limit 1)`;
+}
+
+/** A planned call's verdict as it stands now: kept out when a do-not-call entry stops it. */
+export function effectiveVerdict(): SQL<string> {
+  return sql<string>`(case when ${stoppedBy()} is not null then 'kept_out' else ${plannedCalls.verdict} end)`;
+}
+
+/** Due calls first, then what has a time, then what waits, then who is kept out. */
+const VERDICT_RANK = (v: SQL) => sql`case ${v} when 'call_now' then 0 when 'scheduled' then 1 when 'waiting' then 2 else 3 end`;
 
 export interface PlanViewRow {
   id: string;
@@ -49,15 +83,26 @@ export interface PlanViewSource {
   reading: boolean;
   lastPullAt: Date | null;
   lastPullError: string | null;
+  /** What the last read passed over or noticed. */
+  lastPullNotes: string[];
+  /** When the worker reads it next, when it does. */
+  nextPullAt: Date | null;
   /** Records held from it, per module: { Leads: 1200, Contacts: 300 }. */
   held: Record<string, number>;
 }
 
 export interface PlanView {
   sources: PlanViewSource[];
-  visits: { total: number; lastUpload: { at: Date; by: string | null; added: number; updated: number; refused: number } | null };
+  visits: { total: number; lastUpload: { at: Date; by: string | null; added: number; updated: number; refused: number; batch: string | null } | null };
+  /** The client switched their plan on: their CRM is read on a timer. */
+  enabled: boolean;
+  /** The plan can be switched on for this workspace: it knows clinic calls only for now. */
+  canEnable: boolean;
   /** When the plan was last worked out. Null when there is none yet. */
   computedAt: Date | null;
+  /** The calling hours the plan keeps to, and the client's time zone, for showing when a due call goes. */
+  callingWindow: Windows;
+  timezone: string;
   byVerdict: Record<PlannedCallVerdict, number>;
   /** Kinds of call with at least one row, in the plan's own order. */
   byJourney: Array<{ journey: PlanJourney; label: string; total: number } & Record<PlannedCallVerdict, number>>;
@@ -99,7 +144,17 @@ export async function planView(tenantId: string, opts: PlanViewOptions = {}): Pr
     // ---- where the plan comes from
     const conns = kinds.length
       ? await tx
-          .select({ id: integrations.id, name: integrations.name, kind: integrations.kind, status: integrations.status, config: integrations.config, lastPullAt: integrations.lastPullAt, lastPullError: integrations.lastPullError })
+          .select({
+            id: integrations.id,
+            name: integrations.name,
+            kind: integrations.kind,
+            status: integrations.status,
+            config: integrations.config,
+            lastPullAt: integrations.lastPullAt,
+            lastPullError: integrations.lastPullError,
+            lastPullNotes: integrations.lastPullNotes,
+            nextPullAt: integrations.nextPullAt,
+          })
           .from(integrations)
           .where(inArray(sql<string>`${integrations.kind}::text`, kinds))
           .orderBy(asc(integrations.createdAt))
@@ -120,8 +175,16 @@ export async function planView(tenantId: string, opts: PlanViewOptions = {}): Pr
       reading: ((c.config?.pull ?? {}) as Record<string, unknown>).enabled !== false,
       lastPullAt: c.lastPullAt,
       lastPullError: c.lastPullError,
+      lastPullNotes: Array.isArray(c.lastPullNotes) ? c.lastPullNotes : [],
+      nextPullAt: c.nextPullAt,
       held: Object.fromEntries(held.filter((h) => h.integrationId === c.id).map((h) => [h.module, h.n])),
     }));
+    const [org] = await tx.select({ timezone: organizations.timezone, vertical: organizations.vertical }).from(organizations).where(eq(organizations.id, tenantId));
+    const [state] = await tx
+      .select({ settings: callPlanSettings.settings, enabled: callPlanSettings.enabled, computedAt: callPlanSettings.computedAt })
+      .from(callPlanSettings)
+      .where(eq(callPlanSettings.tenantId, tenantId));
+    const settings = planSettingsOf(state?.settings, org?.timezone ?? "Asia/Kolkata");
 
     const [v] = await tx
       .select({ total: sql<number>`count(*)::int`, changed: sql<Date | null>`max(${visits.updatedAt}) filter (where ${visits.source} = 'upload')`.mapWith(visits.updatedAt) })
@@ -132,7 +195,7 @@ export async function planView(tenantId: string, opts: PlanViewOptions = {}): Pr
     // upload whose every row was refused).
     const since = v?.changed ? new Date(v.changed.getTime() - 60_000) : new Date(Date.now() - UPLOAD_LOOKBACK_MS);
     const [up] = await tx
-      .select({ at: auditEvents.createdAt, diff: auditEvents.diff, via: auditEvents.via, by: user.name })
+      .select({ at: auditEvents.createdAt, diff: auditEvents.diff, via: auditEvents.via, by: user.name, batch: auditEvents.targetId })
       .from(auditEvents)
       .leftJoin(user, eq(user.id, auditEvents.actorUserId))
       .where(and(eq(auditEvents.action, "visits.imported"), gte(auditEvents.createdAt, since)))
@@ -140,30 +203,29 @@ export async function planView(tenantId: string, opts: PlanViewOptions = {}): Pr
       .limit(1);
     const d = (up?.diff ?? {}) as Record<string, unknown>;
     const num = (x: unknown) => (typeof x === "number" ? x : 0);
-    const lastUpload = up ? { at: up.at, by: up.via === "support" ? "JENAI support" : (up.by ?? null), added: num(d.added), updated: num(d.updated), refused: num(d.rejected) } : null;
+    const lastUpload = up ? { at: up.at, by: up.via === "support" ? "JENAI support" : (up.by ?? null), added: num(d.added), updated: num(d.updated), refused: num(d.rejected), batch: up.batch } : null;
 
-    // ---- the plan, within the viewer's branches
+    // ---- the plan, within the viewer's branches, as it stands now
     const visitJoin = and(eq(plannedCalls.originType, "visit"), eq(visits.tenantId, plannedCalls.tenantId), eq(visits.id, plannedCalls.originId));
     const contactJoin = and(eq(contacts.tenantId, plannedCalls.tenantId), eq(contacts.id, plannedCalls.contactId));
     const scope: SQL | undefined = branches === "all" ? undefined : branches.length ? inArray(sql`coalesce(${visits.branchId}, ${contacts.branchId})`, [...branches]) : sql`false`;
+    const current = effectiveVerdict();
 
     const counts = await tx
-      .select({ journey: plannedCalls.journey, verdict: plannedCalls.verdict, n: sql<number>`count(*)::int`, at: sql<Date | null>`max(${plannedCalls.computedAt})`.mapWith(plannedCalls.computedAt) })
+      .select({ journey: plannedCalls.journey, verdict: sql<string>`${current}`, n: sql<number>`count(*)::int` })
       .from(plannedCalls)
       .leftJoin(visits, visitJoin)
       .leftJoin(contacts, contactJoin)
       .where(scope)
-      .groupBy(plannedCalls.journey, plannedCalls.verdict);
+      .groupBy(plannedCalls.journey, current);
     const byVerdict = zero();
     const perJourney = new Map<string, Record<PlannedCallVerdict, number>>();
-    let computedAt: Date | null = null;
     let total = 0;
     for (const c of counts) {
       const vd = c.verdict as PlannedCallVerdict;
       byVerdict[vd] += c.n;
       if (!perJourney.has(c.journey)) perJourney.set(c.journey, zero());
       perJourney.get(c.journey)![vd] += c.n;
-      if (c.at && (!computedAt || c.at > computedAt)) computedAt = c.at;
       if ((!journey || c.journey === journey) && (!verdict || vd === verdict)) total += c.n;
     }
     const byJourney = (Object.keys(PLAN_JOURNEYS) as PlanJourney[])
@@ -181,6 +243,7 @@ export async function planView(tenantId: string, opts: PlanViewOptions = {}): Pr
             phone: plannedCalls.phoneE164,
             journey: plannedCalls.journey,
             verdict: plannedCalls.verdict,
+            stop: stoppedBy(),
             reason: plannedCalls.reason,
             callAt: plannedCalls.callAt,
             from: plannedCalls.originLabel,
@@ -194,13 +257,30 @@ export async function planView(tenantId: string, opts: PlanViewOptions = {}): Pr
           .leftJoin(crmRecords, and(eq(plannedCalls.originType, "crm_record"), eq(crmRecords.tenantId, plannedCalls.tenantId), eq(crmRecords.id, plannedCalls.originId)))
           .leftJoin(visits, visitJoin)
           .leftJoin(contacts, contactJoin)
-          .where(and(scope, journey ? eq(plannedCalls.journey, journey) : undefined, verdict ? eq(plannedCalls.verdict, verdict) : undefined))
-          .orderBy(VERDICT_RANK, asc(plannedCalls.callAt), desc(plannedCalls.priority), asc(plannedCalls.id))
+          .where(and(scope, journey ? eq(plannedCalls.journey, journey) : undefined, verdict ? sql`${current} = ${verdict}` : undefined))
+          .orderBy(VERDICT_RANK(current), asc(plannedCalls.callAt), desc(plannedCalls.priority), asc(plannedCalls.id))
           .limit(PLAN_VIEW_PAGE)
           .offset((page - 1) * PLAN_VIEW_PAGE)
       : [];
-    const rows: PlanViewRow[] = list.map((r) => ({ ...r, phone: maskPhone(r.phone) }));
+    const rows: PlanViewRow[] = list.map(({ stop, ...r }) =>
+      stop ? { ...r, verdict: "kept_out" as const, reason: suppressionText(stop), callAt: null, phone: maskPhone(r.phone) } : { ...r, phone: maskPhone(r.phone) },
+    );
 
-    return { sources, visits: { total: v?.total ?? 0, lastUpload }, computedAt, byVerdict, byJourney, rows, total, page, journey, verdict };
+    return {
+      sources,
+      visits: { total: v?.total ?? 0, lastUpload },
+      enabled: state?.enabled ?? false,
+      canEnable: verticalOf(org?.vertical) === "health",
+      computedAt: state?.computedAt ?? null,
+      callingWindow: settings.callingWindow,
+      timezone: settings.timezone,
+      byVerdict,
+      byJourney,
+      rows,
+      total,
+      page,
+      journey,
+      verdict,
+    };
   });
 }

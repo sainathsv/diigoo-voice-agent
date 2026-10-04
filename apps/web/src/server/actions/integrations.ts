@@ -5,7 +5,7 @@ import { redirect } from "next/navigation";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { apiKeys, audit, integrationEvents, integrations, withTenant } from "@jenai/db";
-import { credentialsOf, releaseHeld, saveZohoConnection, sealCredentials, testConnection } from "@jenai/engine";
+import { credentialsOf, dropOrphanedPlanRows, releaseHeld, saveZohoConnection, sealCredentials, testConnection } from "@jenai/engine";
 import { actorFields, requireWorkspace, workspaceAction } from "../access";
 import { requestMeta } from "../session";
 import { SCOPES, newApiKey } from "../api/key";
@@ -115,7 +115,11 @@ export async function setSystemStatus(fd: FormData) {
   await withTenant(ctx.org.id, async (tx) => {
     const [i] = await tx.select().from(integrations).where(eq(integrations.id, id));
     if (!i) return;
-    if (to === "removed") await tx.delete(integrations).where(eq(integrations.id, id));
+    if (to === "removed") {
+      // Its CRM copy goes with it (crm_records cascade), and so, at once, do the planned calls made from that copy.
+      await tx.delete(integrations).where(eq(integrations.id, id));
+      await dropOrphanedPlanRows(tx);
+    }
     else await tx.update(integrations).set({ status: to as "paused" | "connected", updatedAt: new Date() }).where(eq(integrations.id, id));
     // Resumed: what waited while it was paused goes now.
     if (to === "connected") await releaseHeld(tx, id);

@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { branchesFor, holdsAnywhere } from "@jenai/authz";
-import { VISIT_IMPORT_MAX_BYTES, VisitImportError, decodeVisitFile, importVisits, type VisitReject } from "@jenai/engine";
+import { VISIT_IMPORT_MAX_BYTES, VisitImportError, dbErrorCode, decodeVisitFile, importVisits, type VisitReject } from "@jenai/engine";
 import { actorFields, requireWorkspace } from "../access";
 import { logDenied } from "../security-log";
 import { requestMeta } from "../session";
@@ -59,6 +59,9 @@ export async function uploadVisitList(_: VisitUploadState, fd: FormData): Promis
     };
   } catch (e) {
     if (e instanceof VisitImportError) return { error: e.message };
-    throw e;
+    // A failed query's message holds every row it was writing (names, numbers,
+    // services), so only Postgres's code for it is logged, and nothing is rethrown.
+    console.error(JSON.stringify({ event: "visits.upload_failed", code: dbErrorCode(e) ?? (e instanceof Error ? e.name : "unknown") }));
+    return { error: "The visit list could not be stored or planned just now. Try again in a minute: uploading it again adds nothing twice." };
   }
 }

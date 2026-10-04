@@ -71,7 +71,8 @@ describe("enquiries", () => {
   it("calls a fresh enquiry to book a consultation, with what the script needs", () => {
     const r = only(plan({ records: [lead({ treatment: "Laser Hair Removal", source: "Instagram", centre: "Kondapur" })] }));
     expect(r).toMatchObject({ journey: "new_enquiry", programKey: "clinic.warm_followup", verdict: "call_now", priority: 40, originType: "crm_record", originLabel: "Zoho Lead" });
-    expect(r.callAt).toEqual(NOW);
+    // Due since they asked, so the row stays the same from one plan to the next.
+    expect(r.callAt).toEqual(ist("2026-09-29 11:00"));
     expect(r.reason).toBe("Enquired 2 days ago about Laser Hair Removal through Instagram.");
     expect(r.context).toEqual({ caller_name: "Anitha", enquiry_about: "Laser Hair Removal", enquiry_date: "2026-09-29", enquiry_source: "Instagram", branch: "Kondapur" });
   });
@@ -109,7 +110,7 @@ describe("enquiries", () => {
     const monday = ist("2026-10-05 11:00");
     const r = only(plan({ records: [lead({ status: "Follow-up", createdExt: ist("2026-08-01 10:00"), followUpAt })] }, monday));
     expect(r).toMatchObject({ journey: "callback_due", verdict: "call_now", reason: "The team noted a callback for Sat 3 Oct 2026, and it is due." });
-    expect(r.callAt).toEqual(monday);
+    expect(r.callAt).toEqual(ist("2026-10-03 10:00")); // the calling hour it fell due at
   });
 
   it("keeps out a callback noted longer ago than the fresh limit", () => {
@@ -148,7 +149,7 @@ describe("appointments", () => {
     expect(only(plan({ records: [booked("2026-10-01 17:00")] })).callAt).toEqual(ist("2026-10-01 14:00"));
     const soon = only(plan({ records: [booked("2026-10-01 14:30")] }));
     expect(soon).toMatchObject({ verdict: "call_now" });
-    expect(soon.callAt).toEqual(NOW);
+    expect(soon.callAt).toEqual(ist("2026-10-01 11:30"));
   });
 
   it("does not remind them under 2 hours before", () => {
@@ -170,10 +171,10 @@ describe("appointments", () => {
     expect(early).toMatchObject({ verdict: "kept_out", reason: "No calling hours are left far enough before their appointment on Mon 5 Oct 2026 at 11:00 AM for a reminder call." });
   });
 
-  it("after calling hours the evening before, reminds them the next morning", () => {
+  it("after calling hours the evening before, keeps the reminder due for the next morning", () => {
     const r = only(plan({ records: [booked("2026-10-02 15:00")] }, ist("2026-10-01 20:00")));
-    expect(r.verdict).toBe("call_now");
-    expect(r.callAt).toEqual(ist("2026-10-02 10:00"));
+    expect(r).toMatchObject({ verdict: "call_now", reason: "Appointment on Fri 2 Oct 2026 at 3:00 PM." });
+    expect(r.callAt).toEqual(ist("2026-10-01 18:00")); // due since then; the next calling hour is Friday 10:00, in time
   });
 
   it("keeps out an appointment that has passed while the CRM still says booked", () => {
@@ -322,7 +323,7 @@ describe("kept out", () => {
     expect(only(plan({ records: [lead({ centre: null })] }, NOW, settings)).verdict).toBe("call_now");
   });
 
-  it("keeps out everyone on a do-not-call list, whatever else is due", () => {
+  it("keeps out everyone who asked not to be called, whatever else is due", () => {
     const person: Partial<PlanPerson> = {
       records: [lead({ status: "Appointment Booked", appointmentAt: ist("2026-10-02 11:00") }), lead()],
       visits: [visit()],
@@ -331,8 +332,25 @@ describe("kept out", () => {
     const rows = plan(person);
     expect(rows.length).toBeGreaterThan(3);
     for (const r of rows) expect(r).toMatchObject({ verdict: "kept_out", reason: "Asked not to be called.", callAt: null, context: {} });
-    expect(plan({ ...person, suppressions: [{ reason: "dnd_registry" }] })[0]!.reason).toBe("On the national Do Not Disturb register.");
     expect(plan({ ...person, suppressions: [{ reason: "opt_out", expiresAt: ist("2026-09-30 00:00") }] }).some((r) => r.verdict !== "kept_out")).toBe(true);
+  });
+
+  it("still reminds and cares for someone on the national DND register: it stops promotional calls only, as the dialer does", () => {
+    const rows = plan({ records: [lead({ status: "Appointment Booked", appointmentAt: ist("2026-10-02 11:00") })], visits: [visit()], suppressions: [{ reason: "dnd_registry" }] });
+    expect(journey(rows, "appointment_reminder")).toMatchObject({ verdict: "scheduled", reason: "Appointment on Fri 2 Oct 2026 at 11:00 AM." });
+    expect(journey(rows, "visit_feedback").verdict).toBe("waiting");
+    expect(rows.some((r) => r.reason.includes("Do Not Disturb"))).toBe(false);
+  });
+
+  it("keeps out only the calls an opt-out with a scope covers", () => {
+    const person: Partial<PlanPerson> = { records: [lead({ status: "Appointment Booked", appointmentAt: ist("2026-10-02 11:00") })], visits: [visit()] };
+    // Out of offers only: every planned call is service or transactional, so all of them stand.
+    const promo = plan({ ...person, suppressions: [{ reason: "opt_out", scope: "promotional" }] });
+    expect(promo.every((r) => r.verdict !== "kept_out")).toBe(true);
+    // Out of service calls: the feedback and recalls go, the appointment reminder (transactional) stays.
+    const service = plan({ ...person, suppressions: [{ reason: "opt_out", scope: "service" }] });
+    expect(journey(service, "appointment_reminder").verdict).toBe("scheduled");
+    for (const j of ["visit_feedback", "result_check", "maintenance"]) expect(journey(service, j)).toMatchObject({ verdict: "kept_out", reason: "Asked not to be called." });
   });
 
   it("keeps out the whole person when any record says Do Not Call", () => {
@@ -364,11 +382,13 @@ describe("one call per person", () => {
     expect(reminder.callAt).toEqual(ist("2026-10-01 18:00"));
   });
 
-  it("moves a call into calling hours: tonight to tomorrow morning, Saturday night to Monday", () => {
-    const tonight = only(plan({ records: [lead()] }, ist("2026-10-01 20:00")));
-    expect(tonight.verdict).toBe("call_now");
-    expect(tonight.callAt).toEqual(ist("2026-10-02 10:00"));
-    expect(only(plan({ records: [lead()] }, ist("2026-10-03 20:00"))).callAt).toEqual(ist("2026-10-05 10:00"));
+  it("keeps calls inside calling hours: an enquiry on Saturday night is due from Monday morning", () => {
+    const late = only(plan({ records: [lead({ createdExt: ist("2026-10-03 20:30") })] }, ist("2026-10-03 21:00")));
+    expect(late.verdict).toBe("call_now");
+    expect(late.callAt).toEqual(ist("2026-10-05 10:00"));
+    const callback = only(plan({ records: [lead({ status: "Follow-up", followUpAt: ist("2026-10-04 00:00") })] }, ist("2026-10-03 20:00")));
+    expect(callback).toMatchObject({ journey: "callback_due", verdict: "scheduled" });
+    expect(callback.callAt).toEqual(ist("2026-10-05 10:00"));
     // Feedback due on Sunday 4 Oct waits for Monday.
     const fb = journey(plan({ visits: [visit({ visitDate: "2026-10-02" })] }, ist("2026-10-02 18:00")), "visit_feedback");
     expect(fb.callAt).toEqual(ist("2026-10-05 10:00"));
@@ -379,6 +399,150 @@ describe("one call per person", () => {
     expect(r.verdict).toBe("call_now");
     expect(r.reason).toBe("Enquired 2 days ago." + NOT_SET_UP);
     expect(only(plan({ records: [lead()], programs: new Set(["clinic.warm_followup"]) })).reason).toBe("Enquired 2 days ago.");
+  });
+});
+
+describe("evidence the person already came", () => {
+  it("does not ask someone to book who came in after enquiring: the visit's calls take over", () => {
+    const rows = plan({ records: [lead({ createdExt: ist("2026-09-29 11:00") })], visits: [visit({ visitDate: "2026-09-30" })] });
+    expect(journey(rows, "new_enquiry")).toMatchObject({ verdict: "kept_out", reason: "Visited on Wed 30 Sep 2026 since enquiring, so the calls after that visit take over." });
+    expect(journey(rows, "visit_feedback").verdict).toBe("scheduled");
+  });
+
+  it("checks in after a consultation on an open enquiry, and never also asks them to book one", () => {
+    const rows = plan({ records: [lead({ status: "Follow-up", createdExt: ist("2026-09-28 10:00"), consultant: "Dr Rao", appointmentAt: ist("2026-09-30 11:00") })] });
+    expect(rows.map((r) => r.journey)).toEqual(["after_consultation"]);
+    expect(rows[0]).toMatchObject({ verdict: "scheduled" });
+  });
+
+  it("does not call a no-show to rebook when the visit list shows they came since", () => {
+    const rows = plan({ records: [lead({ status: "No Show", appointmentAt: ist("2026-09-26 11:00") })], visits: [visit({ visitDate: "2026-09-27" })] });
+    expect(journey(rows, "no_show_rebook")).toMatchObject({ verdict: "kept_out", reason: "Visited on Sun 27 Sep 2026 since missing their appointment, so the calls after that visit take over." });
+  });
+
+  it("still calls an enquiry made after an old visit", () => {
+    const rows = plan({ records: [lead()], visits: [visit({ service: "Acne", visitDate: "2025-01-10" })] });
+    expect(journey(rows, "new_enquiry").verdict).toBe("call_now");
+  });
+});
+
+describe("an appointment still to come, whatever the status says", () => {
+  it("reminds an open enquiry with an appointment ahead, and does not also call to book", () => {
+    const rows = plan({ records: [lead({ status: "Follow-up", createdExt: ist("2026-09-20 10:00"), appointmentAt: ist("2026-10-03 11:00") })] });
+    expect(rows.map((r) => r.journey)).toEqual(["appointment_reminder"]);
+    expect(rows[0]).toMatchObject({ verdict: "scheduled", reason: "Appointment on Sat 3 Oct 2026 at 11:00 AM." });
+  });
+
+  it("reminds a No Show who rebooked, and never calls a day still to come a missed one", () => {
+    const rows = plan({ records: [lead({ status: "No Show", appointmentAt: ist("2026-10-05 11:00") })] });
+    expect(rows.map((r) => r.journey)).toEqual(["appointment_reminder"]);
+    expect(rows[0]!.reason).not.toMatch(/Missed/);
+  });
+});
+
+describe("an appointment with a date and no time", () => {
+  const dateOnly = (day: string, over: Partial<PlanRecord> = {}) => lead({ status: "Appointment Booked", appointmentAt: ist(`${day} 00:00`), appointmentHasTime: false, consultant: "Dr Rao", ...over });
+
+  it("is reminded the evening before, without a time of day", () => {
+    const r = only(plan({ records: [dateOnly("2026-10-02")] }));
+    expect(r).toMatchObject({ journey: "appointment_reminder", verdict: "scheduled", reason: "Appointment on Fri 2 Oct 2026." });
+    expect(r.callAt).toEqual(ist("2026-10-01 18:00"));
+    expect(r.context).not.toHaveProperty("appointment_time");
+    expect(JSON.stringify(r)).not.toMatch(/12:00 AM/);
+  });
+
+  it("is not taken as passed on its own day, and is not reminded then: a call could come after it", () => {
+    const r = only(plan({ records: [dateOnly("2026-10-01")] }));
+    expect(r).toMatchObject({ journey: "appointment_reminder", verdict: "kept_out" });
+    expect(r.reason).toMatch(/^Their appointment is today and Zoho gives no time for it/);
+    expect(only(plan({ records: [dateOnly("2026-10-01")] }, ist("2026-10-02 10:00"))).journey).toBe("appointment_unclear");
+  });
+});
+
+describe("recalls that have lapsed", () => {
+  it("keeps out a next session or maintenance long past due: that call would be a win-back offer", () => {
+    const lhr = plan({ visits: [visit({ service: "Laser Hair Removal", visitDate: "2024-04-01" })] }, ist("2026-10-01 12:00"));
+    expect(journey(lhr, "next_session")).toMatchObject({ verdict: "kept_out", reason: "Lapsed: last had Laser Hair Removal on Mon 1 Apr 2024. A call now would be a win-back offer, which needs a promotional number and consent." });
+    const facial = plan({ visits: [visit({ service: "Medifacial", visitDate: "2024-10-15" })] });
+    expect(journey(facial, "maintenance").verdict).toBe("kept_out");
+    // A converted lead from years ago is not a visit to recall either.
+    const old = plan({ records: [lead({ status: "Converted", treatment: "Laser Hair Removal", appointmentAt: ist("2022-05-01 11:00") })] });
+    expect(old.every((r) => r.verdict === "kept_out")).toBe(true);
+  });
+
+  it("still books a session a little overdue, within recallWithinDays", () => {
+    // Due 5 Sep, 26 days ago.
+    const r = only(plan({ visits: [visit({ service: "Glycolic Peel", visitDate: "2026-08-15" })] }));
+    expect(r).toMatchObject({ journey: "next_session", verdict: "call_now" });
+    const strict = planSettingsOf({ recallWithinDays: 20 });
+    expect(only(plan({ visits: [visit({ service: "Glycolic Peel", visitDate: "2026-08-15" })] }, NOW, strict)).verdict).toBe("kept_out");
+  });
+});
+
+describe("leads the clinic found itself, and people who said no", () => {
+  it("never plans an enquiry call to a lead from a cold call or a bought list", () => {
+    for (const source of ["Cold Call", "web research", "Purchased List"]) {
+      const r = only(plan({ records: [lead({ source })] }));
+      expect(r).toMatchObject({ journey: "new_enquiry", verdict: "kept_out" });
+      expect(r.reason).toBe(`Not an enquiry they made (lead source "${source}"): a call to them needs a 140-series number and promotional consent.`);
+    }
+    expect(only(plan({ records: [lead({ source: "Instagram" })] })).verdict).toBe("call_now");
+    expect(only(plan({ records: [lead({ source: null })] })).verdict).toBe("call_now");
+  });
+
+  it("calls only the sources a clinic lists as enquiries, when it lists them", () => {
+    const s = planSettingsOf({ enquirySources: ["Instagram", "Website"] });
+    expect(only(plan({ records: [lead({ source: "Instagram" })] }, NOW, s)).verdict).toBe("call_now");
+    expect(only(plan({ records: [lead({ source: "Hoarding" })] }, NOW, s)).reason).toMatch(/^Lead source "Hoarding" is not one the plan settings count as an enquiry/);
+  });
+
+  it("stops calls to book someone who said no on a newer record, but not their care after a visit", () => {
+    const a = lead({ id: "lead-a", status: "Follow-up", createdExt: ist("2026-09-10 10:00") });
+    const b = lead({ id: "lead-b", status: "Not Interested", createdExt: ist("2026-09-12 10:00"), modifiedExt: ist("2026-09-25 10:00") });
+    // A facial before either enquiry: its result check is care, and goes on.
+    const rows = plan({ records: [a, b], visits: [visit({ visitDate: "2026-09-05" })] });
+    const r = rows.find((x) => x.originId === "lead-a")!;
+    expect(r).toMatchObject({ journey: "new_enquiry", verdict: "kept_out" });
+    expect(r.reason).toBe('Marked "Not Interested" in Zoho on another enquiry (Fri 25 Sep 2026), so JENAI does not call to book them.');
+    expect(journey(rows, "result_check").verdict).toBe("call_now");
+    // An enquiry made after they said no is a new one.
+    const later = plan({ records: [{ ...a, createdExt: ist("2026-09-29 10:00") }, { ...b, modifiedExt: ist("2026-09-20 10:00") }] });
+    expect(later.find((x) => x.originId === "lead-a")!.verdict).toBe("call_now");
+  });
+
+  it("keeps out a person whose CRM notes say not to call them", () => {
+    const rows = plan({ records: [lead({ notesSayDoNotCall: true })], visits: [visit()] });
+    for (const r of rows) expect(r).toMatchObject({ verdict: "kept_out", reason: "The notes on their Zoho record say not to call them." });
+  });
+});
+
+describe("the same plan, whatever order the records come in", () => {
+  it("gives the same rows for visits and records in any order", () => {
+    const a = visit({ id: "visit-a", service: "Hydrafacial" });
+    const b = visit({ id: "visit-b", service: "Glycolic Peel" });
+    const r1 = lead({ id: "lead-x", name: "Anitha R", createdExt: ist("2026-09-29 10:00") });
+    const r2 = lead({ id: "lead-y", name: "Anitha", createdExt: ist("2026-09-29 10:00") });
+    const one = plan({ records: [r1, r2], visits: [a, b] });
+    const two = plan({ records: [r2, r1], visits: [b, a] });
+    expect(two).toEqual(one);
+    expect(journey(one, "visit_feedback").originId).toBe("visit-b"); // "glycolic peel" sorts first
+  });
+});
+
+describe("where and when the clinic calls", () => {
+  it("covers a branch spelt differently in the visit list: Kondapur covers Zennara Clinics Kondapur", () => {
+    const s = planSettingsOf({ centres: ["Kondapur"] });
+    expect(journey(plan({ visits: [visit({ branch: "Zennara Clinics Kondapur" })] }, NOW, s), "visit_feedback").verdict).toBe("scheduled");
+    // The branch the importer matched counts too.
+    expect(journey(plan({ visits: [visit({ branch: "KDP-01", branchKnownAs: ["Kondapur", "KDP"] })] }, NOW, s), "visit_feedback").verdict).toBe("scheduled");
+    expect(journey(plan({ visits: [visit({ branch: "Jubilee Hills" })] }, NOW, s), "visit_feedback").verdict).toBe("kept_out");
+  });
+
+  it("keeps an evening reminder hour inside the calling window rather than losing the reminder", () => {
+    const s = planSettingsOf({ reminderHour: 20 });
+    const r = only(plan({ records: [lead({ status: "Appointment Booked", appointmentAt: ist("2026-10-02 10:30") })] }, NOW, s));
+    expect(r.verdict).toBe("scheduled");
+    expect(r.callAt).toEqual(ist("2026-10-01 18:49"));
   });
 });
 
@@ -466,15 +630,19 @@ describe("replanning a client", () => {
     expect(of("6", "new_enquiry")).toMatchObject({ verdict: "kept_out", reason: "No phone number JENAI can dial.", phoneE164: null });
     expect(rows.find((r) => r.journey === "visit_feedback")).toMatchObject({ verdict: "scheduled", reason: "Visited on Wed 30 Sep 2026 for Hydrafacial." });
 
+    expect(first.written).toBe(first.rows);
     const again = await replanTenant(org, { now: NOW });
-    expect(again).toEqual(first);
+    // Nothing changed, so nothing is written again.
+    expect(again).toEqual({ ...first, written: 0 });
     expect(await stored()).toEqual(rows);
+    // Later the same day the rows are the same: a call already due keeps the time it fell due.
+    expect((await replanTenant(org, { now: new Date(NOW.getTime() + 20 * 60_000) })).written).toBe(0);
   });
 
   it("removes rows that no longer apply", async () => {
     await withTenant(org, async (tx) => {
       await tx.update(crmRecords).set({ deletedAt: NOW }).where(eq(crmRecords.id, ids["1"]!));
-      await tx.update(crmRecords).set({ status: "No Show" }).where(eq(crmRecords.id, ids["3"]!));
+      await tx.update(crmRecords).set({ status: "No Show", appointmentAt: ist("2026-09-26 11:00") }).where(eq(crmRecords.id, ids["3"]!));
     });
     const r = await replanTenant(org, { now: NOW });
     expect(r.removed).toBe(2);

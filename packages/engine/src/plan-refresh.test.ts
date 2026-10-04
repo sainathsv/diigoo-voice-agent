@@ -10,26 +10,30 @@
 import "@jenai/db/env";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
-import { appDb, auditEvents, callPlanSettings, campaignTargets, integrations, organizations, plannedCalls, platformDb, tenantDatabases, visits, withTenant } from "@jenai/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { appDb, auditEvents, callPlanSettings, campaignTargets, integrations, organizations, plannedCalls, platformDb, suppressions, tenantDatabases, visits, withTenant } from "@jenai/db";
 import { sealCredentials } from "./integrations/queue";
+import { pullKinds } from "./integrations/crm-sync";
 import { replanTenant } from "./care-plan";
+import { PlanSwitchError, setPlanEnabled } from "./plan-settings";
 import {
   DEFAULT_PULL_INTERVAL_MINUTES,
+  PLAN_SCHEMA_VERSION,
   PlanSettingError,
+  acrossDatabases,
   checkPlanSetting,
   claimPulls,
+  claimReplans,
+  deferReplan,
   planSummary,
-  plansToRefresh,
   pullAndPlan,
   pullIntervalMinutes,
-  pullKinds,
   requeueStuckPulls,
   setPlanSetting,
 } from "./plan-refresh";
 
 const SCOPES = ["ZohoCRM.modules.leads.READ", "ZohoCRM.modules.contacts.READ"];
-const orgs: Record<"claims" | "clinic" | "backlog" | "quiet", string> = { claims: "", clinic: "", backlog: "", quiet: "" };
+const orgs: Record<"claims" | "clinic" | "backlog" | "quiet" | "off" | "realty", string> = { claims: "", clinic: "", backlog: "", quiet: "", off: "", realty: "" };
 
 /** Zoho writes its times in the account's own offset. */
 const ist = (ms: number) => `${new Date(ms + 330 * 60_000).toISOString().slice(0, 19)}+05:30`;
@@ -88,10 +92,12 @@ beforeAll(async () => {
   for (const key of Object.keys(orgs) as Array<keyof typeof orgs>) {
     const [o] = await platformDb()
       .insert(organizations)
-      .values({ kind: "client", name: `Plan Refresh ${key}`, slug: `plan-refresh-${key}-${randomUUID().slice(0, 8)}`, status: "active", vertical: "derma", languages: ["en"] })
+      .values({ kind: "client", name: `Plan Refresh ${key}`, slug: `plan-refresh-${key}-${randomUUID().slice(0, 8)}`, status: "active", vertical: key === "realty" ? "real estate" : "derma", languages: ["en"] })
       .returning();
     orgs[key] = o!.id;
   }
+  // Reading on a timer is each client's own choice.
+  for (const key of ["claims", "clinic", "backlog"] as const) await setPlanEnabled(orgs[key], true);
 });
 afterAll(async () => {
   for (const id of Object.values(orgs)) if (id) await platformDb().delete(organizations).where(eq(organizations.id, id));
@@ -117,6 +123,8 @@ describe("which connections the worker reads", () => {
     const paused = await connection(t, { status: "paused" });
     const off = await connection(t, { config: { dc: "in", scopes: SCOPES, pull: { enabled: false } } });
     const webhook = await connection(t, { kind: "webhook_out", name: "Their hook", config: { url: "https://example.com/hook" } });
+    // A Zoho connected only to receive call results is never read.
+    const outOnly = await connection(t, { direction: "out" });
 
     const rounds = await Promise.all([1, 2, 3].map(() => claim(t, 2)));
     const first = rounds.flat().map((c) => c.id);
@@ -126,7 +134,7 @@ describe("which connections the worker reads", () => {
     expect([...first, ...rest].sort()).toEqual([...due].sort());
     expect(await claim(t, 10)).toEqual([]); // all held now
 
-    for (const id of [later, reading, paused, off, webhook]) expect([...first, ...rest]).not.toContain(id);
+    for (const id of [later, reading, paused, off, webhook, outOnly]) expect([...first, ...rest]).not.toContain(id);
     const held = await row(t, due[0]!);
     expect(minutesFromNow(held.pullLeaseUntil)).toBeGreaterThan(14);
   });
@@ -220,16 +228,31 @@ describe("a read on the timer, and the plan after it", () => {
     const id = await connection(t);
 
     expect((await claim(t, 1))[0]!.id).toBe(id);
+    // A budget of 1 still gives each module its 2 requests.
     let r = await pullAndPlan(t, id, { pageBudget: 1, fetchImpl: zohoFor(t), scheduled: true });
-    expect(r.sync).toMatchObject({ ran: true, done: false, error: null, pages: 1 });
+    expect(r.sync).toMatchObject({ ran: true, done: false, error: null, pages: 4 });
     expect(r.plan).toBeNull(); // not after every page
-    expect(minutesFromNow(r.nextPullAt)).toBeLessThanOrEqual(0); // the next read is due at once
+    // Moving through a backlog: read again shortly, not at once and not in ten minutes.
+    expect(minutesFromNow(r.nextPullAt)).toBeGreaterThan(0.3);
+    expect(minutesFromNow(r.nextPullAt)).toBeLessThanOrEqual(0.5);
     expect(await withTenant(t, (tx) => tx.select().from(plannedCalls))).toEqual([]);
+    // The changes stored meanwhile bring the plan's own clock forward, in case the last read finds nothing new.
+    const [clock] = await withTenant(t, (tx) => tx.select().from(callPlanSettings));
+    expect(minutesFromNow(clock!.nextReplanAt)).toBeLessThanOrEqual(5);
+    await withTenant(t, (tx) => tx.update(integrations).set({ nextPullAt: null }).where(eq(integrations.id, id)));
 
     expect((await claim(t, 1))[0]!.id).toBe(id);
     r = await pullAndPlan(t, id, { pageBudget: 5, fetchImpl: zohoFor(t), scheduled: true });
     expect(r.sync).toMatchObject({ done: true, error: null });
     expect(r.plan).toMatchObject({ people: 450, rows: 450 });
+    expect(minutesFromNow(r.nextPullAt)).toBeGreaterThan(9);
+
+    // Nothing new since: no plan worked out (the plan's own clock sees to the days), and no read again until the interval.
+    await withTenant(t, (tx) => tx.update(integrations).set({ nextPullAt: null }).where(eq(integrations.id, id)));
+    expect((await claim(t, 1))[0]!.id).toBe(id);
+    r = await pullAndPlan(t, id, { pageBudget: 5, fetchImpl: zohoFor(t), scheduled: true });
+    expect(r.sync.modules.map((m) => m.changed)).toEqual([0, 0]);
+    expect(r.plan).toBeNull();
     expect(minutesFromNow(r.nextPullAt)).toBeGreaterThan(9);
   });
 
@@ -241,36 +264,103 @@ describe("a read on the timer, and the plan after it", () => {
     const down = (async () => new Response("busy", { status: 500 })) as unknown as typeof fetch;
     const r = await pullAndPlan(t, i!.id, { fetchImpl: down, scheduled: true });
     expect(r.sync.error).toMatch(/Zoho answered/);
-    expect(r.plan).toMatchObject({ rows: 450 }); // the plan still moves on with the days
+    expect(r.plan).toBeNull(); // nothing new was read; the plan's own clock moves it on with the days
     const after = await row(t, i!.id);
     expect(after.lastPullError).toMatch(/Zoho answered/);
     expect(after.pullLeaseUntil).toBeNull();
-    expect(minutesFromNow(after.nextPullAt)).toBeGreaterThan(9);
+    // One failure in a row: twice the interval.
+    expect(after.pullFailures).toBe(1);
+    expect(minutesFromNow(after.nextPullAt)).toBeGreaterThan(19);
+    expect(minutesFromNow(after.nextPullAt)).toBeLessThanOrEqual(20);
+  });
+});
+
+describe("reading only for clients who switched the plan on", () => {
+  it("never reads the CRM of a client who has not switched the plan on, and starts at once when they do", async () => {
+    const t = orgs.off;
+    const id = await connection(t);
+    expect(await claim(t, 10)).toEqual([]);
+    await setPlanEnabled(t, true);
+    expect((await claim(t, 10)).map((c) => c.id)).toEqual([id]);
+    await withTenant(t, (tx) => tx.update(integrations).set({ pullLeaseUntil: null, nextPullAt: new Date(Date.now() + 3_600_000) }).where(eq(integrations.id, id)));
+    await setPlanEnabled(t, false);
+    await withTenant(t, (tx) => tx.update(integrations).set({ nextPullAt: null }).where(eq(integrations.id, id)));
+    expect(await claim(t, 10)).toEqual([]);
+    const logged = await withTenant(t, (tx) => tx.select().from(auditEvents).where(eq(auditEvents.tenantId, t)));
+    expect(logged.map((e) => e.action).sort()).toEqual(["call_plan.switched_off", "call_plan.switched_on"]);
+  });
+
+  it("cannot be switched on for a client outside clinics: every call it plans is a clinic's", async () => {
+    await expect(setPlanEnabled(orgs.realty, true)).rejects.toThrow(PlanSwitchError);
+    expect(await withTenant(orgs.realty, (tx) => tx.select().from(callPlanSettings))).toEqual([]);
   });
 });
 
 describe("plans that age with the days", () => {
-  it("plans again, at most hourly, a client with visits that no read will plan soon", async () => {
+  it("works out each client's plan again on its own clock, one worker at a time", async () => {
     const t = orgs.quiet;
-    const due = () => withTenant(t, (tx) => plansToRefresh(tx, 10));
-    expect(await due()).toEqual([]); // nothing to plan for
+    const due = () => withTenant(t, (tx) => claimReplans(tx, 10));
+    expect(await due()).toEqual([]); // nothing planned yet
     await withTenant(t, (tx) => tx.insert(visits).values({ tenantId: t, phoneE164: "+919848100001", service: "Hydrafacial", visitDate: new Date(Date.now() - 3 * 86_400_000).toISOString().slice(0, 10) }));
-    expect(await due()).toEqual([t]); // visits and no plan yet
-
     await replanTenant(t);
+    const [state] = await withTenant(t, (tx) => tx.select().from(callPlanSettings));
+    expect(state!.computedAt).toBeInstanceOf(Date);
+    expect(minutesFromNow(state!.nextReplanAt)).toBeGreaterThan(59);
     expect(await due()).toEqual([]); // planned within the hour
-    await withTenant(t, (tx) => tx.update(plannedCalls).set({ computedAt: new Date(Date.now() - 2 * 3_600_000) }));
-    expect(await due()).toEqual([t]);
 
-    // A read due now plans it anyway; one due tomorrow does not, so the hourly plan does.
-    const id = await connection(t);
-    expect(await due()).toEqual([]);
-    await withTenant(t, (tx) => tx.update(integrations).set({ nextPullAt: new Date(Date.now() + 86_400_000) }).where(eq(integrations.id, id)));
+    await withTenant(t, (tx) => tx.update(callPlanSettings).set({ nextReplanAt: new Date(Date.now() - 60_000) }));
+    // However many workers ask at once, one of them gets it.
+    const claims = await Promise.all([due(), due(), due()]);
+    expect(claims.flat()).toEqual([t]);
+    expect(await due()).toEqual([]); // held while it is worked out
+    await replanTenant(t);
+    expect(await due()).toEqual([]); // and let go with the next time set
+
+    // Someone asks not to be called: their plan is worked out again on the next pass, whoever wrote it.
+    await withTenant(t, (tx) => tx.insert(suppressions).values({ tenantId: t, phoneE164: "+919848100001", reason: "opt_out", scope: null, source: "test" }));
     expect(await due()).toEqual([t]);
+    // A plan that fails is tried again in an hour by any worker, not held.
+    await deferReplan(t);
+    const [later] = await withTenant(t, (tx) => tx.select().from(callPlanSettings));
+    expect(later!.replanLeaseUntil).toBeNull();
+    expect(minutesFromNow(later!.nextReplanAt)).toBeGreaterThan(59);
+    await withTenant(t, (tx) => tx.delete(suppressions).where(eq(suppressions.tenantId, t)));
+    expect(await due()).toEqual([t]); // taking the entry off counts too
+
     // A suspended client is left as it is.
+    await withTenant(t, (tx) => tx.update(callPlanSettings).set({ nextReplanAt: new Date(Date.now() - 60_000), replanLeaseUntil: null }));
     await platformDb().update(organizations).set({ status: "suspended" }).where(eq(organizations.id, t));
     expect(await due()).toEqual([]);
     await platformDb().update(organizations).set({ status: "active" }).where(eq(organizations.id, t));
+  });
+});
+
+describe("clients on their own databases", () => {
+  it("skips a suspended client, reports one whose schema is behind once, and rests one that fails", async () => {
+    const made = await platformDb()
+      .insert(organizations)
+      .values(["suspended", "behind", "down"].map((k) => ({ kind: "client" as const, name: `Own DB ${k}`, slug: `own-db-${k}-${randomUUID().slice(0, 8)}`, status: k === "suspended" ? ("suspended" as const) : ("active" as const), vertical: "derma", languages: ["en"] })))
+      .returning({ id: organizations.id });
+    const [suspended, behind, down] = made.map((m) => m.id) as [string, string, string];
+    const own = (tenantId: string, schemaVersion: number) => ({ tenantId, label: "Their server", host: "db.invalid", database: "jenai", username: "jenai_app", secret: "not-a-sealed-secret", status: "ready", schemaVersion });
+    await platformDb().insert(tenantDatabases).values([own(suspended, PLAN_SCHEMA_VERSION), own(behind, PLAN_SCHEMA_VERSION - 1), own(down, PLAN_SCHEMA_VERSION)]);
+    try {
+      const visited: string[] = [];
+      const fn = async (db: unknown) => {
+        if (db !== platformDb()) visited.push("own");
+        return [] as string[];
+      };
+      const first = await acrossDatabases(fn);
+      const mine = (errors: string[]) => errors.filter((e) => [suspended, behind, down].some((id) => e.includes(id.slice(0, 8))));
+      expect(mine(first.errors).some((e) => e.includes(suspended.slice(0, 8)))).toBe(false); // never visited
+      expect(mine(first.errors).find((e) => e.includes(behind.slice(0, 8)))).toMatch(/behind the 27 the call plan needs; run tenant-db migrate/);
+      expect(mine(first.errors).some((e) => e.includes(down.slice(0, 8)))).toBe(true);
+      // The next pass: the schema note is not repeated, and the database that failed is left alone for a while.
+      expect(mine((await acrossDatabases(fn)).errors)).toEqual([]);
+    } finally {
+      await platformDb().delete(tenantDatabases).where(inArray(tenantDatabases.tenantId, [suspended, behind, down]));
+      await platformDb().delete(organizations).where(inArray(organizations.id, [suspended, behind, down]));
+    }
   });
 });
 

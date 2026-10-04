@@ -6,9 +6,9 @@
 import "./scripts/env";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { platformDb, withTenant } from "./client";
-import { callPlanSettings, crmRecords, integrations, organizations, plannedCalls, treatmentRules, visits } from "./schema";
+import { callPlanSettings, crmRecords, integrations, organizations, plannedCalls, roles, treatmentRules, visits } from "./schema";
 
 let a = "";
 let b = "";
@@ -99,6 +99,18 @@ describe("call plan tables", () => {
       tx.insert(plannedCalls).values({ tenantId: a, journey: "maintenance", programKey: "clinic.revisit_recall", verdict: "dial" as "call_now", reason: "x", originType: "visit", originId: randomUUID(), originLabel: "Visit list" }),
     );
     expect(await pgError(odd)).toMatch(/check constraint/i);
+  });
+
+  it("lets the built-in owner, admin and branch manager upload the visit list on a database set up before it existed (0027)", async () => {
+    const rows = await platformDb()
+      .select({ key: roles.key, permissions: roles.permissions })
+      .from(roles)
+      .where(and(isNull(roles.tenantId), eq(roles.isSystem, true), eq(roles.side, "client"), inArray(roles.key, ["owner", "admin", "branch_manager", "front_desk"])));
+    const has = Object.fromEntries(rows.map((r) => [r.key, r.permissions.includes("visits:import")]));
+    expect(has).toEqual({ owner: true, admin: true, branch_manager: true, front_desk: false });
+    // Row-level security on roles is back on after the migration lifted it for that one update.
+    const [forced] = await platformDb().execute<{ forced: boolean }>(sql`select relforcerowsecurity as forced from pg_class where relname = 'roles' and relnamespace = 'public'::regnamespace`);
+    expect(forced!.forced).toBe(true);
   });
 
   it("starts a connection with nothing pulled, and drops its CRM copy when it is removed", async () => {

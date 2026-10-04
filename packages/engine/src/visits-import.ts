@@ -13,7 +13,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { audit, branches, callPlanSettings, contacts, organizations, withTenant, type AuditInput } from "@jenai/db";
+import { audit, branches, callPlanSettings, contacts, crmRecords, organizations, plannedCalls, visits, withTenant, type AuditInput } from "@jenai/db";
 import { toE164 } from "@jenai/voice";
 import { replanTenant, type ReplanResult } from "./care-plan";
 import { localParts } from "./dialer/time";
@@ -581,4 +581,79 @@ export async function importVisits(tenantId: string, csvText: string, opts: Visi
 
   const plan = await replanTenant(tenantId, { now });
   return { rows: read.rows, added: counts.added, updated: counts.updated, unchanged: counts.unchanged, repeated: counts.repeated, rejected: read.rejected, columns: cols.names, batch, plan };
+}
+
+// ---------------------------------------------------------------- taking visits out again
+
+/** A removal or erasure that cannot be done, with a reason the clinic can act on. */
+export class VisitRemovalError extends Error {
+  override name = "VisitRemovalError";
+}
+
+export interface VisitRemovalOptions {
+  /** The user who asked, for the audit log. Null from the command line. */
+  removedBy?: string | null;
+  audit?: Pick<AuditInput, "impersonatorUserId" | "via" | "ip" | "userAgent">;
+  now?: Date;
+}
+
+const auditOf = (tenantId: string, opts: VisitRemovalOptions) => ({
+  tenantId,
+  actorUserId: opts.removedBy ?? null,
+  impersonatorUserId: opts.audit?.impersonatorUserId ?? null,
+  via: opts.audit?.via ?? (opts.removedBy ? ("user" as const) : ("system" as const)),
+  ip: opts.audit?.ip ?? null,
+  userAgent: opts.audit?.userAgent ?? null,
+});
+
+/**
+ * Takes out the visits one upload added or last changed (its batch, as the
+ * call plan page and the audit log name it), then plans again. A visit a
+ * later upload changed carries that upload's batch instead, and stays.
+ */
+export async function removeVisitUpload(tenantId: string, batch: string, opts: VisitRemovalOptions = {}): Promise<{ removed: number; plan: ReplanResult }> {
+  if (!/^[0-9a-f-]{36}$/i.test(batch)) throw new VisitRemovalError("That is not an upload JENAI knows.");
+  const removed = await withTenant(tenantId, async (tx) => {
+    const gone = await tx.delete(visits).where(eq(visits.batch, batch)).returning({ id: visits.id });
+    await audit(tx, {
+      ...auditOf(tenantId, opts),
+      action: "visits.upload_removed",
+      targetType: "visit_batch",
+      targetId: batch,
+      summary: `Visit list upload removed: ${gone.length} ${gone.length === 1 ? "visit" : "visits"} taken out`,
+      diff: { removed: gone.length },
+    });
+    return gone.length;
+  });
+  return { removed, plan: await replanTenant(tenantId, { now: opts.now }) };
+}
+
+/**
+ * Erases one person's number from what the call plan keeps: their visits,
+ * the CRM records read for them, and their planned calls; their contact
+ * loses the name the visit list gave it. For someone who asked the clinic to
+ * erase their data. The clinic deletes them in its own CRM too, or the next
+ * read brings those records back. The audit entry names the number by its
+ * last 4 digits only.
+ */
+export async function eraseNumber(tenantId: string, rawPhone: string, opts: VisitRemovalOptions = {}): Promise<{ visits: number; records: number; planned: number; plan: ReplanResult }> {
+  const phone = toE164(rawPhone.trim());
+  if (!phone) throw new VisitRemovalError("That is not a phone number JENAI can read.");
+  const counts = await withTenant(tenantId, async (tx) => {
+    const v = await tx.delete(visits).where(eq(visits.phoneE164, phone)).returning({ id: visits.id });
+    const r = await tx.delete(crmRecords).where(eq(crmRecords.phoneE164, phone)).returning({ id: crmRecords.id });
+    const p = await tx.delete(plannedCalls).where(eq(plannedCalls.phoneE164, phone)).returning({ id: plannedCalls.id });
+    await tx.update(contacts).set({ name: null, updatedAt: new Date() }).where(and(eq(contacts.phoneE164, phone), eq(contacts.source, "visit_list")));
+    const c = { visits: v.length, records: r.length, planned: p.length };
+    await audit(tx, {
+      ...auditOf(tenantId, opts),
+      action: "call_plan.number_erased",
+      targetType: "phone",
+      targetId: `ending ${phone.slice(-4)}`,
+      summary: `Erased from the call plan: ${c.visits} visits, ${c.records} CRM records, ${c.planned} planned calls`,
+      diff: c,
+    });
+    return c;
+  });
+  return { ...counts, plan: await replanTenant(tenantId, { now: opts.now }) };
 }

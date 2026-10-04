@@ -31,7 +31,7 @@ import { analyzeCalls, heardOptOut, type Extractor } from "../analyze";
 import { setUpProgram } from "../programs";
 import { addCarrierAccount, addPhoneNumber } from "../telephony";
 import { claimDeliveries, credentialsOf, deliver, enqueueEvent, sealCredentials, subscribers, testConnection } from "./queue";
-import { callbackFromNotes, zohoConnector } from "./zoho";
+import { callbackFromNotes, notesSayDoNotCall, zohoConnector } from "./zoho";
 import { syncIntegration } from "./crm-sync";
 import { exchangeGrantCode, saveZohoConnection } from "./zoho-connect";
 import { EVENT_KINDS, emitCallCompleted, emitLeadUpdated, healthWithheld } from "./events";
@@ -1288,15 +1288,25 @@ describe("connecting Zoho, and connecting it again", () => {
     expect(again.integration.name).toBe("Front desk Zoho");
   });
 
-  it("lets go of the records people were linked to when reconnected to another data centre", async () => {
+  it("lets go of the records people were linked to, and what was read for the plan, when reconnected to another data centre", async () => {
     const [i] = await withTenant(org, (tx) => tx.select().from(integrations).where(eq(integrations.kind, "zoho_crm")));
     const linkFor = (dc: string) => withTenant(org, (tx) => tx.insert(externalLinks).values({ tenantId: org, integrationId: i!.id, ourType: "contact", ourId: randomUUID(), externalType: "Leads", externalId: `ZOHO-${dc}-${randomUUID().slice(0, 6)}` }));
     const links = () => withTenant(org, (tx) => tx.select().from(externalLinks).where(eq(externalLinks.integrationId, i!.id)));
+    const read = () => withTenant(org, (tx) => tx.select().from(crmRecords).where(eq(crmRecords.integrationId, i!.id)));
     await linkFor("in");
+    await withTenant(org, async (tx) => {
+      await tx.insert(crmRecords).values({ tenantId: org, integrationId: i!.id, module: "Leads", externalId: "4150868000009000001", phoneE164: "+919848099991", status: "New Lead" });
+      await tx.update(integrations).set({ pullCursor: { Leads: { since: new Date().toISOString() } } }).where(eq(integrations.id, i!.id));
+    });
     await withTenant(org, (tx) => saveZohoConnection(tx, org, { dc: "in", scopes: null, credentials: { client_id: "cid", client_secret: "secret", refresh_token: "same-dc" } }));
     expect(await links()).toHaveLength(1);
+    expect(await read()).toHaveLength(1);
     await withTenant(org, (tx) => saveZohoConnection(tx, org, { dc: "com", scopes: null, credentials: { client_id: "cid", client_secret: "secret", refresh_token: "other-dc" } }));
     expect(await links()).toEqual([]);
+    // Another Zoho account: its records are read from the start, and the old account's copy goes.
+    expect(await read()).toEqual([]);
+    const [after] = await withTenant(org, (tx) => tx.select().from(integrations).where(eq(integrations.id, i!.id)));
+    expect(after!.pullCursor).toEqual({});
   });
 
   it("starts a new connection from the form's choices, without lead changes until a field is mapped", async () => {
@@ -1534,6 +1544,10 @@ describe("reading their Zoho records for the call plan", () => {
     deleted: Record<string, Array<{ id: string; deleted_time: string }>>;
     fields: Record<string, Array<Record<string, unknown>>>;
     refuse: Record<string, { status: number; body?: unknown }>;
+    /** Runs after Zoho answers a request for records: someone at the clinic changing their CRM meanwhile. */
+    meanwhile?: () => void;
+    /** What the token server answers instead of a token. */
+    tokenError?: string;
   } = { records: {}, deleted: {}, fields: {}, refuse: {} };
   const reset = (c: Partial<typeof crm> = {}) => {
     asked.length = 0;
@@ -1554,6 +1568,7 @@ describe("reading their Zoho records for the call plan", () => {
     if (url.pathname === "/oauth/v2/token") {
       tokens++;
       await new Promise((r) => setTimeout(r, 30)); // Zoho takes its time, so callers overlap
+      if (crm.tokenError) return answer(400, { error: crm.tokenError });
       return answer(200, { access_token: `fresh-${tokens}`, expires_in: 3600 });
     }
     const refused = crm.refuse[url.pathname];
@@ -1568,6 +1583,7 @@ describe("reading their Zoho records for the call plan", () => {
       ? (crm.deleted[m[1]!] ?? []).filter((d) => Date.parse(d.deleted_time) > after)
       : (crm.records[m[1]!] ?? []).filter((r) => Date.parse(String(r.Modified_Time)) > after).sort((a, b) => Date.parse(String(a.Modified_Time)) - Date.parse(String(b.Modified_Time)));
     const data = all.slice((page - 1) * per, page * per);
+    if (!m[2]) crm.meanwhile?.();
     return data.length ? answer(200, { data, info: { per_page: per, count: data.length, page, more_records: all.length > page * per } }) : answer(204);
   }) as typeof fetch;
 
@@ -1617,8 +1633,14 @@ describe("reading their Zoho records for the call plan", () => {
           lead(2, { Follow_Up_Date_Time: "2026-10-07T16:00:00+05:30", Description: "cb 5-10-2026" }),
           // A Lead Zoho converted is a Contact now.
           lead(3, { $converted: true, Lead_Status: "Interested", Follow_Up_Date_Time: "2026-10-08" }),
-          // A date typed into a text field, year first or day first.
+          // A date typed into a text field, year first or day first, with a time.
           lead(4, { Follow_Up_Date_Time: "2026-10-09 11:00", Appointment_Date_Time: "10/10/2026 4 pm" }),
+          // A date field holds a day and no time; the team wrote not to call them.
+          lead(5, { Appointment_Date_Time: "2026-10-05", Description: "Not interested now, asked dont call again" }),
+          // Made in January 2025 and edited since (a new owner): the note's year is the record's own.
+          lead(6, { Created_Time: "2025-01-20T10:00:00+05:30", Description: "call back after 12/10" }),
+          // A day the note says not to call on is no callback.
+          lead(7, { Description: "pt said do not call on 5/10, travelling" }),
         ],
       },
     });
@@ -1645,15 +1667,21 @@ describe("reading their Zoho records for the call plan", () => {
       source: "Instagram",
       centre: "Kondapur",
       appointmentAt: new Date("2026-10-05T05:30:00Z"),
+      appointmentHasTime: true,
       followUpAt: dayIn(2026, 10, 3),
+      notesSayDoNotCall: false,
       treatment: "Hair / PRP",
       consultant: "Dr. Rao",
     });
     expect(r.records[1]!.followUpAt).toEqual(new Date("2026-10-07T10:30:00Z"));
     expect(r.records[2]).toMatchObject({ status: "Converted", followUpAt: dayIn(2026, 10, 8) });
-    expect(r.records[3]).toMatchObject({ followUpAt: dayIn(2026, 10, 9), appointmentAt: dayIn(2026, 10, 10) });
+    // 11:00 and 4 pm in India.
+    expect(r.records[3]).toMatchObject({ followUpAt: new Date("2026-10-09T05:30:00Z"), appointmentAt: new Date("2026-10-10T10:30:00Z"), appointmentHasTime: true });
+    expect(r.records[4]).toMatchObject({ appointmentAt: dayIn(2026, 10, 5), appointmentHasTime: false, notesSayDoNotCall: true });
+    expect(r.records[5]!.followUpAt).toEqual(dayIn(2025, 10, 12));
+    expect(r.records[6]).toMatchObject({ followUpAt: null, notesSayDoNotCall: false });
     // The notes themselves go no further than the date read out of them.
-    expect(JSON.stringify(r)).not.toMatch(/hair fall|tried oils|call back|cb 5/i);
+    expect(JSON.stringify(r)).not.toMatch(/hair fall|tried oils|call back|cb 5|dont call|travelling/i);
 
     // The field list is read once an hour, not on every pull.
     await pull(ctx);
@@ -1687,9 +1715,12 @@ describe("reading their Zoho records for the call plan", () => {
     r = await pull(ctx, "Leads", r.cursor, 10);
     const [first, second] = listings();
     expect(first!.headers["If-Modified-Since"]).toBe(askedAfter(200));
-    expect([first!.query.get("page"), second!.query.get("page")]).toEqual(["1", "2"]);
-    // The newest change stored before is read again, which changes nothing; none is missed.
-    expect(r.records).toHaveLength(251);
+    // Each page starts again from the newest change read, never from a position that may have moved.
+    expect([first!.query.get("page"), second!.query.get("page")]).toEqual(["1", "1"]);
+    expect(second!.headers["If-Modified-Since"]).toBe(askedAfter(399));
+    // The newest change read before is read again, which changes nothing; none is missed.
+    expect(r.records).toHaveLength(252);
+    expect(new Set(r.records.map((x) => x.externalId)).size).toBe(251);
     expect(r.records[0]!.externalId).toBe(lead(200).id);
     expect(r).toMatchObject({ done: true, pages: 3 }); // two pages of changes, one of deletions
     expect(r.cursor.since).toBe(isoAt(450));
@@ -1701,8 +1732,8 @@ describe("reading their Zoho records for the call plan", () => {
   it("never asks past page 10, and starts again from the newest change it read", async () => {
     reset({ fields: { Leads: LEAD_FIELDS }, records: { Leads: Array.from({ length: 2300 }, (_, n) => lead(n + 1)) } });
     const r = await pull(ctxFor(), "Leads", {}, 15);
-    expect(listings().map((a) => Number(a.query.get("page")))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2]);
-    expect(listings()[10]!.headers["If-Modified-Since"]).toBe(askedAfter(2000));
+    expect(listings().map((a) => Number(a.query.get("page")))).toEqual(Array(12).fill(1));
+    expect(listings()[1]!.headers["If-Modified-Since"]).toBe(askedAfter(200));
     expect(new Set(r.records.map((x) => x.externalId)).size).toBe(2300);
     expect(r).toMatchObject({ done: true, pages: 13 });
 
@@ -1712,15 +1743,21 @@ describe("reading their Zoho records for the call plan", () => {
     const stuck = await pull(ctxFor(), "Leads", {}, 30);
     expect(Math.max(...listings().map((a) => Number(a.query.get("page"))))).toBe(10);
     expect(stuck.done).toBe(true);
-    expect(stuck.cursor.since).toBe(new Date(BASE + 2000).toISOString());
+    // If-Modified-Since is exclusive: from the next second on, so a change a second later is still read.
+    expect(stuck.cursor.since).toBe(new Date(BASE + 1000).toISOString());
+    expect(listings().at(-1)!.headers["If-Modified-Since"]).toBe(`${new Date(BASE).toISOString().slice(0, 19)}+00:00`);
     expect(stuck.notes!.join(" ")).toMatch(/More than 2000 Leads changed within one second/);
   });
 
   it("ends the read on an empty answer, and leaves the cursor where it was", async () => {
     reset({ fields: { Leads: LEAD_FIELDS } });
-    const cursor = { since: isoAt(5), deleted: { since: isoAt(5) } };
+    // A first read leaves what it meant and when deletions were last read in the cursor.
+    const cursor: Record<string, unknown> = { ...(await pull(ctxFor(), "Leads")).cursor, since: isoAt(5) };
+    expect(cursor.deleted).toMatchObject({ checkedAt: expect.any(String) });
+    asked.length = 0;
     let r = await pull(ctxFor(), "Leads", cursor);
-    expect(r).toMatchObject({ records: [], deleted: [], done: true, pages: 2 });
+    // Deletions were read within the hour, so one request: they cost Zoho credits too.
+    expect(r).toMatchObject({ records: [], deleted: [], done: true, pages: 1, advanced: false });
     expect(r.cursor).toEqual(cursor);
     expect(listings()[0]!.headers["If-Modified-Since"]).toBe(askedAfter(5));
     // Zoho's 304 for nothing changed since If-Modified-Since says the same.
@@ -1742,6 +1779,13 @@ describe("reading their Zoho records for the call plan", () => {
     expect(day("call back after 3 /10/ 26. Busy, CB 9/10")).toEqual(dayIn(2026, 10, 9));
     // Written in December for January.
     expect(callbackFromNotes("call on 5/1", new Date("2026-12-20T10:00:00Z"))).toEqual(dayIn(2027, 1, 5));
+    // A day without a year is the first such day after the record was made, never one carried into a later year.
+    expect(callbackFromNotes("call back after 12/10", new Date("2025-01-20T04:30:00Z"))).toEqual(dayIn(2025, 10, 12));
+    // A day they asked not to be called on is no callback.
+    for (const negated of ["do not call on 5/10", "dont call before 10/10", "Not interested. Do not call after 5/10/26", "pt said do not call on 5/10, travelling", "Do not call back on 7/10"]) {
+      expect(day(negated), negated).toBeNull();
+    }
+    expect(day("no answer, call back on 5/10")).toEqual(dayIn(2026, 10, 5));
     for (const notCallback of [
       "asdf ;; 12 /// ?? lorem",
       "visited on 2/9/26, happy with results",
@@ -1756,6 +1800,11 @@ describe("reading their Zoho records for the call plan", () => {
       expect(day(notCallback), notCallback).toBeNull();
     }
     expect(callbackFromNotes(null, ref)).toBeNull();
+  });
+
+  it("reads a do-not-call the team wrote in the notes, and not a time they would rather not be called", () => {
+    for (const no of ["asked dont call again", "Do not call", "patient on DND", "stop calling her", "Don’t call", "dont call at all", "no more calls please", "not to be called"]) expect(notesSayDoNotCall(no), no).toBe(true);
+    for (const yes of ["don't call after 7 pm", "do not call on 5/10", "don't call in office hours", "she does not call back", "call after 6pm", "", null]) expect(notesSayDoNotCall(yes), String(yes)).toBe(false);
   });
 
   it("leaves out a module whose scope was not granted, says why, and reads the others", async () => {
@@ -1792,7 +1841,8 @@ describe("reading their Zoho records for the call plan", () => {
       zohoConnector.send(writing, { id: "e1", kind: "call.completed", idempotencyKey: "k1", externalId: "ZOHO-LEAD-1", externalType: "Leads", payload: { call: { outcome: "booked", seconds: 60 } } }),
     ]);
     expect(tokens).toBe(1);
-    expect(saved).toHaveLength(1);
+    // Each caller stores the token itself, in its own transaction: none waits on another's write.
+    expect(saved).toEqual([{ credentials: expect.objectContaining({ access_token: "fresh-1" }) }, { credentials: expect.objectContaining({ access_token: "fresh-1" }) }]);
     expect([pulling.credentials.access_token, writing.credentials.access_token]).toEqual(["fresh-1", "fresh-1"]);
     expect(asked.filter((q) => q.path.startsWith("/crm/")).every((q) => q.headers.Authorization === "Zoho-oauthtoken fresh-1")).toBe(true);
     expect(a.records).toHaveLength(1);
@@ -1802,7 +1852,7 @@ describe("reading their Zoho records for the call plan", () => {
   const rows = () => withTenant(org, (tx) => tx.select().from(crmRecords).where(eq(crmRecords.integrationId, zohoId)).orderBy(crmRecords.externalId));
   const connection = async () => (await withTenant(org, (tx) => tx.select().from(integrations).where(eq(integrations.id, zohoId))))[0]!;
 
-  it("keeps the plan's copy in crm_records, moves the cursor with it, and marks what was deleted", async () => {
+  it("keeps the plan's copy in crm_records, moves the cursor with it, and deletes what Zoho deleted", async () => {
     reset({
       fields: { Leads: LEAD_FIELDS, Contacts: CONTACT_FIELDS },
       records: { Leads: [lead(1, { Description: "Pigmentation, on creams. call back after 3 /10/ 26", Treatment: "Hydrafacial" }), lead(2), lead(3, { Mobile: "12" })], Contacts: [contact(1)] },
@@ -1833,30 +1883,93 @@ describe("reading their Zoho records for the call plan", () => {
     expect(i).toMatchObject({ lastPullError: null, pullLeaseUntil: null });
     expect(i.lastPullAt).toBeInstanceOf(Date);
 
-    // In Zoho, Lead 2 is deleted and Lead 1 booked.
+    // Nothing new: the newest change is read again (Zoho's If-Modified-Since overlap) and changes nothing.
+    r = await syncIntegration(org, zohoId, { pageBudget: 10, fetchImpl: zohoFetch });
+    expect(r.modules.map((m) => [m.module, m.read, m.changed, m.advanced])).toEqual([["Leads", 1, 0, false], ["Contacts", 1, 0, false]]);
+
+    // In Zoho, Lead 2 is deleted and Lead 1 booked. Deletions are read at most hourly, so an hour on:
     crm.records.Leads = [lead(1, { Lead_Status: "Appointment Booked", Modified_Time: minute(10) }), lead(3, { Mobile: "12" })];
     crm.deleted.Leads = [{ id: lead(2).id, deleted_time: ist(Date.now()) }];
+    await withTenant(org, (tx) => tx.execute(sql`update integrations set pull_cursor = jsonb_set(pull_cursor, '{Leads,deleted,checkedAt}', to_jsonb(now() - interval '2 hours')) where id = ${zohoId}`));
     asked.length = 0;
     r = await syncIntegration(org, zohoId, { pageBudget: 10, fetchImpl: zohoFetch });
-    expect(r.modules.find((m) => m.module === "Leads")).toMatchObject({ read: 2, deleted: 1, done: true });
+    expect(r.modules.find((m) => m.module === "Leads")).toMatchObject({ read: 2, changed: 2, deleted: 1, done: true, advanced: true });
     expect(listings()[0]!.headers["If-Modified-Since"]).toBe(askedAfter(3));
     stored = await rows();
-    expect(stored).toHaveLength(4); // Lead 3, read again in the overlap, is not doubled
+    // Lead 3, read again in the overlap, is not doubled; Lead 2 is gone with its name and number.
+    expect(stored).toHaveLength(3);
     expect(stored.find((x) => x.externalId === lead(1).id)).toMatchObject({ status: "Appointment Booked", modifiedExt: new Date(minute(10)) });
-    expect(stored.find((x) => x.externalId === lead(2).id)!.deletedAt).toBeInstanceOf(Date);
+    expect(stored.some((x) => x.externalId === lead(2).id)).toBe(false);
     i = await connection();
     expect(i.pullCursor).toMatchObject({ Leads: { since: isoAt(10) }, Contacts: { since: isoAt(1) } });
   });
 
-  it("shares one page budget across the modules, and leaves a connection another run is reading", async () => {
+  it("misses nothing when the clinic edits a record between two pages", async () => {
+    await withTenant(org, (tx) => tx.update(integrations).set({ pullCursor: {} }).where(eq(integrations.id, zohoId)));
+    reset({ fields: { Leads: LEAD_FIELDS, Contacts: CONTACT_FIELDS }, records: { Leads: Array.from({ length: 450 }, (_, n) => lead(n + 1)), Contacts: [] } });
+    // While page 1 is being read, the front desk changes Lead 5: it moves to the end of the listing.
+    let edited = false;
+    crm.meanwhile = () => {
+      if (edited) return;
+      edited = true;
+      crm.records.Leads = crm.records.Leads!.map((x) => (x.id === lead(5).id ? { ...x, Lead_Status: "Not Answered", Modified_Time: minute(500) } : x));
+    };
+    const r = await syncIntegration(org, zohoId, { pageBudget: 10, fetchImpl: zohoFetch });
+    expect(r.modules[0]).toMatchObject({ module: "Leads", done: true });
+    const stored = await rows();
+    // Every one of the 450, and Lead 201 too, which offset paging would have skipped for good.
+    for (const n of [1, 5, 200, 201, 202, 450]) expect(stored.some((x) => x.externalId === lead(n).id), `lead ${n}`).toBe(true);
+    expect(stored.filter((x) => x.module === "Leads")).toHaveLength(450);
+    expect(stored.find((x) => x.externalId === lead(5).id)!.status).toBe("Not Answered");
+  });
+
+  it("reads every record again when what it reads changes, and takes what Zoho no longer lists as deleted", async () => {
+    await withTenant(org, (tx) => tx.update(integrations).set({ pullCursor: {} }).where(eq(integrations.id, zohoId)));
+    reset({ fields: { Leads: [...LEAD_FIELDS, field("Clinic_Branch", "Clinic Branch", "picklist")], Contacts: CONTACT_FIELDS }, records: { Leads: [lead(1, { Clinic_Branch: "Kondapur" }), lead(2, { Clinic_Branch: "Gachibowli" })], Contacts: [] } });
+    await syncIntegration(org, zohoId, { pageBudget: 10, fetchImpl: zohoFetch });
+    expect((await rows()).filter((x) => x.module === "Leads").map((x) => x.centre)).toEqual([null, null]);
+
+    // Support points the centre at their own field: the records read before get it too, not only the ones edited later.
+    const i = await connection();
+    await withTenant(org, (tx) => tx.update(integrations).set({ config: { ...i.config, pull: { fieldLabels: { centre: ["Clinic Branch"] } } } }).where(eq(integrations.id, zohoId)));
+    asked.length = 0;
+    const r = await syncIntegration(org, zohoId, { pageBudget: 10, fetchImpl: zohoFetch });
+    expect(listings()[0]!.headers["If-Modified-Since"]).toBeUndefined();
+    expect(r.modules[0]!.notes!.join(" ")).toMatch(/What JENAI reads from Leads has changed .* so every Leads record is read again/);
+    expect((await rows()).filter((x) => x.module === "Leads").map((x) => x.centre)).toEqual(["Kondapur", "Gachibowli"]);
+    expect((await connection()).lastPullNotes.join(" ")).toMatch(/every Leads record is read again/);
+
+    // Deletions last read longer ago than Zoho lists them: everything is read again, and Lead 2, gone meanwhile, goes.
+    crm.records.Leads = [lead(1, { Clinic_Branch: "Kondapur" })];
+    await withTenant(org, (tx) => tx.execute(sql`update integrations set pull_cursor = jsonb_set(pull_cursor, '{Leads,deleted,checkedAt}', to_jsonb(now() - interval '70 days')) where id = ${zohoId}`));
+    const again = await syncIntegration(org, zohoId, { pageBudget: 10, fetchImpl: zohoFetch });
+    expect(again.modules[0]!.notes!.join(" ")).toMatch(/Deleted Leads were last read more than 55 days ago/);
+    expect((await rows()).filter((x) => x.module === "Leads").map((x) => x.externalId)).toEqual([lead(1).id]);
+    await withTenant(org, (tx) => tx.update(integrations).set({ config: i.config }).where(eq(integrations.id, zohoId)));
+  });
+
+  it("marks the connection not working when Zoho revokes the grant, and the worker stops reading it", async () => {
+    const before = await connection();
+    const expired = sealCredentials(org, { client_id: "cid", client_secret: "secret", refresh_token: "refresh", access_token: "old", access_token_until: String(Date.now() - 1000) });
+    await withTenant(org, (tx) => tx.update(integrations).set({ credentials: expired, pullFailures: 0 }).where(eq(integrations.id, zohoId)));
+    reset({ tokenError: "invalid_code" });
+    const r = await syncIntegration(org, zohoId, { fetchImpl: zohoFetch });
+    expect(r).toMatchObject({ connectionBroken: true });
+    expect(r.error).toMatch(/Reconnect Zoho/);
+    const after = await connection();
+    expect(after).toMatchObject({ status: "error", pullFailures: 1 });
+    expect(after.lastError).toMatch(/Reconnect Zoho/);
+    expect(tokens).toBe(1); // Contacts was not tried with the same dead grant
+    await withTenant(org, (tx) => tx.update(integrations).set({ status: before.status, credentials: before.credentials, lastError: null, pullFailures: 0 }).where(eq(integrations.id, zohoId)));
+  });
+
+  it("gives every module two requests however low the budget, and leaves a connection another run is reading", async () => {
     await withTenant(org, (tx) => tx.update(integrations).set({ pullCursor: {} }).where(eq(integrations.id, zohoId)));
     reset({ fields: { Leads: LEAD_FIELDS, Contacts: CONTACT_FIELDS }, records: { Leads: [lead(1)], Contacts: [contact(1)] } });
+    // A budget of 1 for two modules would leave the second one starved, run after run.
     let r = await syncIntegration(org, zohoId, { pageBudget: 1, fetchImpl: zohoFetch });
-    expect(r).toMatchObject({ ran: true, pages: 1, done: false, error: null });
-    expect(r.modules).toEqual([
-      expect.objectContaining({ module: "Leads", read: 1, done: false }), // its deletions wait for the next run
-      { module: "Contacts", read: 0, deleted: 0, done: false },
-    ]);
+    expect(r).toMatchObject({ ran: true, pages: 4, done: true, error: null });
+    expect(r.modules.map((m) => [m.module, m.read, m.done])).toEqual([["Leads", 1, true], ["Contacts", 1, true]]);
 
     await withTenant(org, (tx) => tx.update(integrations).set({ pullLeaseUntil: new Date(Date.now() + 60_000) }).where(eq(integrations.id, zohoId)));
     asked.length = 0;

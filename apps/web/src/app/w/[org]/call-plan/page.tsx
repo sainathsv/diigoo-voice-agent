@@ -2,10 +2,12 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { branchesFor, can, holdsAnywhere } from "@jenai/authz";
 import type { PlannedCallVerdict } from "@jenai/db";
-import { PLAN_JOURNEYS, type PlanJourney } from "@jenai/engine";
-import { Empty, PageHead, Pager, Section, StatusBadge, TextLink, fmtDate } from "@/components/ui";
+import { PLAN_JOURNEYS, inWindow, nextWindowStart, type PlanJourney, type Windows } from "@jenai/engine";
+import { Empty, Flash, PageHead, Pager, Section, StatusBadge, TextLink, fmtDate } from "@/components/ui";
+import { ConfirmButton, SubmitButton } from "@/components/client";
 import { requireWorkspace } from "@/server/access";
-import { CALL_PLAN_PAGE, loadCallPlan, type CallPlanRow, type CallPlanSource } from "@/server/queries/call-plan";
+import { removeUpload, switchCallPlan } from "@/server/actions/call-plan";
+import { CALL_PLAN_PAGE, loadCallPlan, type CallPlanRow, type CallPlanSource, type CallPlanView } from "@/server/queries/call-plan";
 import { deny } from "@/server/security-log";
 import { VisitUploadForm } from "./visit-upload-form";
 
@@ -21,13 +23,17 @@ const VERDICT_OF = Object.fromEntries(VERDICTS.map((v) => [v.key, v])) as Record
 
 const KIND: Record<string, string> = { zoho_crm: "Zoho CRM", salesforce: "Salesforce", hubspot: "HubSpot", leadsquared: "LeadSquared", google_sheets: "Google Sheets" };
 
-export default async function CallPlanPage({ params, searchParams }: { params: Promise<{ org: string }>; searchParams: Promise<{ journey?: string; verdict?: string; page?: string }> }) {
+export default async function CallPlanPage({ params, searchParams }: { params: Promise<{ org: string }>; searchParams: Promise<{ journey?: string; verdict?: string; page?: string; ok?: string; error?: string }> }) {
   const { org: slug } = await params;
   const sp = await searchParams;
   const ctx = await requireWorkspace(slug);
   if (!holdsAnywhere(ctx.access, "contacts:view")) return deny(ctx, { perm: "contacts:view" });
   const plan = await loadCallPlan(ctx.org.id, ctx.access, { journey: sp.journey, verdict: sp.verdict, page: Number(sp.page ?? 1) });
   const canUpload = holdsAnywhere(ctx.access, "visits:import") && ctx.org.status !== "suspended";
+  // Taking a whole upload out can reach every branch, so it needs the permission across the workspace.
+  const canRemoveUpload = can(ctx.access, "visits:import") && ctx.org.status !== "suspended";
+  const canSwitch = can(ctx.access, "org:manage") && ctx.org.status !== "suspended";
+  const canTune = can(ctx.access, "org:manage") || can(ctx.access, "integrations:manage");
   const someBranches = branchesFor(ctx.access, "contacts:view") !== "all";
   const tz = zoneOf(ctx.org.timezone);
   const now = new Date();
@@ -41,10 +47,20 @@ export default async function CallPlanPage({ params, searchParams }: { params: P
 
   return (
     <>
-      <PageHead title="Call plan" sub="Everyone in your records, the call JENAI would make to each of them, when and why, or why they are kept out." />
+      <PageHead
+        title="Call plan"
+        sub="Everyone in your records, the call JENAI would make to each of them, when and why, or why they are kept out."
+        actions={canTune ? <TextLink href={`/w/${slug}/call-plan/settings`}>Plan settings</TextLink> : null}
+      />
+      <Flash ok={sp.ok} error={sp.error} />
       <div className="notice notice-warn mb-5" role="status">
         <b>Preview.</b> Nobody is being called yet. JENAI shows who it would call and why. Calls start only when calling is switched on for this workspace.
       </div>
+      {plan.stale && plan.computedAt ? (
+        <div className="notice notice-warn mb-5" role="status">
+          This plan was worked out {fmtDate(plan.computedAt, true, tz)} and could not be worked out again just now, so some times may have moved on. It is tried again on your next visit.
+        </div>
+      ) : null}
 
       <div className="grid gap-6">
         <Section title="Where the plan comes from" sub="Your CRM records, which JENAI only reads to make this plan, and the visit list your team uploads.">
@@ -60,9 +76,12 @@ export default async function CallPlanPage({ params, searchParams }: { params: P
               <div>
                 <div className="eyebrow">CRM</div>
                 {plan.sources.length ? (
-                  <ul className="mt-2 grid gap-3">
-                    {plan.sources.map((s) => <SourceLine key={s.id} s={s} tz={tz} />)}
-                  </ul>
+                  <>
+                    <ul className="mt-2 grid gap-3">
+                      {plan.sources.map((s) => <SourceLine key={s.id} s={s} tz={tz} plan={plan} />)}
+                    </ul>
+                    <PlanSwitch plan={plan} slug={slug} canSwitch={canSwitch} />
+                  </>
                 ) : (
                   <p className="mt-2 text-ink-soft">
                     No CRM connected.{" "}
@@ -79,6 +98,13 @@ export default async function CallPlanPage({ params, searchParams }: { params: P
                       Last upload {fmtDate(plan.visits.lastUpload.at, true, tz)}
                       {plan.visits.lastUpload.by ? ` by ${plan.visits.lastUpload.by}` : ""}: {plan.visits.lastUpload.added.toLocaleString("en-IN")} added, {plan.visits.lastUpload.updated.toLocaleString("en-IN")} updated
                       {plan.visits.lastUpload.refused ? `, ${plan.visits.lastUpload.refused.toLocaleString("en-IN")} ${plan.visits.lastUpload.refused === 1 ? "row" : "rows"} not used` : ""}.
+                      {canRemoveUpload && plan.visits.lastUpload.batch && plan.visits.lastUpload.added + plan.visits.lastUpload.updated > 0 ? (
+                        <form action={removeUpload} className="mt-2">
+                          <input type="hidden" name="slug" value={slug} />
+                          <input type="hidden" name="batch" value={plan.visits.lastUpload.batch} />
+                          <ConfirmButton className="btn btn-ghost btn-sm" message="Take out the visits this upload added or changed? The plan is worked out again without them.">Remove this upload</ConfirmButton>
+                        </form>
+                      ) : null}
                     </div>
                   ) : (
                     <div className="text-[13px] text-ink-soft">{canUpload ? "Upload it below." : "A workspace admin or branch manager can upload it."}</div>
@@ -153,7 +179,7 @@ export default async function CallPlanPage({ params, searchParams }: { params: P
                               <span className={`badge ${VERDICT_OF[r.verdict]?.badge ?? "badge-muted"}`}>{VERDICT_OF[r.verdict]?.label ?? r.verdict}</span>
                               <div className={`mt-1 ${r.verdict === "kept_out" ? "text-grey" : ""}`}>{PLAN_JOURNEYS[r.journey as PlanJourney]?.label ?? r.journey}</div>
                             </td>
-                            <td className="whitespace-nowrap">{whenText(r, tz, now)}</td>
+                            <td className="whitespace-nowrap">{whenText(r, tz, now, plan.callingWindow)}</td>
                             <td className="max-w-[44ch] text-[13px] text-ink-soft">{r.reason}</td>
                           </tr>
                         ))}
@@ -167,7 +193,10 @@ export default async function CallPlanPage({ params, searchParams }: { params: P
           </>
         ) : !nothing ? (
           <Section title="Nobody in the plan yet">
-            <Empty>The plan is worked out after JENAI reads your CRM or a visit list is uploaded. It shows here once there is someone to plan for.</Empty>
+            <Empty>
+              The plan is worked out after JENAI reads your CRM or a visit list is uploaded. It shows here once there is someone to plan for.
+              {plan.sources.length && !plan.enabled ? " Your CRM is read once the call plan is switched on." : ""}
+            </Empty>
           </Section>
         ) : null}
 
@@ -182,15 +211,18 @@ export default async function CallPlanPage({ params, searchParams }: { params: P
 }
 
 /** How JENAI reads one CRM connection, in plain words. */
-function SourceLine({ s, tz }: { s: CallPlanSource; tz: string }) {
+function SourceLine({ s, tz, plan }: { s: CallPlanSource; tz: string; plan: CallPlanView }) {
   const held = Object.entries(s.held).map(([module, n]) => `${n.toLocaleString("en-IN")} ${module}`);
+  const last = s.lastPullAt ? ` Last read ${fmtDate(s.lastPullAt, true, tz)}.` : "";
   const state =
     s.status === "paused" ? "Paused, so JENAI does not read it."
     : s.status === "error" ? "Not working. Connect it again under Your systems."
     : s.status === "draft" ? "Not finished connecting."
     : !s.reading ? "Reading is switched off for this connection."
-    : s.lastPullAt ? `Last read ${fmtDate(s.lastPullAt, true, tz)}.`
-    : "Connected, not read yet.";
+    : !plan.enabled ? `Not read on a timer: the call plan is switched off.${last}`
+    : !plan.readingOnTimer ? `JENAI is not reading CRMs on a timer on this server yet, so it is read only when JENAI support reads it.${last}`
+    : s.lastPullAt ? `Last read ${fmtDate(s.lastPullAt, true, tz)}${s.nextPullAt ? `, next ${fmtDate(s.nextPullAt, true, tz)}` : ""}.`
+    : "Switched on: read for the first time within a few minutes.";
   return (
     <li>
       <div className="flex flex-wrap items-center gap-2">
@@ -204,7 +236,30 @@ function SourceLine({ s, tz }: { s: CallPlanSource; tz: string }) {
           Last read had a problem: {s.lastPullError.length > 300 ? `${s.lastPullError.slice(0, 300)}...` : s.lastPullError}
         </div>
       ) : null}
+      {s.lastPullNotes.length ? (
+        <ul className="mt-0.5 list-disc pl-5 text-[13px] text-ink-soft">
+          {s.lastPullNotes.slice(0, 5).map((n, i) => <li key={i}>{n}</li>)}
+        </ul>
+      ) : null}
     </li>
+  );
+}
+
+/** The call plan's own switch: reading the CRM on a timer starts only when the workspace asks for it. */
+function PlanSwitch({ plan, slug, canSwitch }: { plan: CallPlanView; slug: string; canSwitch: boolean }) {
+  if (!canSwitch) return plan.enabled ? null : <p className="mt-3 text-[13px] text-ink-soft">A workspace admin can switch the call plan on, so JENAI reads your CRM on a timer.</p>;
+  if (!plan.enabled && !plan.canEnable) return <p className="mt-3 text-[13px] text-ink-soft">The call plan knows clinic calls only for now, so it cannot be switched on for this workspace.</p>;
+  return (
+    <form action={switchCallPlan} className="mt-3 flex flex-wrap items-center gap-3">
+      <input type="hidden" name="slug" value={slug} />
+      <input type="hidden" name="to" value={plan.enabled ? "off" : "on"} />
+      <span className="text-[13px] text-ink-soft">
+        {plan.enabled ? "The call plan is on: JENAI reads your CRM on a timer, only to plan." : "The call plan is off: JENAI does not read your CRM on a timer. Switching it on uses a few hundred of your Zoho API credits a day."}
+      </span>
+      <SubmitButton className={plan.enabled ? "btn btn-ghost btn-sm" : "btn btn-primary btn-sm"} pendingText="Saving">
+        {plan.enabled ? "Switch off" : "Switch on"}
+      </SubmitButton>
+    </form>
   );
 }
 
@@ -228,14 +283,15 @@ function StatusOrService({ r }: { r: CallPlanRow }) {
 }
 
 /**
- * A due call made outside calling hours carries the next opening as its time,
- * so "now" is shown only once that time has come.
+ * When a call goes. A call already due keeps the time it fell due, so "now"
+ * is shown only inside calling hours; outside them, the next opening.
  */
-function whenText(r: CallPlanRow, tz: string, now: Date): React.ReactNode {
+function whenText(r: CallPlanRow, tz: string, now: Date, window: Windows): React.ReactNode {
   if (r.verdict === "kept_out") return <span className="text-grey">Not called</span>;
-  if (r.verdict === "waiting") return <span className="text-grey">{r.callAt ? fmtDate(r.callAt, true, tz) : "After the first call"}</span>;
-  if (!r.callAt || r.callAt <= now) return <span className="font-semibold">Now</span>;
-  return fmtDate(r.callAt, true, tz);
+  if (r.verdict === "waiting") return <span className="text-grey">{r.callAt && r.callAt > now ? fmtDate(r.callAt, true, tz) : "After the first call"}</span>;
+  if (r.callAt && r.callAt > now) return fmtDate(r.callAt, true, tz);
+  if (inWindow(now, window, tz)) return <span className="font-semibold">Now</span>;
+  return <span className="font-semibold">Next calling hours, {fmtDate(nextWindowStart(now, window, tz), true, tz)}</span>;
 }
 
 /** The organisation's time zone, or India's when it is not one the runtime knows. */
