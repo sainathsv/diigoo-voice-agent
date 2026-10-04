@@ -1,5 +1,6 @@
 "use server";
 
+import { revalidatePath } from "next/cache";
 import { branchesFor, holdsAnywhere } from "@jenai/authz";
 import { VISIT_IMPORT_MAX_BYTES, VisitImportError, decodeVisitFile, importVisits, type VisitReject } from "@jenai/engine";
 import { actorFields, requireWorkspace } from "../access";
@@ -46,6 +47,8 @@ export async function uploadVisitList(_: VisitUploadState, fd: FormData): Promis
       branchIds: scope === "all" ? undefined : scope,
     });
     const refused = r.rejected.length;
+    // The call plan page shows the new plan with the result, without a reload.
+    revalidatePath(`/w/${ctx.org.slug}/call-plan`);
     return {
       ok:
         `Visit list read: ${r.added} new ${r.added === 1 ? "visit" : "visits"}, ${r.updated} updated, ${r.unchanged} already here` +

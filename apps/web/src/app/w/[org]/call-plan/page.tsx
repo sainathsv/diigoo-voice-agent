@@ -1,0 +1,254 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+import { branchesFor, can, holdsAnywhere } from "@jenai/authz";
+import type { PlannedCallVerdict } from "@jenai/db";
+import { PLAN_JOURNEYS, type PlanJourney } from "@jenai/engine";
+import { Empty, PageHead, Pager, Section, StatusBadge, TextLink, fmtDate } from "@/components/ui";
+import { requireWorkspace } from "@/server/access";
+import { CALL_PLAN_PAGE, loadCallPlan, type CallPlanRow, type CallPlanSource } from "@/server/queries/call-plan";
+import { deny } from "@/server/security-log";
+import { VisitUploadForm } from "./visit-upload-form";
+
+export const metadata: Metadata = { title: "Call plan" };
+
+const VERDICTS: Array<{ key: PlannedCallVerdict; label: string; badge: string; sub: string }> = [
+  { key: "call_now", label: "Call now", badge: "badge-ok", sub: "Due now, within calling hours" },
+  { key: "scheduled", label: "Scheduled", badge: "badge-copper", sub: "Due at a set time" },
+  { key: "waiting", label: "Waiting", badge: "badge-warn", sub: "Another call to them comes first" },
+  { key: "kept_out", label: "Kept out", badge: "badge-muted", sub: "Not called, with the reason" },
+];
+const VERDICT_OF = Object.fromEntries(VERDICTS.map((v) => [v.key, v])) as Record<PlannedCallVerdict, (typeof VERDICTS)[number]>;
+
+const KIND: Record<string, string> = { zoho_crm: "Zoho CRM", salesforce: "Salesforce", hubspot: "HubSpot", leadsquared: "LeadSquared", google_sheets: "Google Sheets" };
+
+export default async function CallPlanPage({ params, searchParams }: { params: Promise<{ org: string }>; searchParams: Promise<{ journey?: string; verdict?: string; page?: string }> }) {
+  const { org: slug } = await params;
+  const sp = await searchParams;
+  const ctx = await requireWorkspace(slug);
+  if (!holdsAnywhere(ctx.access, "contacts:view")) return deny(ctx, { perm: "contacts:view" });
+  const plan = await loadCallPlan(ctx.org.id, ctx.access, { journey: sp.journey, verdict: sp.verdict, page: Number(sp.page ?? 1) });
+  const canUpload = holdsAnywhere(ctx.access, "visits:import") && ctx.org.status !== "suspended";
+  const someBranches = branchesFor(ctx.access, "contacts:view") !== "all";
+  const tz = zoneOf(ctx.org.timezone);
+  const now = new Date();
+  const planned = VERDICTS.reduce((n, v) => n + plan.byVerdict[v.key], 0);
+  const nothing = !plan.sources.length && !plan.visits.total && !plan.visits.lastUpload && !planned;
+
+  const q = (over: Record<string, string | undefined>) => {
+    const u = new URLSearchParams(Object.entries({ journey: plan.journey, verdict: plan.verdict, ...over }).filter(([, v]) => v) as [string, string][]);
+    return `/w/${slug}/call-plan${u.size ? `?${u}` : ""}`;
+  };
+
+  return (
+    <>
+      <PageHead title="Call plan" sub="Everyone in your records, the call JENAI would make to each of them, when and why, or why they are kept out." />
+      <div className="notice notice-warn mb-5" role="status">
+        <b>Preview.</b> Nobody is being called yet. JENAI shows who it would call and why. Calls start only when calling is switched on for this workspace.
+      </div>
+
+      <div className="grid gap-6">
+        <Section title="Where the plan comes from" sub="Your CRM records, which JENAI only reads to make this plan, and the visit list your team uploads.">
+          {nothing ? (
+            <Empty>
+              Connect Zoho or upload a visit list to see who JENAI would call.
+              {can(ctx.access, "integrations:manage") ? (
+                <div className="mt-2"><TextLink href={`/w/${slug}/integrations`}>Connect Zoho</TextLink></div>
+              ) : null}
+            </Empty>
+          ) : (
+            <div className="grid gap-5 px-5 py-4 md:grid-cols-2">
+              <div>
+                <div className="eyebrow">CRM</div>
+                {plan.sources.length ? (
+                  <ul className="mt-2 grid gap-3">
+                    {plan.sources.map((s) => <SourceLine key={s.id} s={s} tz={tz} />)}
+                  </ul>
+                ) : (
+                  <p className="mt-2 text-ink-soft">
+                    No CRM connected.{" "}
+                    {can(ctx.access, "integrations:manage") ? <TextLink href={`/w/${slug}/integrations`}>Connect Zoho</TextLink> : "An admin can connect Zoho under Your systems."}
+                  </p>
+                )}
+              </div>
+              <div>
+                <div className="eyebrow">Visit list</div>
+                <div className="mt-2 grid gap-1">
+                  <div className="font-semibold">{plan.visits.total ? `${plan.visits.total.toLocaleString("en-IN")} ${plan.visits.total === 1 ? "visit" : "visits"} on file` : "No visits on file yet"}</div>
+                  {plan.visits.lastUpload ? (
+                    <div className="text-[13px] text-ink-soft">
+                      Last upload {fmtDate(plan.visits.lastUpload.at, true, tz)}
+                      {plan.visits.lastUpload.by ? ` by ${plan.visits.lastUpload.by}` : ""}: {plan.visits.lastUpload.added.toLocaleString("en-IN")} added, {plan.visits.lastUpload.updated.toLocaleString("en-IN")} updated
+                      {plan.visits.lastUpload.refused ? `, ${plan.visits.lastUpload.refused.toLocaleString("en-IN")} ${plan.visits.lastUpload.refused === 1 ? "row" : "rows"} not used` : ""}.
+                    </div>
+                  ) : (
+                    <div className="text-[13px] text-ink-soft">{canUpload ? "Upload it below." : "A workspace admin or branch manager can upload it."}</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </Section>
+
+        {planned ? (
+          <>
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              {VERDICTS.map((v) => (
+                <Link key={v.key} href={q({ verdict: plan.verdict === v.key ? undefined : v.key, page: undefined })} className={`card px-4 py-3 hover:border-copper ${plan.verdict === v.key ? "border-copper" : ""}`} aria-current={plan.verdict === v.key ? "true" : undefined}>
+                  <div className="eyebrow">{v.label}</div>
+                  <div className="mt-1 text-[24px] font-semibold tabular-nums text-ink">{plan.byVerdict[v.key].toLocaleString("en-IN")}</div>
+                  <div className="text-[12px] text-grey">{v.sub}</div>
+                </Link>
+              ))}
+            </div>
+
+            <Section title="By kind of call" sub={`${plan.computedAt ? `Worked out ${fmtDate(plan.computedAt, true, tz)}. ` : ""}One call per person at a time: the one that comes first.${someBranches ? " Showing people in your branches." : ""}`}>
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead><tr><th>What JENAI would do</th>{VERDICTS.map((v) => <th key={v.key} className="num">{v.label}</th>)}<th className="num">Total</th></tr></thead>
+                  <tbody>
+                    {plan.byJourney.map((j) => (
+                      <tr key={j.journey}>
+                        <td><Link className="font-semibold hover:text-copper-deep" href={q({ journey: j.journey, page: undefined })}>{j.label}</Link></td>
+                        {VERDICTS.map((v) => <td key={v.key} className={`num ${j[v.key] ? "" : "text-grey"}`}>{j[v.key].toLocaleString("en-IN")}</td>)}
+                        <td className="num font-semibold">{j.total.toLocaleString("en-IN")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Section>
+
+            <Section title={`${plan.total.toLocaleString("en-IN")} ${plan.total === 1 ? "person or record" : "people and records"}${plan.journey || plan.verdict ? " matching" : ""}`} sub="Phone numbers show the last 4 digits only.">
+              <div className="flex flex-wrap items-center gap-2 border-b border-line px-5 py-3">
+                <Link href={q({ verdict: undefined, page: undefined })} className={`btn btn-sm ${!plan.verdict ? "btn-dark" : "btn-ghost"}`}>Any</Link>
+                {VERDICTS.map((v) => (
+                  <Link key={v.key} href={q({ verdict: v.key, page: undefined })} className={`btn btn-sm ${plan.verdict === v.key ? "btn-dark" : "btn-ghost"}`}>{v.label}</Link>
+                ))}
+                <form className="ml-auto flex gap-2" action={`/w/${slug}/call-plan`}>
+                  {plan.verdict ? <input type="hidden" name="verdict" value={plan.verdict} /> : null}
+                  <select name="journey" defaultValue={plan.journey ?? ""} className="input h-[30px] w-auto max-w-[260px] py-0 text-[12.5px]" aria-label="Kind of call">
+                    <option value="">Every kind of call</option>
+                    {(Object.keys(PLAN_JOURNEYS) as PlanJourney[]).map((j) => <option key={j} value={j}>{PLAN_JOURNEYS[j].label}</option>)}
+                  </select>
+                  <button className="btn btn-ghost btn-sm" type="submit">Filter</button>
+                </form>
+              </div>
+              {plan.rows.length === 0 ? (
+                <Empty>Nobody matches these filters. <TextLink href={`/w/${slug}/call-plan`}>Show everyone</TextLink></Empty>
+              ) : (
+                <>
+                  <div className="tbl-wrap">
+                    <table className="tbl">
+                      <thead><tr><th>Person</th><th>From</th><th>Status or service</th><th>What JENAI would do</th><th>When ({zoneLabel(tz)})</th><th>Why</th></tr></thead>
+                      <tbody>
+                        {plan.rows.map((r) => (
+                          <tr key={r.id}>
+                            <td>
+                              <div className="font-semibold">{r.name ?? <span className="text-grey">No name</span>}</div>
+                              <div className="font-mono text-[12px] text-grey">{r.phone || "No number"}</div>
+                            </td>
+                            <td className="whitespace-nowrap">{r.from}</td>
+                            <td className="max-w-[22ch]"><StatusOrService r={r} /></td>
+                            <td className="max-w-[30ch]">
+                              <span className={`badge ${VERDICT_OF[r.verdict]?.badge ?? "badge-muted"}`}>{VERDICT_OF[r.verdict]?.label ?? r.verdict}</span>
+                              <div className={`mt-1 ${r.verdict === "kept_out" ? "text-grey" : ""}`}>{PLAN_JOURNEYS[r.journey as PlanJourney]?.label ?? r.journey}</div>
+                            </td>
+                            <td className="whitespace-nowrap">{whenText(r, tz, now)}</td>
+                            <td className="max-w-[44ch] text-[13px] text-ink-soft">{r.reason}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <Pager page={plan.page} total={plan.total} perPage={CALL_PLAN_PAGE} href={(p) => q({ page: String(p) })} labels={["Previous", "Next"]} />
+                </>
+              )}
+            </Section>
+          </>
+        ) : !nothing ? (
+          <Section title="Nobody in the plan yet">
+            <Empty>The plan is worked out after JENAI reads your CRM or a visit list is uploaded. It shows here once there is someone to plan for.</Empty>
+          </Section>
+        ) : null}
+
+        {canUpload ? (
+          <Section title="Upload visit list" sub="The services people actually took, from your billing or front-desk software. Each visit becomes its feedback call, result check or next session in the plan.">
+            <VisitUploadForm slug={slug} />
+          </Section>
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+/** How JENAI reads one CRM connection, in plain words. */
+function SourceLine({ s, tz }: { s: CallPlanSource; tz: string }) {
+  const held = Object.entries(s.held).map(([module, n]) => `${n.toLocaleString("en-IN")} ${module}`);
+  const state =
+    s.status === "paused" ? "Paused, so JENAI does not read it."
+    : s.status === "error" ? "Not working. Connect it again under Your systems."
+    : s.status === "draft" ? "Not finished connecting."
+    : !s.reading ? "Reading is switched off for this connection."
+    : s.lastPullAt ? `Last read ${fmtDate(s.lastPullAt, true, tz)}.`
+    : "Connected, not read yet.";
+  return (
+    <li>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-semibold">{s.name}</span>
+        <span className="text-[12px] text-grey">{KIND[s.kind] ?? s.kind}</span>
+        <StatusBadge status={s.status} />
+      </div>
+      <div className="text-[13px] text-ink-soft">{state}{held.length ? ` ${held.join(", ")} on file.` : ""}</div>
+      {s.lastPullError ? (
+        <div className="mt-0.5 text-[13px] text-bad" title={s.lastPullError}>
+          Last read had a problem: {s.lastPullError.length > 300 ? `${s.lastPullError.slice(0, 300)}...` : s.lastPullError}
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+function StatusOrService({ r }: { r: CallPlanRow }) {
+  if (r.originType === "visit") {
+    return (
+      <>
+        <div>{r.service ?? <span className="text-grey">Service not given</span>}</div>
+        {r.visitDate ? <div className="text-[12px] text-grey">Visit on {fmtDate(`${r.visitDate}T00:00:00Z`, false, "UTC")}</div> : null}
+      </>
+    );
+  }
+  // Zoho shows an empty pick list as "-None-".
+  const status = r.status && r.status.trim() !== "-None-" ? r.status : null;
+  return (
+    <>
+      <div>{status ?? <span className="text-grey">No status</span>}</div>
+      {r.treatment ? <div className="text-[12px] text-grey">{r.treatment}</div> : null}
+    </>
+  );
+}
+
+/**
+ * A due call made outside calling hours carries the next opening as its time,
+ * so "now" is shown only once that time has come.
+ */
+function whenText(r: CallPlanRow, tz: string, now: Date): React.ReactNode {
+  if (r.verdict === "kept_out") return <span className="text-grey">Not called</span>;
+  if (r.verdict === "waiting") return <span className="text-grey">{r.callAt ? fmtDate(r.callAt, true, tz) : "After the first call"}</span>;
+  if (!r.callAt || r.callAt <= now) return <span className="font-semibold">Now</span>;
+  return fmtDate(r.callAt, true, tz);
+}
+
+/** The organisation's time zone, or India's when it is not one the runtime knows. */
+function zoneOf(tz: string | null | undefined): string {
+  try {
+    new Intl.DateTimeFormat("en-IN", { timeZone: tz || "Asia/Kolkata" });
+    return tz || "Asia/Kolkata";
+  } catch {
+    return "Asia/Kolkata";
+  }
+}
+
+/** "IST" for India; otherwise whatever short name the runtime gives the zone. */
+function zoneLabel(tz: string): string {
+  return new Intl.DateTimeFormat("en-IN", { timeZone: tz, timeZoneName: "short" }).formatToParts(new Date()).find((p) => p.type === "timeZoneName")?.value ?? tz;
+}
