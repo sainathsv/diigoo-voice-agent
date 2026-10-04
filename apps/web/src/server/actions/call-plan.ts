@@ -72,7 +72,8 @@ export async function removeUpload(fd: FormData) {
   const batch = String(fd.get("batch") ?? "");
   await attempt(slug, "plan", "Removing the upload", async () => {
     const r = await removeVisitUpload(ctx.org.id, batch, { removedBy: ctx.user.userId, audit: { ...(await who(ctx)).audit, via: ctx.support ? "support" : "user" } });
-    return `Upload removed: ${r.removed} ${r.removed === 1 ? "visit" : "visits"} taken out, and the plan worked out again.`;
+    const kept = r.kept ? `; ${r.kept} also read from your front desk system ${r.kept === 1 ? "stays" : "stay"}` : "";
+    return `Upload removed: ${r.removed} ${r.removed === 1 ? "visit" : "visits"} taken out${kept}, and the plan worked out again.`;
   });
 }
 

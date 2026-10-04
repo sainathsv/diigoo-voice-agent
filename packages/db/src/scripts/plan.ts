@@ -11,11 +11,13 @@
  * connection, such as Zenoti, with when it was last read and is next read),
  * the counts per journey and verdict, the settings the client changed, and
  * the next 20 calls JENAI would make, with the number masked; a call already
- * due says "now (due since ...)". set stores one setting (null puts back the
- * default) and plans everyone's calls again. on switches the plan on, so the
- * worker reads the client's CRM and front desk system on a timer; off stops
- * that. Never prints a name, a full number or a reason: a reason can name a
- * treatment or a doctor, and terminals are logged. Nothing is dialled.
+ * due says "now (due since ...)" inside calling hours, and the next calling
+ * hours outside them, as the workspace's call plan page does. set stores one
+ * setting (null puts back the default) and plans everyone's calls again. on
+ * switches the plan on, so the worker reads the client's CRM and front desk
+ * system on a timer; off stops that. Never prints a name, a full number or a
+ * reason: a reason can name a treatment or a doctor, and terminals are
+ * logged. Nothing is dialled.
  */
 import "./env";
 import { asc, eq, inArray, sql } from "drizzle-orm";
@@ -62,7 +64,7 @@ async function show() {
   if (s.next.length) {
     const now = new Date();
     console.log(`\n  next ${s.next.length} calls (times in ${org.timezone})`);
-    const times = s.next.map((c) => callTime(c, now, org.timezone));
+    const times = s.next.map((c) => callTime(c, now, org.timezone, s.callingWindow));
     const width = Math.max(24, ...times.map((t) => t.length));
     s.next.forEach((c, n) => console.log(`    ${times[n]!.padEnd(width)} ${c.verdict.padEnd(10)} ${c.journey.padEnd(22)} ${c.phone.padEnd(18)} ${c.origin}`));
   }

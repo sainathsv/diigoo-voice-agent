@@ -875,6 +875,78 @@ describe("the front desk under the plan's own rules", () => {
   });
 });
 
+describe("the front desk and the CRM answering each other", () => {
+  const noShow = (over: Partial<PlanBooking> = {}) => booking({ status: "no_show", service: "PRP - Hair", startsAt: ist("2026-09-20 16:30"), ...over });
+  const cancelled = (over: Partial<PlanBooking> = {}) => booking({ status: "cancelled", service: "Consultation", startsAt: ist("2026-09-28 11:00"), ...over });
+  const today = (over: Partial<PlanRecord> = {}) => lead({ status: "Appointment Booked", appointmentAt: ist("2026-10-01 00:00"), appointmentHasTime: false, ...over });
+
+  it("takes a Zoho appointment today with no time as booked again, so a missed or cancelled Zenoti booking is not called to rebook", () => {
+    const rows = plan({ records: [today()], bookings: [noShow()] });
+    expect(journey(rows, "appointment_reminder")).toMatchObject({ originType: "crm_record", verdict: "kept_out" });
+    expect(journey(rows, "no_show_rebook")).toMatchObject({ verdict: "kept_out", reason: "Missed their appointment on Sun 20 Sep 2026 for PRP - Hair, but is booked again for Thu 1 Oct 2026." });
+    const off = plan({ records: [today()], bookings: [cancelled()] });
+    expect(journey(off, "cancelled_rebook")).toMatchObject({ verdict: "kept_out", reason: "Cancelled their appointment for Consultation booked for Mon 28 Sep 2026, but is booked again for Thu 1 Oct 2026." });
+  });
+
+  it("takes a Zoho appointment still to come as booked again whatever its status says, though too close to remind", () => {
+    for (const status of ["Interested", "No Show", "Appointment Booked"]) {
+      const rows = plan({ records: [lead({ status, appointmentAt: ist("2026-10-01 13:30") })], bookings: [noShow()] });
+      expect(journey(rows, "appointment_reminder")).toMatchObject({ verdict: "kept_out", reason: "Their appointment on Thu 1 Oct 2026 at 1:30 PM is under 2 hours away: too close for a reminder call." });
+      expect(journey(rows, "no_show_rebook")).toMatchObject({ verdict: "kept_out", reason: "Missed their appointment on Sun 20 Sep 2026 for PRP - Hair, but is booked again for Thu 1 Oct 2026." });
+      const off = plan({ records: [lead({ status, appointmentAt: ist("2026-10-01 13:30") })], bookings: [cancelled()] });
+      expect(journey(off, "cancelled_rebook").verdict).toBe("kept_out");
+    }
+    // A record marked not to be called, or one only in Zoho Contacts, books nothing.
+    const junk = plan({ records: [lead({ status: "Junk Lead", appointmentAt: ist("2026-10-03 11:00") })], bookings: [noShow()] });
+    expect(journey(junk, "no_show_rebook").verdict).toBe("call_now");
+    const contact = { id: "c-3", module: "Contacts", crm: "Zoho", phoneE164: PHONE, appointmentAt: ist("2026-10-03 11:00") };
+    expect(only(plan({ records: [contact], bookings: [noShow()] }))).toMatchObject({ journey: "no_show_rebook", verdict: "call_now" });
+  });
+
+  it("calls to rebook a Zenoti no-show today that a Zoho appointment with no time for the same day stands for", () => {
+    const rows = plan({ records: [today()], bookings: [noShow({ startsAt: ist("2026-10-01 10:00") })] });
+    expect(journey(rows, "no_show_rebook")).toMatchObject({ verdict: "call_now", reason: "Missed their appointment on Thu 1 Oct 2026 for PRP - Hair." });
+  });
+
+  it("keeps out a call to rebook a cancellation ahead of its day when they said no after it was read", () => {
+    const b = cancelled({ service: "LHR", startsAt: ist("2026-10-10 11:00"), changedAt: ist("2026-09-30 15:00") });
+    const no = lead({ id: "lead-no", status: "Not Interested", createdExt: ist("2026-09-01 10:00"), modifiedExt: ist("2026-10-01 10:00") });
+    expect(journey(plan({ records: [no], bookings: [b] }), "cancelled_rebook")).toMatchObject({
+      verdict: "kept_out",
+      reason: 'Marked "Not Interested" in Zoho on another enquiry (Thu 1 Oct 2026), so JENAI does not call to book them.',
+    });
+    // A no said before the cancellation was read does not cover it.
+    const earlier = lead({ id: "lead-no", status: "Not Interested", createdExt: ist("2026-09-01 10:00"), modifiedExt: ist("2026-09-29 10:00") });
+    expect(journey(plan({ records: [earlier], bookings: [b] }), "cancelled_rebook").verdict).toBe("call_now");
+  });
+
+  it("does not ask someone to book whose Zenoti booking since enquiring has come: what came of it speaks for the enquiry", () => {
+    const at = ist("2026-10-01 10:30");
+    const came = plan({ records: [lead()], bookings: [booking({ status: "checked_in", startsAt: at })] });
+    expect(only(came)).toMatchObject({ journey: "new_enquiry", verdict: "kept_out", reason: "Came in on Thu 1 Oct 2026 since enquiring, as Zenoti shows, so JENAI does not call to book them." });
+    expect(only(plan({ records: [lead()], bookings: [booking({ status: "completed", startsAt: at })] })).verdict).toBe("kept_out");
+    for (const status of ["booked", "confirmed"] as const) {
+      expect(only(plan({ records: [lead()], bookings: [booking({ status, startsAt: at })] }))).toMatchObject({
+        originType: "crm_record",
+        journey: "appointment_unclear",
+        verdict: "kept_out",
+        reason: "Booked in Zenoti for Thu 1 Oct 2026 at 10:30 AM since enquiring; that has passed and Zenoti still says booked, so JENAI cannot tell if they came. Update it in Zenoti.",
+      });
+    }
+    // Missed since enquiring: the call to rebook it is the one made.
+    const missed = plan({ records: [lead()], bookings: [noShow({ startsAt: ist("2026-09-30 16:30") })] });
+    expect(journey(missed, "new_enquiry")).toMatchObject({
+      verdict: "kept_out",
+      reason: "Booked in Zenoti for Wed 30 Sep 2026 at 4:30 PM since enquiring, and marked a no-show there, so the calls about that booking take over.",
+    });
+    expect(journey(missed, "no_show_rebook").verdict).toBe("call_now");
+    // A callback the team noted goes the same way.
+    expect(journey(plan({ records: [lead({ followUpAt: ist("2026-10-01 11:00") })], bookings: [booking({ status: "checked_in", startsAt: at })] }), "callback_due").verdict).toBe("kept_out");
+    // A booking from before they enquired says nothing about the enquiry.
+    expect(journey(plan({ records: [lead()], bookings: [noShow()] }), "new_enquiry").verdict).toBe("call_now");
+  });
+});
+
 describe("plan settings", () => {
   it("keeps the default for anything missing or unusable", () => {
     const s = planSettingsOf({ freshDays: 45, minGapDays: -1, reminderHour: "6pm", openStatuses: ["Warm", 3], callingWindow: { days: [1], start: "21:00", end: "23:00" } }, "Asia/Kolkata");

@@ -12,7 +12,7 @@
  * is ever logged or repeated in a reason.
  */
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
 import {
   audit,
   branches,
@@ -553,6 +553,7 @@ export async function importVisits(tenantId: string, csvText: string, opts: Visi
       }));
       // visits_once is on lower(service), an expression Drizzle's upsert cannot name, hence plain SQL.
       // A value the file leaves empty keeps the one stored; a visit the file changes nothing in is not written.
+      // A visit a connected system holds stays out of the upload's batch, so removing the upload never removes it.
       const res = await tx.execute<{ inserted: boolean }>(sql`
         insert into visits (tenant_id, contact_id, phone_e164, name, service, visit_date, doctor, branch, branch_id, sessions_done, sessions_total, source, batch)
         select ${tenantId}, v.contact_id, v.phone_e164, v.name, v.service, v.visit_date, v.doctor, v.branch, v.branch_id, v.sessions_done, v.sessions_total, ${source}, ${batch}
@@ -565,7 +566,7 @@ export async function importVisits(tenantId: string, csvText: string, opts: Visi
           branch_id = coalesce(excluded.branch_id, visits.branch_id),
           sessions_done = coalesce(excluded.sessions_done, visits.sessions_done),
           sessions_total = coalesce(excluded.sessions_total, visits.sessions_total),
-          batch = excluded.batch,
+          batch = case when visits.integration_id is null then excluded.batch else visits.batch end,
           updated_at = now()
         where (coalesce(excluded.contact_id, visits.contact_id), coalesce(excluded.name, visits.name), coalesce(excluded.doctor, visits.doctor),
                coalesce(excluded.branch, visits.branch), coalesce(excluded.branch_id, visits.branch_id),
@@ -624,23 +625,35 @@ const auditOf = (tenantId: string, opts: VisitRemovalOptions) => ({
 /**
  * Takes out the visits one upload added or last changed (its batch, as the
  * call plan page and the audit log name it), then plans again. A visit a
- * later upload changed carries that upload's batch instead, and stays.
+ * later upload changed carries that upload's batch instead, and stays. A
+ * visit a connected system (Zenoti) holds as well stays too, no longer in
+ * the batch: that system does not read old days again, so it would not
+ * come back.
  */
-export async function removeVisitUpload(tenantId: string, batch: string, opts: VisitRemovalOptions = {}): Promise<{ removed: number; plan: ReplanResult }> {
+export async function removeVisitUpload(tenantId: string, batch: string, opts: VisitRemovalOptions = {}): Promise<{ removed: number; kept: number; plan: ReplanResult }> {
   if (!/^[0-9a-f-]{36}$/i.test(batch)) throw new VisitRemovalError("That is not an upload JENAI knows.");
-  const removed = await withTenant(tenantId, async (tx) => {
-    const gone = await tx.delete(visits).where(eq(visits.batch, batch)).returning({ id: visits.id });
+  const counts = await withTenant(tenantId, async (tx) => {
+    const gone = await tx
+      .delete(visits)
+      .where(and(eq(visits.batch, batch), isNull(visits.integrationId)))
+      .returning({ id: visits.id });
+    const held = await tx
+      .update(visits)
+      .set({ batch: null })
+      .where(and(eq(visits.batch, batch), isNotNull(visits.integrationId)))
+      .returning({ id: visits.id });
+    const c = { removed: gone.length, kept: held.length };
     await audit(tx, {
       ...auditOf(tenantId, opts),
       action: "visits.upload_removed",
       targetType: "visit_batch",
       targetId: batch,
-      summary: `Visit list upload removed: ${gone.length} ${gone.length === 1 ? "visit" : "visits"} taken out`,
-      diff: { removed: gone.length },
+      summary: `Visit list upload removed: ${c.removed} ${c.removed === 1 ? "visit" : "visits"} taken out${c.kept ? `, ${c.kept} kept as a connected system holds ${c.kept === 1 ? "it" : "them"}` : ""}`,
+      diff: c,
     });
-    return gone.length;
+    return c;
   });
-  return { removed, plan: await replanTenant(tenantId, { now: opts.now }) };
+  return { ...counts, plan: await replanTenant(tenantId, { now: opts.now }) };
 }
 
 /**

@@ -528,6 +528,8 @@ describe("looking at a plan and changing its settings", () => {
     }
     expect(JSON.stringify(s)).not.toMatch(/9848100\d{3}|Lead \d/);
     expect((await planSummary(t, { upcoming: 2 })).next).toHaveLength(2);
+    // The calling hours, for saying when a call already due can go.
+    expect(s.callingWindow).toEqual({ days: [1, 2, 3, 4, 5, 6], start: "10:00", end: "19:00" });
   });
 
   it("says plainly why a setting cannot be used", () => {
@@ -571,5 +573,11 @@ describe("looking at a plan and changing its settings", () => {
     const logged = await withTenant(t, (tx) => tx.select().from(auditEvents).where(and(eq(auditEvents.tenantId, t), eq(auditEvents.action, "call_plan.setting_changed"))));
     expect(logged.map((e) => e.summary).sort()).toEqual(["Call plan setting centres changed", "Call plan setting centres put back to its default", "Call plan setting freshDays changed"]);
     expect(await withTenant(t, (tx) => tx.execute(sql`select 1 from campaign_targets`))).toHaveLength(0);
+
+    // The plan's summary gives the clinic's own calling hours.
+    const weekdays = { days: [1, 2, 3, 4, 5], start: "11:00", end: "18:00" };
+    await setPlanSetting(t, "callingWindow", weekdays);
+    expect((await planSummary(t)).callingWindow).toEqual(weekdays);
+    await setPlanSetting(t, "callingWindow", null);
   });
 });

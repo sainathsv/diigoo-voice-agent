@@ -76,7 +76,8 @@ async function client() {
 async function remove() {
   const org = await client();
   const r = await removeVisitUpload(org.id, arg("batch"), { removedBy: null });
-  console.log(`\n${org.name}: ${r.removed} ${r.removed === 1 ? "visit" : "visits"} taken out, and the plan worked out again (${r.plan.rows} rows).\n`);
+  const kept = r.kept ? `; ${r.kept} also read from a connected system ${r.kept === 1 ? "stays" : "stay"}` : "";
+  console.log(`\n${org.name}: ${r.removed} ${r.removed === 1 ? "visit" : "visits"} taken out${kept}, and the plan worked out again (${r.plan.rows} rows).\n`);
 }
 
 async function erase() {

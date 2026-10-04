@@ -17,7 +17,8 @@ import { errorText } from "./errors";
 import { PULL_LEASE_MINUTES, changedIn, planReadKinds, pullKinds, syncIntegration, type CrmSyncResult } from "./integrations/crm-sync";
 import type { ZenotiClock } from "./integrations/zenoti";
 import { syncZenoti, zenotiChanges, zenotiProgressed, zenotiResult, type ZenotiSyncResult } from "./integrations/zenoti-sync";
-import { PLAN_SETTING_KEYS, planSettingProblem, replanTenant, type PlanJourney, type PlanSettingKey, type ReplanResult } from "./care-plan";
+import { PLAN_SETTING_KEYS, planSettingProblem, planSettingsOf, replanTenant, type PlanJourney, type PlanSettingKey, type ReplanResult } from "./care-plan";
+import type { Windows } from "./dialer/time";
 import { effectiveVerdict } from "./plan-view";
 import { visitColumnsProblem } from "./visits-import";
 
@@ -406,6 +407,8 @@ export interface PlanSummary {
    * no name or reason is included: a reason can name a treatment or doctor.
    */
   next: Array<{ callAt: Date | null; journey: PlanJourney; verdict: PlannedCallVerdict; phone: string; origin: string }>;
+  /** The plan's calling hours: a call already due goes only inside them. */
+  callingWindow: Windows;
 }
 
 /**
@@ -420,7 +423,7 @@ export async function planSummary(tenantId: string, opts: { upcoming?: number } 
       .select({ journey: plannedCalls.journey, verdict: sql<string>`${verdict}`, n: sql<number>`count(*)::int` })
       .from(plannedCalls)
       .groupBy(plannedCalls.journey, verdict);
-    const [state] = await tx.select({ computedAt: callPlanSettings.computedAt }).from(callPlanSettings).where(eq(callPlanSettings.tenantId, tenantId));
+    const [state] = await tx.select({ computedAt: callPlanSettings.computedAt, settings: callPlanSettings.settings }).from(callPlanSettings).where(eq(callPlanSettings.tenantId, tenantId));
     const next = await tx
       .select({ callAt: plannedCalls.callAt, journey: plannedCalls.journey, verdict: plannedCalls.verdict, phone: plannedCalls.phoneE164, origin: plannedCalls.originLabel })
       .from(plannedCalls)
@@ -441,6 +444,7 @@ export async function planSummary(tenantId: string, opts: { upcoming?: number } 
       byVerdict,
       byJourney,
       next: next.map((r) => ({ callAt: r.callAt, journey: r.journey as PlanJourney, verdict: r.verdict as PlannedCallVerdict, phone: maskPhone(r.phone), origin: r.origin })),
+      callingWindow: planSettingsOf(state?.settings).callingWindow,
     };
   });
 }

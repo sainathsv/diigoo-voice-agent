@@ -412,6 +412,7 @@ async function pullLoop() {
             bookings: r.sync.bookings.read,
             changed: r.sync.bookings.changed + r.sync.bookings.removed + v.added + v.updated + v.removed + v.numbered,
             guests: r.sync.guests.read,
+            waitingForPhone: r.sync.waitingForPhone,
             caughtUp: r.sync.done,
             planned: r.plan?.rows ?? null,
             // What waits names days and centres, never a person.

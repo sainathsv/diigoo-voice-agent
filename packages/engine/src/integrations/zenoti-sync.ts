@@ -177,12 +177,15 @@ export interface ZenotiSyncResult {
   /** Bookings read; of them new or changed in Zenoti; removed because Zenoti no longer lists them, or they can no longer be kept current. */
   bookings: { read: number; changed: number; removed: number };
   /**
-   * Services done: read, new, changed, folded into a visit JENAI already had
-   * for the same person, service and day, removed because the booking is no
+   * Services done: read, new, changed (an uploaded visit for the same
+   * person, service and day taken over included), folded into a visit
+   * JENAI already had for them, removed because the booking is no
    * longer completed or the sales line is no longer listed, and given a
    * phone number (or a new one) once their guest's was known.
    */
   visits: { read: number; added: number; updated: number; merged: number; removed: number; numbered: number };
+  /** Services done from this connection still without a phone number, theirs or their guest's: counted, not planned until one arrives. */
+  waitingForPhone: number;
   /** Guests' profiles read, and still due. */
   guests: { read: number; left: number };
   /** Guests whose packages were read, balance rows stored, visits given session counts, guests still due. */
@@ -235,6 +238,12 @@ export async function syncZenoti(tenantId: string, integrationId: string, opts: 
         run.problems.push(`The call plan could not be made again: ${errorWithoutValues(e)}`.slice(0, 300));
       }
     }
+    // Counted here, not taken from the plan: the worker plans after the read, and the summary must say it all the same.
+    try {
+      result.waitingForPhone = await waitingForPhone(tenantId, integrationId);
+    } catch {
+      // Only a count for the summary: a read that went well is not failed over it.
+    }
     result.left = run.left;
     result.error = run.problems.length ? run.problems.join(" ").slice(0, 1000) : null;
     result.done = !result.left.length && !result.error;
@@ -264,6 +273,17 @@ export async function syncZenoti(tenantId: string, integrationId: string, opts: 
   return result;
 }
 
+/** Services done from this connection with no number of their own and none known for their guest, as the plan counts them. */
+async function waitingForPhone(tenantId: string, integrationId: string): Promise<number> {
+  const [row] = await withTenant(tenantId, (tx) =>
+    tx.execute<{ n: number }>(sql`
+      select count(*)::int as n from visits v
+      where v.integration_id = ${integrationId} and v.phone_e164 is null
+        and not exists (select 1 from external_people g where g.integration_id = v.integration_id and g.external_id = v.guest_ref and g.phone_e164 is not null)`),
+  );
+  return row?.n ?? 0;
+}
+
 /** A run's result before anything is read. */
 export function zenotiResult(budget: number): ZenotiSyncResult {
   return {
@@ -275,6 +295,7 @@ export function zenotiResult(budget: number): ZenotiSyncResult {
     centres: [],
     bookings: { read: 0, changed: 0, removed: 0 },
     visits: { read: 0, added: 0, updated: 0, merged: 0, removed: 0, numbered: 0 },
+    waitingForPhone: 0,
     guests: { read: 0, left: 0 },
     packages: { guests: 0, rows: 0, sessions: 0, left: 0 },
     done: false,
@@ -1093,7 +1114,11 @@ class Run {
     const theirs: Array<typeof visits.$inferSelect> = [];
     for (const part of chunks([...changes.keys()]))
       theirs.push(...(await tx.select().from(visits).where(and(eq(visits.integrationId, this.i.id), inArray(visits.guestRef, part), isNotNull(visits.externalId)))));
-    const move = theirs.filter((v) => v.phoneE164 !== (changes.get(v.guestRef!) ?? null));
+    // A visit the clinic uploaded, which Zenoti took over, keeps the number it came with when their profile now has none.
+    const move = theirs.filter((v) => {
+      const to = changes.get(v.guestRef!) ?? null;
+      return v.phoneE164 !== to && !(to === null && v.source === "upload");
+    });
     if (!move.length) return;
     const res = await storeVisits(
       tx,
@@ -1110,6 +1135,11 @@ class Run {
         branch: v.branch,
         branchId: v.branchId,
         sessionsTotal: v.sessionsTotal,
+        // Carried to an uploaded visit this one folds into and becomes: no later read of an older day would give them.
+        centreRef: v.centreRef,
+        listedOn: v.listedOn,
+        categories: v.categories,
+        seenAt: v.seenAt?.toISOString(),
       })),
       { exactPhone: true },
     );
@@ -1419,7 +1449,10 @@ interface VisitWrite {
  * line that would be a second (an uploaded visit, another invoice line, the
  * same service under another path) folds into the visit JENAI has: a new one
  * is not added, and one stored earlier is removed, its twin standing for
- * it. A visit already stored keeps its id, so its planned calls keep theirs.
+ * it. An uploaded twin becomes the line's own, Zenoti's to keep current, so
+ * removing the upload leaves it: Zenoti reads that day once, and would not
+ * put it back. A visit already stored keeps its id, so its planned calls
+ * keep theirs.
  */
 async function storeVisits(
   tx: Tx,
@@ -1452,31 +1485,37 @@ async function storeVisits(
   });
   const keyOf = (phone: string | null, service: string, day: string) => (phone ? `${phone}|${day}|${service.toLowerCase()}` : null);
 
-  // The same person, service and day held by a visit outside these lines.
-  const held = new Set<string>();
+  // The same person, service and day held by a visit outside these lines: an uploaded one by its id, any other as null.
+  const held = new Map<string, string | null>();
   const phones = [...new Set(rows.flatMap((r) => (r.phoneE164 ? [r.phoneE164] : [])))];
   for (const part of chunks(phones)) {
-    const others = await tx.execute<{ phone_e164: string; service: string; visit_date: string }>(sql`
-      select phone_e164, service, visit_date::text as visit_date from visits
+    const others = await tx.execute<{ id: string; phone_e164: string; service: string; visit_date: string; uploaded: boolean }>(sql`
+      select id, phone_e164, service, visit_date::text as visit_date, integration_id is null as uploaded from visits
       where phone_e164 in ${texts(part)}
         and not coalesce(integration_id = ${integrationId} and external_id in ${texts(ids)}, false)`);
-    for (const o of others) held.add(keyOf(o.phone_e164, o.service, o.visit_date)!);
+    for (const o of others) held.set(keyOf(o.phone_e164, o.service, o.visit_date)!, o.uploaded ? o.id : null);
   }
 
   const keep: typeof rows = [];
+  const adopt: Array<(typeof rows)[number] & { twin: string }> = [];
   const drop: string[] = [];
   const taken = new Set<string>();
   // Lines already stored first, so the visit already planned is the one kept.
   for (const r of [...rows].sort((a, b) => Number(a.id === null) - Number(b.id === null) || (a.externalId < b.externalId ? -1 : 1))) {
     const k = keyOf(r.phoneE164, r.service, r.visitDate);
-    if (k && (taken.has(k) || held.has(k))) {
-      out.merged++;
+    const twin = k ? held.get(k) : undefined;
+    if (k && (taken.has(k) || twin !== undefined)) {
       if (r.id) drop.push(r.id);
+      // The first line onto an uploaded twin takes it over; any other folds into the visit held.
+      if (twin && !taken.has(k)) adopt.push({ ...r, twin });
+      else out.merged++;
+      taken.add(k);
       continue;
     }
     if (k) taken.add(k);
     keep.push(r);
   }
+  // First, so a twin can take over a dropped line's Zenoti id, which only one visit may carry.
   for (const part of chunks(drop)) await tx.execute(sql`delete from visits where id in ${uuids(part)}`);
 
   const record = (r: (typeof rows)[number]) => ({
@@ -1496,6 +1535,35 @@ async function storeVisits(
     categories: r.categories?.length ? r.categories : null,
     seen_at: r.seenAt ?? null,
   });
+  // An uploaded twin becomes the line's: out of the upload's batch, Zenoti's word over the file's, as a later read of that day would give it.
+  // It keeps its id, number, contact, sessions done and source, the way it first arrived.
+  for (const part of chunks(adopt)) {
+    const res = await tx.execute(sql`
+      update visits t set
+        integration_id = ${integrationId},
+        external_id = v.external_id,
+        guest_ref = v.guest_ref,
+        name = coalesce(v.name, t.name),
+        service = v.service,
+        doctor = coalesce(v.doctor, t.doctor),
+        branch = coalesce(v.branch, t.branch),
+        branch_id = coalesce(v.branch_id, t.branch_id),
+        sessions_total = coalesce(v.sessions_total, t.sessions_total),
+        centre_ref = coalesce(v.centre_ref, t.centre_ref),
+        listed_on = coalesce(v.listed_on, t.listed_on),
+        categories = coalesce(v.categories, t.categories),
+        seen_at = coalesce(v.seen_at, t.seen_at),
+        batch = null,
+        updated_at = now()
+      from jsonb_to_recordset(${JSON.stringify(part.map((r) => ({ ...record(r), id: r.twin })))}::jsonb)
+        as v(id uuid, external_id text, guest_ref text, name text, service text, doctor text, branch text, branch_id uuid, sessions_total int,
+             centre_ref text, listed_on date, categories text[], seen_at timestamptz)
+      where t.id = v.id and t.integration_id is null
+      returning t.id`);
+    out.updated += res.length;
+    // One another connection took over meanwhile stands for it.
+    out.merged += part.length - res.length;
+  }
   // A value Zenoti leaves empty keeps the one stored; a visit nothing changed in is not written.
   for (const part of chunks(keep.filter((r) => r.id))) {
     const res = await tx.execute(sql`
@@ -1780,7 +1848,7 @@ function summaryOf(r: ZenotiSyncResult): string {
   if (r.guests.read) said.push(`Read ${count(r.guests.read, "guest profile")}.`);
   if (v.numbered) said.push(`${count(v.numbered, "visit")} given ${v.numbered === 1 ? "its" : "their"} guest's phone number.`);
   if (r.packages.guests) said.push(`Read the packages of ${count(r.packages.guests, "guest")}.`);
-  const waiting = r.plan?.waitingForPhone ?? 0;
+  const waiting = r.waitingForPhone;
   if (waiting) said.push(`${count(waiting, "service")} done ${waiting === 1 ? "waits" : "wait"} for a phone number.`);
   said.push(r.left.length ? `Left for next time: ${r.left.join(", ")}.` : "Up to date.");
   said.push(`${r.calls} of ${r.budget} calls to Zenoti used.`);

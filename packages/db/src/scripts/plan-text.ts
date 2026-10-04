@@ -2,7 +2,7 @@
  * How the command line prints a call plan: counts only, per journey and
  * verdict, and when each call goes. Shared by `zoho pull` and `plan`.
  */
-import { PLAN_JOURNEYS, type PlanJourney } from "@jenai/engine";
+import { PLAN_JOURNEYS, inWindow, nextWindowStart, type PlanJourney, type Windows } from "@jenai/engine";
 import { PLANNED_CALL_VERDICTS, type PlannedCallVerdict } from "../index";
 
 const HEAD: Record<PlannedCallVerdict, string> = { call_now: "call now", scheduled: "scheduled", waiting: "waiting", kept_out: "kept out" };
@@ -27,11 +27,16 @@ export function when(at: Date | null, timeZone: string): string {
 }
 
 /**
- * When a planned call goes, for the list of next calls. A call due now keeps
- * the time it fell due, so a past time is said as "now (due since ...)"
- * rather than as a date that has gone by.
+ * When a planned call goes, for the list of next calls, as the workspace's
+ * call plan page says it. A call due keeps the time it fell due, and so does
+ * a scheduled one whose time came since the plan was worked out: either is
+ * said as "now (due since ...)" inside calling hours, and as the next calling
+ * hours outside them, never as a date that has gone by.
  */
-export function callTime(c: { callAt: Date | null; verdict: PlannedCallVerdict }, now: Date, timeZone: string): string {
-  if (c.verdict === "call_now" && c.callAt && c.callAt <= now) return `now (due since ${when(c.callAt, timeZone)})`;
+export function callTime(c: { callAt: Date | null; verdict: PlannedCallVerdict }, now: Date, timeZone: string, window: Windows): string {
+  if ((c.verdict === "call_now" || c.verdict === "scheduled") && c.callAt && c.callAt <= now) {
+    const since = `due since ${when(c.callAt, timeZone)}`;
+    return inWindow(now, window, timeZone) ? `now (${since})` : `next calling hours, ${when(nextWindowStart(now, window, timeZone), timeZone)} (${since})`;
+  }
   return when(c.callAt, timeZone);
 }

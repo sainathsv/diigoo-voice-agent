@@ -567,6 +567,8 @@ interface Ctx {
   personName: string | null;
   /** Days they came, oldest first: the visit list, and customers' appointments that have passed. */
   came: string[];
+  /** Their front desk bookings, soonest first. */
+  bookings: readonly PlanBooking[];
   packages: readonly PlanPackage[];
 }
 
@@ -611,12 +613,13 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
     lastCallAt: person.lastCallAt ?? null,
     personName: records.find((r) => r.name)?.name ?? visitList.find((v) => v.name)?.name ?? bookings.find((b) => b.name)?.name ?? null,
     came: [],
+    bookings,
     packages: [...(person.packages ?? [])].sort(byPackage),
   };
   const drafts: Draft[] = [];
   const uploaded = visitList.filter((v) => v.visitDate <= c.today).map((v) => visitIn(v));
   const uploadedDays = new Set(uploaded.map((v) => v.day));
-  const isContactOnly = (r: PlanRecord) => !statusOf(r.status) && inList(settings.contactOnlyModules, r.module);
+  const isContactOnly = (r: PlanRecord) => contactOnly(r, settings);
   const hasEnquiry = records.some((r) => !isContactOnly(r));
   // Their front desk system is the clinic's own record of bookings: a reminder goes by it before any CRM's.
   const upcoming = bookings.filter((b) => isBooked(b.status) && b.startsAt > now);
@@ -788,6 +791,18 @@ function cameSince(day: string | null, c: Ctx): string | null {
   return c.came.filter((d) => d >= from).at(-1) ?? null;
 }
 
+/**
+ * Their latest front desk booking on or after this day (with no day, within
+ * the fresh limit) whose time has come: checked in, done, missed, cancelled,
+ * or passed and still booked. One still to come is left to the reminder, and
+ * one in a state JENAI does not know says nothing.
+ */
+function deskSince(day: string | null, c: Ctx): PlanBooking | null {
+  const from = day ?? addDays(c.today, -c.s.freshDays);
+  const come = (b: PlanBooking) => b.status !== "unknown" && (!isBooked(b.status) || b.startsAt <= c.now);
+  return c.bookings.filter((b) => come(b) && dayOf(b.startsAt, c.tz) >= from).at(-1) ?? null;
+}
+
 /** An open enquiry: a check-in after their consultation, the callback the team noted, or the first call. */
 function enquiryRows(r: PlanRecord, o: Origin, c: Ctx): Draft[] {
   const crm = o.crm;
@@ -811,6 +826,17 @@ function enquiryRows(r: PlanRecord, o: Origin, c: Ctx): Draft[] {
   // They came since enquiring (the front desk did not update the CRM): the calls after that visit take over.
   const came = cameSince(created, c);
   if (came) return [keep(fu ? "callback_due" : "new_enquiry", o, `Visited on ${dateText(came)} since enquiring, so the calls after that visit take over.`)];
+  // Booked at the front desk since enquiring, and that booking's time has come: what came of it speaks for the enquiry.
+  const desk = deskSince(created, c);
+  if (desk) {
+    const [sys, when] = [systemOf(desk), whenText(desk.startsAt, c)];
+    const enquiry = fu ? "callback_due" : "new_enquiry";
+    if (desk.status === "checked_in" || desk.status === "completed")
+      return [keep(enquiry, o, `Came in on ${dateText(dayOf(desk.startsAt, c.tz))} since enquiring, as ${sys} shows, so JENAI does not call to book them.`)];
+    if (isBooked(desk.status))
+      return [keep("appointment_unclear", o, `Booked in ${sys} for ${when} since enquiring; that has passed and ${sys} still says booked, so JENAI cannot tell if they came. Update it in ${sys}.`)];
+    return [keep(enquiry, o, `Booked in ${sys} for ${when} since enquiring, and ${BOOKING_STATUS_TEXT[desk.status]} there, so the calls about that booking take over.`)];
+  }
 
   const age = created ? Math.max(0, daysBetween(created, c.today)) : null;
   // A noted callback keeps an older enquiry warm, but only while the callback itself is recent.
@@ -967,9 +993,14 @@ function bookedAgain(at: Date, records: readonly PlanRecord[], bookings: readonl
   const holding = (b: PlanBooking) => isBooked(b.status) || b.status === "checked_in";
   const ahead = [
     ...bookings.filter((b) => holding(b) && b.startsAt > c.now).map((b) => b.startsAt),
-    // A CRM booking counts unless the front desk cancelled that day.
+    // A CRM appointment still to come counts whatever its status says, as for its reminder (a date with no time, all its day),
+    // unless the front desk cancelled that day or, with no time to tell them apart, marked that day's booking a no-show.
     ...records
-      .filter((r) => r.appointmentAt && r.appointmentAt > c.now && ["booked", "customer"].includes(classOf(r.status, c.s)) && !cancelledOn(bookings, r.appointmentAt, c))
+      .filter((r) => {
+        if (!r.appointmentAt || passed(r, c) || contactOnly(r, c.s) || ["never", "unknown"].includes(classOf(r.status, c.s))) return false;
+        const day = dayOf(r.appointmentAt, c.tz);
+        return !cancelledOn(bookings, r.appointmentAt, c) && !(r.appointmentHasTime === false && bookings.some((b) => b.status === "no_show" && dayOf(b.startsAt, c.tz) === day));
+      })
       .map((r) => r.appointmentAt!),
   ].sort((a, b) => a.getTime() - b.getTime())[0];
   if (ahead) return `is booked again for ${dateText(dayOf(ahead, c.tz))}`;
@@ -1011,7 +1042,8 @@ function bookingOrigin(b: PlanBooking): Origin {
     centreNames: [...(b.centre ? [b.centre] : []), ...(b.centreKnownAs ?? [])],
     source: null,
     // A booking stands for the day it was for: a "no" said on a CRM record after that day covers it, one said before does not.
-    enquiredAt: b.startsAt,
+    // One cancelled ahead of its day stands for when the cancellation was read, so a "no" said after that covers it too.
+    enquiredAt: b.status === "cancelled" && b.changedAt && b.changedAt < b.startsAt ? b.changedAt : b.startsAt,
     crm: systemOf(b),
   };
 }
@@ -1224,6 +1256,9 @@ function keep(journey: PlanJourney, o: Origin, reason: string): Draft {
 }
 
 type StatusClass = "never" | "no_show" | "booked" | "customer" | "open" | "unknown";
+
+/** Only in a module that is a list of people (Zoho Contacts), with no status: no enquiry or booking of its own. */
+const contactOnly = (r: PlanRecord, s: PlanSettings) => !statusOf(r.status) && inList(s.contactOnlyModules, r.module);
 
 /** A record with no status is an enquiry not yet worked. */
 function classOf(status: string | null | undefined, s: PlanSettings): StatusClass {

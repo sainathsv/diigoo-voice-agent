@@ -14,6 +14,7 @@ import { auditEvents, branches, clinicAppointments, externalPeople, integrations
 import { endPull, takePullLease } from "./crm-sync";
 import { sealCredentials } from "./queue";
 import { errorWithoutValues, syncZenoti } from "./zenoti-sync";
+import { importVisits, removeVisitUpload } from "../visits-import";
 
 const KEY = "zen-test-key-not-real";
 const KONDAPUR = "80963e4e-6625-4b83-8b88-9708c0cb2303";
@@ -554,20 +555,21 @@ describe("reading Zenoti through a sales report", () => {
     r = await run(c.org, c.id, z, later(25));
     expect(r).toMatchObject({ tested: true, path: "sales_accrual", error: null });
     expect(z.asked("guestDetails").slice(1).map((q) => q.path).sort()).toEqual(["/v1/guests/g7", "/v1/guests/g8"]);
-    expect(r.visits).toMatchObject({ numbered: 1, merged: 2 });
+    // Guest 8's line takes over the visit the clinic uploaded; guest 7's second line folds into the first.
+    expect(r.visits).toMatchObject({ numbered: 2, merged: 1 });
     expect(r.plan?.waitingForPhone).toBe(0);
 
     s = await stored(c.org);
-    // One Hydrafacial visit for guest 7, now with their number; guest 8's line is the uploaded visit.
+    // One Hydrafacial visit for guest 7, now with their number; guest 8's line took over the uploaded visit, which keeps its id.
     expect(s.visits.map((v) => [v.externalId, v.phoneE164, v.service, v.source])).toEqual([
       ["i1:svc-hf", e164(7), "Hydrafacial", "api"],
-      [null, e164(8), "prp - hair", "upload"],
+      ["i3:svc-prp", e164(8), "PRP - Hair", "upload"],
     ]);
     expect(s.plan.some((p) => p.originId === s.visits[0]!.id)).toBe(true);
 
-    // Read again later, the same line stays folded into the uploaded visit.
+    // Read again later, the same line is that visit, with nothing new in it.
     r = await run(c.org, c.id, z, later(26));
-    expect(r).toMatchObject({ tested: false, calls: 2, visits: { added: 0, merged: 1 } });
+    expect(r).toMatchObject({ tested: false, calls: 2, visits: { added: 0, updated: 0, merged: 0 } });
     s = await stored(c.org);
     expect(s.visits).toHaveLength(2);
     // Two runs changed something and were audited; this one found nothing new.
@@ -714,6 +716,19 @@ describe("visits read before their guest's number", () => {
     expect(s.plan.some((p) => p.originId === s.visits[0]!.id && p.phoneE164 === e164(1))).toBe(true);
   });
 
+  it("are counted in the run's summary when the worker reads and plans after, as when the run plans itself", async () => {
+    const z = fakeZenoti(["salesReport"]);
+    const c = await clinic({ backfillDays: 7, ...checked(may("salesReport"), "sales_report") });
+    z.report.push(sold("r1", 1, "2026-09-30", "2026-09-30", "Hydrafacial"), sold("r2", 2, "2026-10-02", "2026-10-02", "Peel"));
+    const r = await syncZenoti(c.org, c.id, { now: NOW, clock: clockAt(NOW), fetchImpl: z.fetchImpl, replan: false });
+    expect(r.plan).toBeNull();
+    expect(r.waitingForPhone).toBe(2);
+    expect(r.summary).toMatch(/ 2 services done wait for a phone number\. /);
+    const s = await stored(c.org);
+    expect((s.integration.config.lastSync as Record<string, unknown>).summary).toBe(r.summary);
+    expect(s.audit.at(-1)?.summary).toContain("2 services done wait for a phone number.");
+  });
+
   it("still have their guest's packages read when they folded into an uploaded visit", async () => {
     const z = fakeZenoti(["appointments", "guestPackages"]);
     const c = await clinic({ backfillDays: 7, ...checked(may("appointments", "guestPackages"), "appointments") });
@@ -723,7 +738,7 @@ describe("visits read before their guest's number", () => {
     z.packages.set("g4", [{ user_package_id: "up-4", status: 1, package: { name: "Hydrafacial 6 sittings" }, date: { end: "2027-01-01T00:00:00" }, services: [{ service_type_info: { service_category_type: 2, name: "Hydrafacial" }, total: 6, used: 2, balance: 4 }] }]);
 
     const r = await run(c.org, c.id, z, NOW);
-    expect(r.visits).toMatchObject({ added: 0, merged: 1 });
+    expect(r.visits).toMatchObject({ added: 0, updated: 1, merged: 0 });
     expect(z.asked("guestPackages").map((q) => q.path)).toEqual(["/v1/guests/g4/Packages"]);
     const s = await stored(c.org);
     expect(s.packages.map((p) => [p.guestRef, p.service, p.balance, p.phoneE164])).toEqual([["g4", "Hydrafacial", 4, e164(4)]]);
@@ -752,6 +767,56 @@ describe("visits read before their guest's number", () => {
     expect(s.visits[0]).toMatchObject({ categories: ["Laser", "Hair Reduction"], sessionsTotal: 6, sessionsDone: 2 });
     // Planned from the package, behind the feedback call on the visit.
     expect(s.plan.find((p) => p.originId === s.visits[0]!.id && p.journey === "next_session")?.verdict).toBe("waiting");
+  });
+});
+
+describe("visits on a list the clinic uploaded as well", () => {
+  const visitIds = (s: Awaited<ReturnType<typeof stored>>) => s.plan.filter((p) => p.originType === "visit").map((p) => p.id).sort();
+
+  it("stay when the upload is removed, whether the upload or Zenoti had the visit first, with their planned calls", async () => {
+    const z = fakeZenoti(["appointments", "guestDetails"]);
+    const c = await clinic({ backfillDays: 7, ...checked(may("appointments", "guestDetails"), "appointments") });
+    // The clinic uploads a visit, then Zenoti reads the same one: the uploaded visit becomes Zenoti's, keeping its id.
+    const first = await importVisits(c.org, `Mobile,Service,Date\n${mobile(4)},hydrafacial,02/10/2026`, { now: NOW });
+    const [up] = await withTenant(c.org, (tx) => tx.select().from(visits).where(eq(visits.batch, first.batch)));
+    z.appointments.push(appointment("u1", 4, "2026-10-02", "11:00", 1, "Hydrafacial"), appointment("u2", 5, "2026-10-01", "12:00", 1, "Peel"));
+    // Guest 4's profile gives no number: the number the clinic uploaded stays on their visit.
+    z.guests.set("g4", { id: "g4", personal_info: { first_name: "Guest", last_name: "Number 4", mobile_phone: { country_code: 95, number: "" } } });
+    z.guests.set("g5", profile(5, false, true));
+    const r = await run(c.org, c.id, z, NOW);
+    expect(r.visits).toMatchObject({ added: 1, updated: 1, merged: 0 });
+    let s = await stored(c.org);
+    expect(s.visits.map((v) => [v.id === up!.id, v.externalId, v.integrationId, v.phoneE164, v.service, v.batch, v.source])).toEqual([
+      [true, "u1", c.id, e164(4), "Hydrafacial", null, "upload"],
+      [false, "u2", c.id, e164(5), "Peel", null, "api"],
+    ]);
+    expect(s.visits[0]!.centreRef).toBe(KONDAPUR);
+
+    // Zenoti had guest 5's visit first; an upload adds its session count, and leaves it Zenoti's.
+    const second = await importVisits(c.org, `Mobile,Service,Date,Sessions Done\n${mobile(5)},Peel,01/10/2026,2`, { now: NOW });
+    expect(second).toMatchObject({ added: 0, updated: 1 });
+    s = await stored(c.org);
+    expect(s.visits[1]).toMatchObject({ externalId: "u2", sessionsDone: 2, batch: null });
+    const planned = visitIds(s);
+    expect(planned.length).toBeGreaterThan(0);
+
+    // Both uploads removed: Zenoti reads those days once only, so its visits stay, and so do their calls.
+    expect(await removeVisitUpload(c.org, first.batch, { now: NOW })).toMatchObject({ removed: 0, kept: 0 });
+    expect(await removeVisitUpload(c.org, second.batch, { now: NOW })).toMatchObject({ removed: 0, kept: 0 });
+    s = await stored(c.org);
+    expect(s.visits.map((v) => v.externalId)).toEqual(["u1", "u2"]);
+    expect(visitIds(s)).toEqual(planned);
+
+    // A visit stamped with an upload's batch before uploads stopped doing that is let go of by it, not deleted.
+    const old = randomUUID();
+    await withTenant(c.org, (tx) => tx.update(visits).set({ batch: old }).where(eq(visits.externalId, "u2")));
+    expect(await removeVisitUpload(c.org, old, { now: NOW })).toMatchObject({ removed: 0, kept: 1 });
+    s = await stored(c.org);
+    expect(s.visits.find((v) => v.externalId === "u2")).toMatchObject({ batch: null });
+    // The upload's own visits still go.
+    const third = await importVisits(c.org, `Mobile,Service,Date\n${mobile(6)},Peel,01/10/2026`, { now: NOW });
+    expect(await removeVisitUpload(c.org, third.batch, { now: NOW })).toMatchObject({ removed: 1, kept: 0 });
+    expect((await stored(c.org)).visits).toHaveLength(2);
   });
 });
 
