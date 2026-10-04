@@ -1183,6 +1183,21 @@ describe("logging calls on their Zoho records", () => {
     expect(r.message).not.toMatch(/Call record/);
   });
 
+  it("passes the Test when Zoho refuses only the made-up number, as Zennara's Zoho does", async () => {
+    // Seen in production: a real Zoho rejects "0000000000" as a phone number,
+    // after checking the grant. That proves search works; it is not a failure.
+    const badNumber = { code: "INVALID_DATA", details: { param_name: "phone" }, message: "invalid data", status: "error" };
+    zoho = (req) => (req === "GET /crm/v2/Leads" ? { status: 200, body: { data: [{ id: "ZOHO-LEAD-1" }] } } : req.endsWith("/search") ? { status: 400, body: badNumber } : { status: 500 });
+    const r = await zohoConnector.test({
+      integration: { tenantId: tenant, id: zohoId, kind: "zoho_crm", name: "Zoho", config: { dc: "in", module: "Leads", scopes: SCOPES }, mapping: {} } as unknown as Integration,
+      credentials: { access_token: "cached", access_token_until: String(Date.now() + 3_600_000) },
+      fetch: fakeFetch,
+      async save() {},
+    });
+    expect(r.ok).toBe(true);
+    expect(r.message).toMatch(/Finding callers in Leads, then Contacts\./);
+  });
+
   it("fails the Test when Zoho will not let it search, rather than the first delivery", async () => {
     const mismatch = { code: "OAUTH_SCOPE_MISMATCH", details: {}, message: "invalid oauth scope to access this URL", status: "error" };
     zoho = (req) => (req === "GET /crm/v2/Leads" ? { status: 200, body: { data: [{ id: "ZOHO-LEAD-1" }] } } : req.endsWith("/search") ? { status: 401, body: mismatch } : { status: 500 });

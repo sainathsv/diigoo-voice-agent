@@ -269,7 +269,8 @@ interface Found {
 function verdict(r: Answer): { code: string; message: string; field: string } {
   const row = ((r.json.data as Array<Record<string, unknown>> | undefined) ?? [])[0] ?? {};
   const details = (row.details ?? r.json.details ?? {}) as Record<string, unknown>;
-  return { code: String(row.code ?? r.json.code ?? ""), message: String(row.message ?? r.json.message ?? ""), field: String(details.api_name ?? "") };
+  // A record write names the field in api_name; a search names its query parameter in param_name.
+  return { code: String(row.code ?? r.json.code ?? ""), message: String(row.message ?? r.json.message ?? ""), field: String(details.api_name ?? details.param_name ?? "") };
 }
 
 /**
@@ -676,7 +677,12 @@ export const zohoConnector: Connector = {
       const unread: Array<{ module: string; r: Answer }> = [];
       for (const module of lookIn(ctx)) {
         const s = await call(ctx, `/crm/v2/${module}/search?phone=${PROBE}`);
-        if (s.status < 400) where.push(module);
+        // Zoho checks the grant before it checks the number, so a refusal of the
+        // made-up number itself still proves the search is allowed. Zennara's Zoho
+        // answers "0000000000" with INVALID_DATA on phone; reading that as a failure
+        // marked a working connection as broken.
+        const probeRefused = s.status === 400 && verdict(s).code === "INVALID_DATA" && verdict(s).field === "phone";
+        if (s.status < 400 || probeRefused) where.push(module);
         else if (judge(s) === "not-allowed") unread.push({ module, r: s });
         else return { ok: false, message: `Zoho answered a search in ${module} with ${s.status}: ${s.text.slice(0, 160)}` };
       }
