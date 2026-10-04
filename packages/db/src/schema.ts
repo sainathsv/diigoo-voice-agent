@@ -6,6 +6,7 @@ import {
   bigint,
   boolean,
   customType,
+  date,
   integer,
   jsonb,
   pgEnum,
@@ -974,6 +975,12 @@ export const integrations = pgTable(
     createdBy: text("created_by"),
     createdAt: ts("created_at").notNull().defaultNow(),
     updatedAt: ts("updated_at").notNull().defaultNow(),
+    /** Reading their records on a timer (migration 0025): when next, who holds it, and where each module got to. */
+    nextPullAt: ts("next_pull_at"),
+    pullLeaseUntil: ts("pull_lease_until"),
+    pullCursor: jsonb("pull_cursor").$type<Record<string, unknown>>().notNull().default({}),
+    lastPullAt: ts("last_pull_at"),
+    lastPullError: text("last_pull_error"),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
@@ -1266,3 +1273,124 @@ export const telephoneLineStatus = pgTable("telephone_line_status", {
   status: jsonb("status").$type<Record<string, unknown>>().notNull(),
   checkedAt: ts("checked_at").notNull().defaultNow(),
 });
+
+// ---------------------------------------------------------------- call plan (0025)
+/**
+ * A record in the client's CRM as last read: only the fields planning uses.
+ * Their free-text notes are never kept, only values read out of them.
+ */
+export const crmRecords = pgTable(
+  "crm_records",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    integrationId: uuid("integration_id").notNull(),
+    /** Their module, such as Zoho's Leads or Contacts. */
+    module: text("module").notNull(),
+    externalId: text("external_id").notNull(),
+    phoneE164: text("phone_e164"),
+    name: text("name"),
+    status: text("status"),
+    source: text("source"),
+    centre: text("centre"),
+    createdExt: ts("created_ext"),
+    modifiedExt: ts("modified_ext"),
+    appointmentAt: ts("appointment_at"),
+    /** Their follow-up field, or a callback date read from their notes. */
+    followUpAt: ts("follow_up_at"),
+    treatment: text("treatment"),
+    consultant: text("consultant"),
+    deletedAt: ts("deleted_at"),
+    syncedAt: ts("synced_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type CrmRecord = typeof crmRecords.$inferSelect;
+
+/** A service a patient actually took, from the clinic's own software. One per person, service (any case) and day. */
+export const visits = pgTable(
+  "visits",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    contactId: uuid("contact_id"),
+    phoneE164: text("phone_e164").notNull(),
+    name: text("name"),
+    service: text("service").notNull(),
+    /** A calendar day, "2026-10-03", with no time and no time zone to shift it. */
+    visitDate: date("visit_date", { mode: "string" }).notNull(),
+    doctor: text("doctor"),
+    branch: text("branch"),
+    branchId: uuid("branch_id"),
+    sessionsDone: integer("sessions_done"),
+    sessionsTotal: integer("sessions_total"),
+    source: text("source").notNull().default("upload"),
+    batch: text("batch"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type Visit = typeof visits.$inferSelect;
+
+/** When each treatment's calls fall due for one client; the keyword is matched against the service, ignoring case. */
+export const treatmentRules = pgTable(
+  "treatment_rules",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    match: text("match").notNull(),
+    label: text("label").notNull(),
+    feedbackAfterDays: integer("feedback_after_days"),
+    resultCheckAfterDays: integer("result_check_after_days"),
+    sessionIntervalDays: integer("session_interval_days"),
+    courseSessions: integer("course_sessions"),
+    maintenanceAfterDays: integer("maintenance_after_days"),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type TreatmentRule = typeof treatmentRules.$inferSelect;
+
+/** One client's choices for the plan. Keys left out take the defaults in code. */
+export const callPlanSettings = pgTable("call_plan_settings", {
+  tenantId: uuid("tenant_id").primaryKey(),
+  settings: jsonb("settings").$type<Record<string, unknown>>().notNull().default({}),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+});
+
+export const PLANNED_CALL_VERDICTS = ["call_now", "scheduled", "waiting", "kept_out"] as const;
+export type PlannedCallVerdict = (typeof PLANNED_CALL_VERDICTS)[number];
+export const PLAN_ORIGIN_TYPES = ["crm_record", "visit"] as const;
+export type PlanOriginType = (typeof PLAN_ORIGIN_TYPES)[number];
+
+/**
+ * The call plan: per person, per thing that prompts a call, per kind of call.
+ * Worked out again whenever the sources change, and never dialled from here.
+ */
+export const plannedCalls = pgTable(
+  "planned_calls",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    contactId: uuid("contact_id"),
+    /** Empty only for someone kept out for having no usable number. */
+    phoneE164: text("phone_e164"),
+    name: text("name"),
+    journey: text("journey").notNull(),
+    programKey: text("program_key").notNull(),
+    verdict: text("verdict").$type<PlannedCallVerdict>().notNull(),
+    /** Plain English, for the clinic. */
+    reason: text("reason").notNull(),
+    callAt: ts("call_at"),
+    priority: integer("priority").notNull().default(0),
+    originType: text("origin_type").$type<PlanOriginType>().notNull(),
+    originId: uuid("origin_id").notNull(),
+    originLabel: text("origin_label").notNull(),
+    /** The variables the call needs: caller_name, treatment, visit_date, appointment_time ... */
+    context: jsonb("context").$type<Record<string, unknown>>().notNull().default({}),
+    computedAt: ts("computed_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type PlannedCall = typeof plannedCalls.$inferSelect;
