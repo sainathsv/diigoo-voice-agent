@@ -314,21 +314,20 @@ describe("importing a visit list", () => {
     for (const x of await stored()) expect(x.contactId).toBe(of(x.phoneE164!).id);
   });
 
-  it("plans the feedback call and the result check for what they had", async () => {
+  it("plans the feedback call and the result check for what they had, and one check-in for a sitting partway through a course", async () => {
     const rows = await withTenant(org, (tx) => tx.select().from(plannedCalls).where(eq(plannedCalls.originType, "visit")));
     const ids = new Map((await stored()).map((x) => [x.phoneE164, x.id]));
     const journeys = (p: string) => rows.filter((r) => r.originId === ids.get(p)).map((r) => r.journey).sort();
     expect(journeys(ANITHA)).toEqual(["maintenance", "result_check", "visit_feedback"]);
-    expect(journeys(RAVI)).toEqual(["next_session", "result_check", "visit_feedback"]);
+    // Sitting 2 of 6: no feedback or result check, only the check-in before the next sitting.
+    expect(journeys(RAVI)).toEqual(["course_checkin"]);
     const feedback = rows.find((r) => r.originId === ids.get(ANITHA) && r.journey === "visit_feedback")!;
     expect(feedback).toMatchObject({ verdict: "scheduled", phoneE164: ANITHA, callAt: new Date("2026-10-02T10:00:00+05:30") });
     expect(feedback.reason).toMatch(/^Visited on Wed 30 Sep 2026 for Hydrafacial\./);
-    // One call at a time: the overdue feedback call first, the others wait for it.
-    const ravi = (j: string) => rows.find((r) => r.originId === ids.get(RAVI) && r.journey === j)!;
-    // The branch the row named ("KDP") is matched to a JENAI branch, which the call names as the clinic does.
-    expect(ravi("visit_feedback")).toMatchObject({ verdict: "call_now", context: { visit_date: "2026-09-20", doctor: "Dr Rao", branch: "Kondapur" } });
-    expect(ravi("result_check")).toMatchObject({ verdict: "waiting", callAt: new Date("2026-10-05T10:00:00+05:30") });
-    expect(ravi("next_session").verdict).toBe("waiting");
+    const ravi = rows.find((r) => r.originId === ids.get(RAVI))!;
+    // 3 days before the next sitting is due on 25 Oct. The branch the row named ("KDP") is matched to a JENAI branch, which the call names as the clinic does.
+    expect(ravi).toMatchObject({ verdict: "scheduled", callAt: new Date("2026-10-22T10:00:00+05:30") });
+    expect(ravi.context).toEqual({ caller_name: "Ravi", treatment: "Laser Hair Removal - Full Face", last_visit: "2026-09-20", sitting_number: "2", sessions_left: "4", next_due: "2026-10-25", doctor: "Dr Rao", branch: "Kondapur" });
   });
 
   it("changes nothing when the same file is uploaded again", async () => {

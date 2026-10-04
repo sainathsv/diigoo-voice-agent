@@ -15,7 +15,7 @@
  * promotional number and recorded consent, which a plan cannot assume. The
  * SMS consents read from a front desk system are counted, never planned on.
  */
-import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
+import { and, eq, gt, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import {
   branches,
   callPlanSettings,
@@ -68,12 +68,12 @@ export const PLAN_JOURNEYS = {
   appointment_reminder: { program: "clinic.appointment_reminder", label: "Remind them of their appointment", priority: 90 },
   after_consultation: { program: "clinic.prescription_followup", label: "Check in after their consultation", priority: 80 },
   result_check: { program: "clinic.prescription_followup", label: "Ask how they are doing and whether they see a difference", priority: 70 },
+  course_checkin: { program: "clinic.course_checkin", label: "Check in and book their next sitting", priority: 65 },
   visit_feedback: { program: "clinic.feedback", label: "Ask how their visit went", priority: 60 },
   callback_due: { program: "clinic.warm_followup", label: "Call back on the date the team noted", priority: 50 },
   new_enquiry: { program: "clinic.warm_followup", label: "Call to book a consultation", priority: 40 },
   no_show_rebook: { program: "clinic.warm_followup", label: "They missed their appointment: call to rebook", priority: 30 },
   cancelled_rebook: { program: "clinic.warm_followup", label: "They cancelled: call to rebook", priority: 25 },
-  next_session: { program: "clinic.revisit_recall", label: "Book their next session", priority: 20 },
   maintenance: { program: "clinic.revisit_recall", label: "Book their maintenance session", priority: 10 },
   appointment_unclear: { program: "", label: "Appointment outcome unknown", priority: 0 },
   no_call: { program: "", label: "No call", priority: 0 },
@@ -84,7 +84,7 @@ export type PlanJourney = keyof typeof PLAN_JOURNEYS;
 const FRESH_ENQUIRY_PRIORITY = 55;
 
 /** Calls whose point is to get them booked: an appointment already coming up makes them wait. */
-const BOOKING_JOURNEYS = new Set<PlanJourney>(["callback_due", "new_enquiry", "no_show_rebook", "cancelled_rebook", "next_session", "maintenance"]);
+const BOOKING_JOURNEYS = new Set<PlanJourney>(["callback_due", "new_enquiry", "no_show_rebook", "cancelled_rebook", "course_checkin", "maintenance"]);
 /**
  * Calls about an enquiry or a booking they let go, as against care after a
  * visit: only for someone who asked the clinic first and has not said no since.
@@ -153,10 +153,16 @@ export interface PlanSettings {
   feedbackWithinDays: number;
   /** A result check is made only this many days past its due date. */
   resultCheckWithinDays: number;
-  /** A next session or maintenance call is made only this many days past its due date: later, it is a win-back offer. */
+  /** A course check-in or maintenance call is made only this many days past its due date: later, it is a win-back offer. */
   recallWithinDays: number;
-  /** A package with sessions left that ends within this many days is called about now, not at the usual gap. */
+  /** A package with sessions left that ends within this many days is called about by then, not at the usual gap. */
   packageEndingWithinDays: number;
+  /** The one call between sittings of a course goes this many days before the next sitting is due. */
+  checkinLeadDays: number;
+  /** A break between sittings longer than this, or than 2.5 times the treatment's gap between sittings when that is longer, starts a new course. */
+  courseGapDays: number;
+  /** At most this many calls to one person in any 30 days: a later call waits until the 30 days allow it. */
+  maxCallsPer30Days: number;
   /** The client's time zone, from their organisation. Not a setting they edit here. */
   timezone: string;
 }
@@ -189,6 +195,9 @@ export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
   resultCheckWithinDays: 30,
   recallWithinDays: 60,
   packageEndingWithinDays: 30,
+  checkinLeadDays: 3,
+  courseGapDays: 60,
+  maxCallsPer30Days: 3,
   timezone: "Asia/Kolkata",
 };
 
@@ -201,7 +210,10 @@ type NumberKey =
   | "feedbackWithinDays"
   | "resultCheckWithinDays"
   | "recallWithinDays"
-  | "packageEndingWithinDays";
+  | "packageEndingWithinDays"
+  | "checkinLeadDays"
+  | "courseGapDays"
+  | "maxCallsPer30Days";
 type ListKey =
   | "openStatuses"
   | "bookedStatuses"
@@ -224,6 +236,9 @@ const NUMBER_LIMITS: Record<NumberKey, [number, number]> = {
   resultCheckWithinDays: [1, 180],
   recallWithinDays: [1, 365],
   packageEndingWithinDays: [0, 180],
+  checkinLeadDays: [0, 30],
+  courseGapDays: [14, 730],
+  maxCallsPer30Days: [1, 30],
 };
 const LIST_KEYS: ListKey[] = [
   "openStatuses",
@@ -478,6 +493,8 @@ export interface PlanPerson {
   suppressions?: Array<{ reason: SuppressionReason; scope?: Purpose | null; expiresAt?: Date | null }>;
   /** Their last call with this client, either way. */
   lastCallAt?: Date | null;
+  /** Calls made to them in the last 30 days, for the cap on calls in any 30 days. */
+  recentCalls?: Date[];
   contactId?: string | null;
   /** Call programs this workspace has set up. Left out, scripts are not checked. */
   programs?: ReadonlySet<string>;
@@ -566,6 +583,8 @@ interface Ctx {
   tz: string;
   today: string;
   lastCallAt: Date | null;
+  /** Calls made to them in the last 30 days, latest first. */
+  recentCalls: Date[];
   personName: string | null;
   /** Days they came, oldest first: the visit list, and customers' appointments that have passed. */
   came: string[];
@@ -613,6 +632,7 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
     tz,
     today: dayOf(now, tz),
     lastCallAt: person.lastCallAt ?? null,
+    recentCalls: [...(person.recentCalls ?? [])].sort((a, b) => b.getTime() - a.getTime()),
     personName: records.find((r) => r.name)?.name ?? visitList.find((v) => v.name)?.name ?? bookings.find((b) => b.name)?.name ?? null,
     came: [],
     bookings,
@@ -695,8 +715,20 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
     }
   }
 
+  // A sitting of a course already booked, at the front desk or in their CRM: its reminder is the call before it.
+  const bookedFor = (key: string): string | null => {
+    const desk = upcoming.find((b) => b.service.trim() && treatmentKey(b.service, rules) === key);
+    if (desk) return `Their next sitting is already booked in ${systemOf(desk)} for ${whenText(desk.startsAt, c)}`;
+    const crm = records
+      .filter((r) => r.treatment?.trim() && r.appointmentAt && !passed(r, c) && !isContactOnly(r) && !["never", "unknown"].includes(classOf(r.status, settings)))
+      .filter((r) => !cancelledOn(bookings, r.appointmentAt!, c) && treatmentKey(r.treatment!, rules) === key)
+      .sort((a, b) => a.appointmentAt!.getTime() - b.appointmentAt!.getTime())[0];
+    if (crm) return `Their next sitting is already booked in ${crm.crm ?? "their CRM"} for ${crm.appointmentHasTime === false ? dateText(dayOf(crm.appointmentAt!, tz)) : whenText(crm.appointmentAt!, c)}`;
+    return null;
+  };
+
   drafts.push(...bookingRows(bookings, upcoming, again, c));
-  drafts.push(...visitRows(all, c));
+  drafts.push(...visitRows(all, c, bookedFor));
   // Everyone shows in the plan, including a patient none of whose calls is due any more.
   if (!drafts.length && all.length) {
     const last = all.reduce((a, b) => (b.day > a.day ? b : a));
@@ -1061,20 +1093,36 @@ function bookingValues(b: PlanBooking, c: Ctx): Values {
   };
 }
 
+/** A break between sittings up to this many times the treatment's usual gap (a sitting or two put off) is still the same course. */
+const COURSE_GAP_INTERVALS = 2.5;
+/** A course check-in comes at least this many days after the sitting, so they can say how they have been. */
+const CHECKIN_MIN_DAYS = 7;
+/** The cap on calls to one person counts the calls of this many days. */
+const CAP_DAYS = 30;
+
 /**
- * After a visit: feedback, a check on how they are doing, then the next
- * session of a course or, once it is done, maintenance. Per service, from its
- * latest visit; feedback once per visit day however many services they had.
- * Their package for the service, when their front desk says, decides the
- * course: sessions left, done, on hold or ended. A session or maintenance
- * overdue by more than recallWithinDays has lapsed: calling them now would be
- * a win-back offer, not care. Sessions left on a package they paid for are
- * theirs, so a call about those is never a win-back.
+ * After a visit, per treatment, from its latest sitting. A course (sittings
+ * left on a package, a set number of sittings, or sittings at a set gap with
+ * no end) gets one call per sitting, not three: feedback after the first,
+ * then before each next sitting one check-in that asks how they have been and
+ * whether they see a difference and books it; after the last, the result
+ * check and later maintenance. A service given once gets feedback, the
+ * result check and maintenance. Feedback is asked once per visit day however
+ * many services they had.
+ *
+ * A course is the run of sittings of one treatment (the treatment rule it
+ * matches, or the service's name when only the rule for any other service
+ * does) with no break longer than the course gap: a longer break starts a new
+ * one. Their package for it, when their front desk says, decides the sittings
+ * left and when it ends. A check-in or maintenance overdue by more than
+ * recallWithinDays has lapsed: calling them now would be a win-back offer,
+ * not care. Sessions left on a package they paid for are theirs, so a call
+ * about those is never a win-back.
  */
-function visitRows(all: VisitIn[], c: Ctx): Draft[] {
+function visitRows(all: VisitIn[], c: Ctx, bookedFor: (key: string) => string | null): Draft[] {
   const groups = new Map<string, VisitIn[]>();
   for (const v of all) {
-    const key = serviceKey(v.service);
+    const key = treatmentKey(v.service, c.rules);
     const g = groups.get(key);
     if (g) g.push(v);
     else groups.set(key, [v]);
@@ -1084,60 +1132,165 @@ function visitRows(all: VisitIn[], c: Ctx): Draft[] {
   for (const [key, g] of groups) {
     g.sort((a, b) => a.day.localeCompare(b.day) || a.origin.id.localeCompare(b.origin.id));
     const last = g[g.length - 1]!;
+    const onDay = g.filter((v) => v.day === last.day);
     const rule = ruleFor(last.service, c.rules);
-    const what = last.service || "their visit";
+    const every = rule.sessionIntervalDays;
+    // Every service of this treatment they had that day, as the clinic names it.
+    const named = listText([...new Map(onDay.filter((v) => v.service.trim()).map((v) => [serviceKey(v.service), v.service.trim()])).values()]);
+    const what = named || "their visit";
     const note = rule.isDefault ? " Timing is JENAI's default until the clinic's doctors confirm it." : "";
-    const values: Values = { visit_date: last.day, last_visit: last.day, treatment: last.service || null, doctor: last.doctor, branch: last.branch };
+    const values: Values = { visit_date: last.day, last_visit: last.day, treatment: named || null, doctor: last.doctor, branch: last.branch };
     const after = (n: number) => startOf(addDays(last.day, n), c.tz);
     const recall = (journey: PlanJourney, days: number, reason: string) =>
       daysBetween(addDays(last.day, days), c.today) > c.s.recallWithinDays
         ? keep(journey, last.origin, `Lapsed: last had ${what} on ${dateText(last.day)}. A call now would be a win-back offer, which needs a promotional number and consent.`)
         : callable(journey, last.origin, after(days), reason, values, c);
-    const every = rule.sessionIntervalDays;
+    const feedback = () => {
+      if (rule.feedbackAfterDays === null || daysBetween(last.day, c.today) > c.s.feedbackWithinDays || feedbackDays.has(last.day)) return;
+      feedbackDays.add(last.day);
+      rows.push(callable("visit_feedback", last.origin, after(rule.feedbackAfterDays), `Visited on ${dateText(last.day)}${named ? ` for ${named}` : ""}.`, values, c));
+    };
+    const resultCheck = (had: string) => {
+      const n = rule.resultCheckAfterDays;
+      if (n === null) return;
+      const due = addDays(last.day, n);
+      if (daysBetween(due, c.today) <= c.s.resultCheckWithinDays)
+        rows.push(callable("result_check", last.origin, startOf(due, c.tz), `${had} on ${dateText(last.day)}; results usually show by about ${plural(n, "day")}.${note}`, { ...values, review_due: due }, c));
+    };
     const maintenance = (had: string) => {
       const m = rule.maintenanceAfterDays;
       if (m) rows.push(recall("maintenance", m, `${had} on ${dateText(last.day)}; maintenance is due every ${plural(m, "day")}.${note}`));
     };
 
-    if (rule.feedbackAfterDays !== null && daysBetween(last.day, c.today) <= c.s.feedbackWithinDays && !feedbackDays.has(last.day)) {
-      feedbackDays.add(last.day);
-      rows.push(callable("visit_feedback", last.origin, after(rule.feedbackAfterDays), `Visited on ${dateText(last.day)}${last.service ? ` for ${last.service}` : ""}.`, values, c));
-    }
-    if (rule.resultCheckAfterDays !== null) {
-      const due = addDays(last.day, rule.resultCheckAfterDays);
-      if (daysBetween(due, c.today) <= c.s.resultCheckWithinDays)
-        rows.push(
-          callable("result_check", last.origin, startOf(due, c.tz), `Had ${what} on ${dateText(last.day)}; results usually show by about ${plural(rule.resultCheckAfterDays, "day")}.${note}`, { ...values, review_due: due }, c),
-        );
-    }
+    // This course's sittings: back from the latest to the first break longer than the course gap.
+    const gap = Math.max(Math.ceil(COURSE_GAP_INTERVALS * (every ?? 0)), c.s.courseGapDays);
+    const days = [...new Set(g.map((v) => v.day))];
+    let start = days.length - 1;
+    while (start > 0 && daysBetween(days[start - 1]!, days[start]!) <= gap) start--;
+    const sittings = days.length - start;
 
-    const pkg = packageFor(key, last, c);
-    if (pkg?.kind === "open") rows.push(openPackageRow(pkg, last, every, what, values, note, c));
-    else if (pkg?.kind === "complete") maintenance(`Finished the course of ${what}`);
-    else if (pkg?.kind === "frozen")
-      rows.push(keep("next_session", last.origin, `Their package for ${what} is on hold in ${systemOf(pkg.p)}${pkg.left ? ` with ${plural(pkg.left, "session")} left` : ""}, so no call about the next session while it is.`));
-    else if (pkg?.kind === "ended") {
-      const p = pkg.p;
-      const how = p.status === "cancelled" ? `was cancelled in ${systemOf(p)}` : p.expiresOn && p.expiresOn < c.today ? `ended on ${dateText(p.expiresOn)}` : `has expired in ${systemOf(p)}`;
-      rows.push(keep("next_session", last.origin, `Their package for ${what} ${how}${pkg.left ? ` with ${plural(pkg.left, "session")} unused` : ""}, so there is no next session to call about.`));
+    const pkg = packageFor(onDay, c);
+    const p = pkg?.p;
+    // Sessions used on the package that speaks for the course, when it says.
+    const used = p && (pkg.kind === "open" || pkg.kind === "complete") ? (p.used ?? (p.total != null && pkg.left !== null ? p.total - pkg.left : null)) : null;
+    // Which sitting the latest was: the clinic's own count (the package in use, the visit list's), else the sittings JENAI has seen.
+    const count = (used !== null && used >= 1 ? used : null) ?? last.sessionsDone ?? sittings;
+    const first = count === 1 && sittings === 1;
+    let length: number | null;
+    let left: number | null;
+    if (pkg?.kind === "open") [length, left] = [p!.total ?? (used !== null ? used + pkg.left! : null) ?? last.sessionsTotal, pkg.left];
+    else if (pkg?.kind === "complete") [length, left] = [p!.total ?? used ?? last.sessionsTotal ?? count, 0];
+    else {
+      length = last.sessionsTotal ?? rule.courseSessions;
+      left = length !== null ? Math.max(0, length - count) : null;
+    }
+    // A rule with a maintenance gap and no number of sittings (a facial) is a service given once, then kept up.
+    const course = pkg ? pkg.kind !== "complete" || (length ?? 0) > 1 : length !== null ? length > 1 : every !== null && !rule.maintenanceAfterDays;
+
+    if (!course) {
+      feedback();
+      resultCheck(`Had ${what}`);
+      maintenance(length !== null ? `Finished the course of ${what}` : `Had ${what}`);
+    } else if (pkg?.kind === "frozen") {
+      if (first) feedback();
+      rows.push(keep("course_checkin", last.origin, `Their package for ${what} is on hold in ${systemOf(pkg.p)}${pkg.left ? ` with ${plural(pkg.left, "session")} left` : ""}, so no call about the next sitting while it is.`));
+    } else if (pkg?.kind === "ended") {
+      // The course stopped there: how it came out, and no sitting to book.
+      if (first) feedback();
+      resultCheck(`Had ${what}`);
+      const q = pkg.p;
+      const how = q.status === "cancelled" ? `was cancelled in ${systemOf(q)}` : q.expiresOn && q.expiresOn < c.today ? `ended on ${dateText(q.expiresOn)}` : `has expired in ${systemOf(q)}`;
+      rows.push(keep("course_checkin", last.origin, `Their package for ${what} ${how}${pkg.left ? ` with ${plural(pkg.left, "session")} unused` : ""}, so there is no next sitting to call about.`));
+    } else if (left === 0) {
+      // The last sitting: how the course came out, then maintenance.
+      resultCheck(`Finished the course of ${what}`);
+      maintenance(`Finished the course of ${what}`);
     } else {
-      const total = last.sessionsTotal ?? rule.courseSessions;
-      const done = last.sessionsDone ?? g.length;
-      if (total !== null && done < total) {
-        if (every) rows.push(recall("next_session", every, `Session ${done + 1} of ${total} of ${what} is due ${plural(every, "day")} after the last, on ${dateText(last.day)}.${note}`));
-      } else if (rule.maintenanceAfterDays) {
-        maintenance(total !== null ? `Finished the course of ${what}` : `Had ${what}`);
-      } else if (total === null && every) {
-        // Sessions with no set number (a drip, pigmentation): the next one, every interval.
-        rows.push(recall("next_session", every, `Had ${what} on ${dateText(last.day)}; sessions are due every ${plural(every, "day")}.${note}`));
-      }
+      if (first) feedback();
+      // A package bought again and not started yet: the latest sitting was the course before it, and the next is its first.
+      const restart = pkg?.kind === "open" && used === 0;
+      const nextNo = pkg?.kind === "open" ? (used !== null ? used + 1 : null) : count + 1;
+      rows.push(checkinRow({ last, what, every, pkg, note, values, length, left, lastNo: restart ? null : count, nextNo, booked: bookedFor(key) }, c));
     }
   }
   return rows;
 }
 
+/** A course's latest sitting, as its check-in needs it. */
+interface Checkin {
+  last: VisitIn;
+  what: string;
+  every: number | null;
+  pkg: PackageState | null;
+  note: string;
+  values: Values;
+  /** Sittings in the course, and left in it, when known. */
+  length: number | null;
+  left: number | null;
+  /** Which sitting the latest was, and which the next is, when known. */
+  lastNo: number | null;
+  nextNo: number | null;
+  /** Their next sitting already booked, in words, or null. */
+  booked: string | null;
+}
+
+/**
+ * The one call between two sittings of a course: checkinLeadDays before the
+ * next is due, and at least a week after the last so they can say how they
+ * have been. None when the next sitting is already booked: the reminder
+ * before it is the call. With sessions left on a package that ends within
+ * packageEndingWithinDays, no later than when it came that close to its end,
+ * so they can book before it does.
+ */
+function checkinRow(k: Checkin, c: Ctx): Draft {
+  const { last, what } = k;
+  const o = last.origin;
+  if (k.booked) return keep("course_checkin", o, `${k.booked}: the reminder before it is the call.`);
+  const open = k.pkg?.kind === "open" ? k.pkg : null;
+  const next = k.every ? addDays(last.day, k.every) : null;
+  const sitting = k.nextNo !== null && k.length !== null && k.nextNo <= k.length ? `Sitting ${k.nextNo} of ${k.length} of ${what}` : `The next sitting of ${what}`;
+  const values: Values = { ...k.values, sitting_number: k.lastNo ? String(k.lastNo) : null, sessions_left: k.left !== null ? String(k.left) : null, next_due: next };
+  const ends = open?.p.expiresOn ?? null;
+  // A week after the sitting at the soonest; when their package ends before then, the day after, so they can still book.
+  const soonest = addDays(last.day, ends && ends <= addDays(last.day, CHECKIN_MIN_DAYS) ? 1 : CHECKIN_MIN_DAYS);
+  const usual = next ? later(addDays(next, -c.s.checkinLeadDays), soonest) : null;
+  if (open && ends && daysBetween(c.today, ends) <= c.s.packageEndingWithinDays) {
+    // A fixed day, never later than when the package came that close to its end, so the row stays the same from one plan to the next.
+    const near = later(addDays(ends, -c.s.packageEndingWithinDays), soonest);
+    const day = usual && usual < near ? usual : near;
+    return callable("course_checkin", o, startOf(day, c.tz), `${plural(open.left!, "session")} left, package ends on ${dateText(ends)}: called in time to book before it does. ${sitting} is next; the last was on ${dateText(last.day)}.`, values, c);
+  }
+  if (!next || !usual)
+    return keep(
+      "course_checkin",
+      o,
+      open
+        ? `${plural(open.left!, "session")} of ${what} left on ${theirPackage(open.p)}, but no gap between sessions is set for it, so JENAI cannot tell when the next is due. Add one in the treatment rules.`
+        : `${sitting} is next, but no gap between sittings is set for it, so JENAI cannot tell when it is due. Add one in the treatment rules.`,
+    );
+  // With no package, a course long past its next sitting has lapsed.
+  if (!open && daysBetween(next, c.today) > c.s.recallWithinDays)
+    return keep("course_checkin", o, `Lapsed: last had ${what} on ${dateText(last.day)}. A call now would be a win-back offer, which needs a promotional number and consent.`);
+  const pkgText = open ? ` ${plural(open.left!, "session")} left on ${theirPackage(open.p)}${ends ? `, which ends on ${dateText(ends)}` : ""}.` : "";
+  return callable("course_checkin", o, startOf(usual, c.tz), `${sitting} is due ${plural(k.every!, "day")} after the last, on ${dateText(last.day)}.${pkgText}${k.note}`, values, c);
+}
+
+const theirPackage = (p: PlanPackage) => (p.status === "not_started" ? "the package they bought, not started yet" : "their package");
+/** The later of two days. */
+const later = (a: string, b: string) => (a > b ? a : b);
+
 /** A service's name as visits and packages are matched on: any case, any spacing. */
 const serviceKey = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+
+/**
+ * Which treatment a service is, for telling one course from another: the
+ * treatment rule it matches, so "Laser Toning - Lips" and "lip toning" are one
+ * course, or its own name when only the rule for any other service matches.
+ */
+function treatmentKey(service: string, rules: readonly PlanRule[]): string {
+  const r = ruleFor(service, rules);
+  return r.match.length ? `rule:${rules.indexOf(r)}` : `service:${serviceKey(service)}`;
+}
 
 interface PackageState {
   /**
@@ -1185,12 +1338,12 @@ function covers(p: PlanPackage, key: string, v: VisitIn): boolean {
   return p.covers !== "tag" && k === key;
 }
 
-/** Of their packages for a service, the one that speaks for the course: as packageRank says, then ending soonest. */
-function packageFor(key: string, last: VisitIn, c: Ctx): PackageState | null {
+/** Of their packages for the services of one sitting, the one that speaks for the course: as packageRank says, then ending soonest. */
+function packageFor(onDay: readonly VisitIn[], c: Ctx): PackageState | null {
   let best: PackageState | null = null;
   for (const p of c.packages) {
-    if (!covers(p, key, last)) continue;
-    const st = packageState(p, last.day, c.today);
+    if (!onDay.some((v) => covers(p, serviceKey(v.service), v))) continue;
+    const st = packageState(p, onDay[0]!.day, c.today);
     if (!st) continue;
     const ends = (x: PackageState) => x.p.expiresOn ?? "9999-12-31";
     if (!best || packageRank(st) < packageRank(best) || (packageRank(st) === packageRank(best) && ends(st) < ends(best))) best = st;
@@ -1199,42 +1352,9 @@ function packageFor(key: string, last: VisitIn, c: Ctx): PackageState | null {
 }
 
 /**
- * The next session from a package with sessions left: at the usual gap after
- * the last, or now when the package ends within packageEndingWithinDays, so
- * they can use what they paid for before it does.
- */
-function openPackageRow(pkg: PackageState, last: VisitIn, every: number | null, what: string, values: Values, note: string, c: Ctx): Draft {
-  const { p } = pkg;
-  const left = pkg.left!;
-  const total = p.total ?? last.sessionsTotal;
-  const done = p.used ?? (total !== null ? total - left : null);
-  const session = total !== null && done !== null && done >= 0 && done < total ? `Session ${done + 1} of ${total} of ${what}` : `The next session of ${what}`;
-  const ends = p.expiresOn ?? null;
-  const theirs = p.status === "not_started" ? "the package they bought, not started yet" : "their package";
-  if (ends && daysBetween(c.today, ends) <= c.s.packageEndingWithinDays) {
-    // Due since the package came that close to its end, or since the usual gap when that came first, never before their last
-    // visit: a fixed time, so the row stays the same from one plan to the next.
-    const near = addDays(ends, -c.s.packageEndingWithinDays);
-    const gap = every ? addDays(last.day, every) : near;
-    const from = gap < near ? gap : near;
-    const fell = startOf(from > last.day ? from : last.day, c.tz);
-    return callable("next_session", last.origin, fell, `${plural(left, "session")} left, package ends on ${dateText(ends)}: called now so they can book before it does. ${session} is next; the last was on ${dateText(last.day)}.`, values, c);
-  }
-  if (every)
-    return callable(
-      "next_session",
-      last.origin,
-      startOf(addDays(last.day, every), c.tz),
-      `${session} is due ${plural(every, "day")} after the last, on ${dateText(last.day)}. ${plural(left, "session")} left on ${theirs}${ends ? `, which ends on ${dateText(ends)}` : ""}.${note}`,
-      values,
-      c,
-    );
-  return keep("next_session", last.origin, `${plural(left, "session")} of ${what} left on ${theirs}, but no gap between sessions is set for it, so JENAI cannot tell when the next is due. Add one in the treatment rules.`);
-}
-
-/**
  * A call that will be made: due now once its time has come, otherwise
- * scheduled for it; never within minGapDays of the last call with them;
+ * scheduled for it; never within minGapDays of the last call with them, nor
+ * while they have had maxCallsPer30Days calls in the 30 days before it;
  * always inside calling hours. A call already due keeps the calling moment it
  * fell due at, so the row stays the same from one plan to the next; it is
  * made at the next calling moment from now.
@@ -1242,14 +1362,22 @@ function openPackageRow(pkg: PackageState, last: VisitIn, every: number | null, 
 function callable(journey: PlanJourney, o: Origin, due: Date, reason: string, values: Values, c: Ctx, opts: { priority?: number } = {}): Draft {
   let at = due;
   let verdict: PlannedCallVerdict = due > c.now ? "scheduled" : "call_now";
-  let moved = false;
+  let why = "";
   if (c.lastCallAt && c.s.minGapDays > 0) {
     const free = new Date(c.lastCallAt.getTime() + c.s.minGapDays * DAY_MS);
-    if (free > at && free > c.now) [at, verdict, moved] = [free, "scheduled", true];
+    if (free > at && free > c.now) [at, verdict, why] = [free, "scheduled", `the last call with them was on ${dateText(dayOf(c.lastCallAt, c.tz))}, and calls are kept ${plural(c.s.minGapDays, "day")} apart.`];
+  }
+  // Counted at the time the call would go. This call is the one more: it waits until the oldest call that fills the cap is 30 days old.
+  const goes = at > c.now ? at : c.now;
+  const counted = c.recentCalls.filter((x) => x <= goes && goes.getTime() - x.getTime() < CAP_DAYS * DAY_MS);
+  const max = c.s.maxCallsPer30Days;
+  if (counted.length >= max) {
+    const free = new Date(counted[max - 1]!.getTime() + CAP_DAYS * DAY_MS);
+    if (free > at)
+      [at, verdict, why] = [free, "scheduled", `they have had ${plural(counted.length, "call")} since ${dateText(dayOf(counted.at(-1)!, c.tz))}, and the plan settings allow ${max} in any ${CAP_DAYS} days.`];
   }
   at = nextWindowStart(at, c.s.callingWindow, c.tz);
-  if (moved)
-    reason += ` Moved to ${dateText(dayOf(at, c.tz))}: the last call with them was on ${dateText(dayOf(c.lastCallAt!, c.tz))}, and calls are kept ${plural(c.s.minGapDays, "day")} apart.`;
+  if (why) reason += ` Moved to ${dateText(dayOf(at, c.tz))}: ${why}`;
   return { origin: o, journey, verdict, reason, callAt: at, priority: opts.priority ?? PLAN_JOURNEYS[journey].priority, values };
 }
 
@@ -1519,6 +1647,19 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
           .where(gt(calls.startedAt, new Date(now.getTime() - settings.minGapDays * DAY_MS)))
           .groupBy(who)
       : [];
+    // Calls made to them in the last 30 days, for the cap on calls in any 30 days: every one that left the dialer, answered or not.
+    const made = await tx
+      .select({ phone: calls.toE164, at: calls.startedAt })
+      .from(calls)
+      .where(
+        and(
+          eq(calls.direction, "outbound"),
+          notInArray(calls.status, ["queued", "failed"]),
+          gt(calls.startedAt, new Date(now.getTime() - CAP_DAYS * DAY_MS)),
+          lte(calls.startedAt, now),
+          sql`${calls.toE164} in ${inPlan}`,
+        ),
+      );
     const programs = new Set((await tx.selectDistinct({ key: clientPrograms.programKey }).from(clientPrograms)).map((p) => p.key));
     const contactOf = new Map((await tx.select({ id: contacts.id, phone: contacts.phoneE164 }).from(contacts).where(sql`${contacts.phoneE164} in ${inPlan}`)).map((x) => [x.phone, x.id]));
 
@@ -1526,7 +1667,7 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
     const people = new Map<string, PlanPerson>();
     const personFor = (key: string, phone: string | null) => {
       let p = people.get(key);
-      if (!p) people.set(key, (p = { phone, records: [], visits: [], bookings: [], packages: [], suppressions: [], lastCallAt: null, contactId: phone ? (contactOf.get(phone) ?? null) : null, programs }));
+      if (!p) people.set(key, (p = { phone, records: [], visits: [], bookings: [], packages: [], suppressions: [], lastCallAt: null, recentCalls: [], contactId: phone ? (contactOf.get(phone) ?? null) : null, programs }));
       return p;
     };
     for (const r of records) personFor(r.phoneE164 ?? `record:${r.id}`, r.phoneE164).records.push({ ...r, crm: systemNamed(r.integrationId) ?? "their CRM" });
@@ -1582,6 +1723,7 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
       const p = l.phone ? people.get(l.phone) : undefined;
       if (p && l.at) p.lastCallAt = l.at;
     }
+    for (const m of made) if (m.phone) people.get(m.phone)?.recentCalls!.push(m.at);
 
     const rows = new Map<string, PlanRow>();
     for (const p of people.values()) for (const row of planPerson(p, settings, rules, now)) rows.set(`${row.originType}:${row.originId}:${row.journey}`, row);

@@ -28,7 +28,7 @@ export async function setPlanEnabled(tenantId: string, enabled: boolean, opts: S
   await withTenant(tenantId, async (tx) => {
     const [org] = await tx.select({ vertical: organizations.vertical }).from(organizations).where(eq(organizations.id, tenantId));
     if (enabled && verticalOf(org?.vertical) !== "health")
-      throw new PlanSwitchError("The call plan knows clinic calls only for now (reminders, check-ins, feedback, next sessions), so it cannot be switched on for this workspace.");
+      throw new PlanSwitchError("The call plan knows clinic calls only for now (reminders, check-ins, feedback, next sittings), so it cannot be switched on for this workspace.");
     await tx
       .insert(callPlanSettings)
       .values({ tenantId, enabled, nextReplanAt: sql`now()` })

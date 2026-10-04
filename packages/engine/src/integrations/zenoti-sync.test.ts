@@ -338,9 +338,9 @@ describe("reading Zenoti through appointments", () => {
     ]);
     expect(s.people[0]!.packagesFetchedAt?.toISOString()).toBe(NOW.toISOString());
 
-    // The plan has the laser course's next session, and nobody waits for a number.
+    // The plan has the check-in before the laser course's next sitting, and nobody waits for a number.
     expect(r.plan?.waitingForPhone).toBe(0);
-    expect(s.plan.some((p) => p.originId === s.visits[1]!.id && p.journey === "next_session")).toBe(true);
+    expect(s.plan.some((p) => p.originId === s.visits[1]!.id && p.journey === "course_checkin")).toBe(true);
     // The no-show is not called to rebook: the booking a month out was read too.
     const a2 = s.bookings.find((b) => b.externalId === "a2")!;
     expect(s.plan.find((p) => p.originId === a2.id)).toMatchObject({ journey: "no_show_rebook", verdict: "kept_out", reason: "Missed their appointment on Sun 20 Sep 2026 for PRP - Hair, but is booked again for Fri 30 Oct 2026." });
@@ -744,7 +744,7 @@ describe("visits read before their guest's number", () => {
     expect(s.packages.map((p) => [p.guestRef, p.service, p.balance, p.phoneE164])).toEqual([["g4", "Hydrafacial", 4, e164(4)]]);
     expect(s.visits).toHaveLength(1);
     expect(s.visits[0]).toMatchObject({ id: up!.id, sessionsTotal: 6, sessionsDone: 2 });
-    expect(s.plan.some((p) => p.originId === up!.id && p.journey === "next_session")).toBe(true);
+    expect(s.plan.some((p) => p.originId === up!.id && p.journey === "course_checkin")).toBe(true);
   });
 
   it("reads a package for a whole category against the visits' categories", async () => {
@@ -765,8 +765,8 @@ describe("visits read before their guest's number", () => {
     const s = await stored(c.org);
     expect(s.packages.map((p) => [p.service, p.covers, p.balance])).toEqual([["Hair Reduction", "category", 4]]);
     expect(s.visits[0]).toMatchObject({ categories: ["Laser", "Hair Reduction"], sessionsTotal: 6, sessionsDone: 2 });
-    // Planned from the package, behind the feedback call on the visit.
-    expect(s.plan.find((p) => p.originId === s.visits[0]!.id && p.journey === "next_session")?.verdict).toBe("waiting");
+    // Planned from the package: the 2nd of 6 sittings, so the check-in before the next and no feedback call.
+    expect(s.plan.filter((p) => p.originId === s.visits[0]!.id).map((p) => [p.journey, p.verdict])).toEqual([["course_checkin", "scheduled"]]);
   });
 });
 

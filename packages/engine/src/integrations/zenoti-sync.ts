@@ -1321,7 +1321,7 @@ class Run {
    * from Zenoti removed, the week noted on the guest, and the counts of the
    * package a session was last taken from set on their latest visit for each
    * service (or category) in it, which is the visit the plan reads for the
-   * next session. A package not yet started speaks for no visit already had,
+   * course's next sitting. A package not yet started speaks for no visit already had,
    * and a line for a tag matches none: JENAI does not know services' tags.
    */
   private async storePackages(tx: Tx, guestRef: string, rows: ZenotiPackageRow[]): Promise<void> {

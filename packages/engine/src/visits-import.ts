@@ -3,7 +3,7 @@
  * clinic's or salon's own front desk or billing software and uploaded here.
  * importVisits() stores one visits row per person, service and day, keeps a
  * contact for every number, then plans everyone's calls again, so a visit
- * turns into its feedback call, result check or next session.
+ * turns into its feedback call, course check-in, result check or maintenance call.
  *
  * Every vendor's export looks different, so columns are found by name (any
  * case or punctuation, with the usual synonyms), dates are read day first as

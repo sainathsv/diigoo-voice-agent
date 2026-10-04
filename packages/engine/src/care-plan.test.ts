@@ -273,12 +273,12 @@ describe("after a visit", () => {
     expect(rows[0]!.callAt).toEqual(ist("2027-07-01 10:00"));
   });
 
-  it("books the next session of a course that is not finished", () => {
+  it("checks in before the next sitting of a course that is not finished", () => {
     const rows = plan({ visits: [visit({ service: "Glycolic Peel", visitDate: "2026-08-01" }), visit({ service: "glycolic  peel", visitDate: "2026-08-22" })] });
     const r = only(rows);
-    expect(r).toMatchObject({ journey: "next_session", programKey: "clinic.revisit_recall", verdict: "call_now" });
-    expect(r.reason).toMatch(/^Session 3 of 4 of glycolic {2}peel is due 21 days after the last, on Sat 22 Aug 2026\./);
-    expect(r.context).toEqual({ caller_name: "Anitha", treatment: "glycolic  peel", last_visit: "2026-08-22" });
+    expect(r).toMatchObject({ journey: "course_checkin", programKey: "clinic.course_checkin", verdict: "call_now" });
+    expect(r.reason).toMatch(/^Sitting 3 of 4 of glycolic {2}peel is due 21 days after the last, on Sat 22 Aug 2026\./);
+    expect(r.context).toEqual({ caller_name: "Anitha", treatment: "glycolic  peel", last_visit: "2026-08-22", sitting_number: "2", sessions_left: "2", next_due: "2026-09-12" });
   });
 
   it("books maintenance once the course is done, going by the clinic's session count", () => {
@@ -569,26 +569,31 @@ describe("packages at the front desk", () => {
   const laser = (visitDate: string) => visit({ service: "LHR Full Legs", visitDate });
   const DEFAULT_NOTE = " Timing is JENAI's default until the clinic's doctors confirm it.";
 
-  it("books the next session from the sessions left on their package", () => {
+  it("checks in before the next sitting from the sessions left on their package", () => {
     const r = only(plan({ visits: [laser("2026-08-01")], packages: [pack()] }));
-    expect(r).toMatchObject({ journey: "next_session", verdict: "call_now", programKey: "clinic.revisit_recall" });
-    expect(r.reason).toBe(`Session 4 of 5 of LHR Full Legs is due 35 days after the last, on Sat 1 Aug 2026. 2 sessions left on their package, which ends on Mon 1 Mar 2027.${DEFAULT_NOTE}`);
+    expect(r).toMatchObject({ journey: "course_checkin", verdict: "call_now", programKey: "clinic.course_checkin" });
+    expect(r.reason).toBe(`Sitting 4 of 5 of LHR Full Legs is due 35 days after the last, on Sat 1 Aug 2026. 2 sessions left on their package, which ends on Mon 1 Mar 2027.${DEFAULT_NOTE}`);
+    expect(r.context).toMatchObject({ sitting_number: "3", sessions_left: "2", next_due: "2026-09-05" });
     // Without the package, the default course and their visits count.
-    expect(only(plan({ visits: [laser("2026-08-01")] })).reason).toMatch(/^Session 2 of 6 of LHR Full Legs/);
+    expect(only(plan({ visits: [laser("2026-08-01")] })).reason).toMatch(/^Sitting 2 of 6 of LHR Full Legs/);
     // Matched however the service is spelled.
-    expect(only(plan({ visits: [laser("2026-08-01")], packages: [pack({ service: "lhr  FULL legs" })] })).reason).toMatch(/^Session 4 of 5/);
+    expect(only(plan({ visits: [laser("2026-08-01")], packages: [pack({ service: "lhr  FULL legs" })] })).reason).toMatch(/^Sitting 4 of 5/);
   });
 
-  it("calls now when the package ends within 30 days, and says so", () => {
-    const rows = plan({ visits: [laser("2026-09-30")], packages: [pack({ expiresOn: "2026-10-12" })] });
-    const r = journey(rows, "next_session");
-    expect(r).toMatchObject({ verdict: "call_now", reason: "2 sessions left, package ends on Mon 12 Oct 2026: called now so they can book before it does. Session 4 of 5 of LHR Full Legs is next; the last was on Wed 30 Sep 2026." });
-    // Due since their last visit (the package was already that close to its end), at a fixed time the next plan keeps.
-    expect(r.callAt).toEqual(ist("2026-09-30 10:00"));
-    expect(journey(rows, "visit_feedback").verdict).toBe("waiting");
-    // A clinic that wants less notice: the usual gap.
-    const later = journey(plan({ visits: [laser("2026-09-30")], packages: [pack({ expiresOn: "2026-10-12" })] }, NOW, planSettingsOf({ packageEndingWithinDays: 7 })), "next_session");
-    expect(later.callAt).toEqual(ist("2026-11-04 10:00"));
+  it("checks in a week after the sitting when the package ends within 30 days, and says so", () => {
+    const r = only(plan({ visits: [laser("2026-09-30")], packages: [pack({ expiresOn: "2026-10-12" })] }));
+    expect(r).toMatchObject({
+      journey: "course_checkin",
+      verdict: "scheduled",
+      reason: "2 sessions left, package ends on Mon 12 Oct 2026: called in time to book before it does. Sitting 4 of 5 of LHR Full Legs is next; the last was on Wed 30 Sep 2026.",
+    });
+    // Not at the usual 3 days before the next sitting (2 Nov), which would be after the package ends: a week after the sitting.
+    expect(r.callAt).toEqual(ist("2026-10-07 10:00"));
+    // A package that ends within that week: the day after the sitting, so they can still book.
+    expect(only(plan({ visits: [laser("2026-09-30")], packages: [pack({ expiresOn: "2026-10-05" })] }))).toMatchObject({ verdict: "call_now", callAt: ist("2026-10-01 10:00") });
+    // A clinic that wants less notice: the usual time, 3 days before the next sitting is due (Sunday 1 Nov, so Monday).
+    const later = only(plan({ visits: [laser("2026-09-30")], packages: [pack({ expiresOn: "2026-10-12" })] }, NOW, planSettingsOf({ packageEndingWithinDays: 7 })));
+    expect(later.callAt).toEqual(ist("2026-11-02 10:00"));
   });
 
   it("books maintenance once the package is used up", () => {
@@ -598,63 +603,69 @@ describe("packages at the front desk", () => {
     expect(r.reason).toMatch(/^Finished the course of LHR Full Legs on Mon 1 Jun 2026; maintenance is due every 180 days\./);
   });
 
-  it("never calls about the next session of an expired or cancelled package", () => {
+  it("never calls about the next sitting of an expired or cancelled package", () => {
     const next = (p: PlanPackage) => {
       const rows = plan({ visits: [laser("2026-09-10")], packages: [p] });
       expect(rows.some((r) => r.journey === "maintenance")).toBe(false);
-      return journey(rows, "next_session");
+      return journey(rows, "course_checkin");
     };
     expect(next(pack({ status: "expired", expiresOn: "2026-09-15" }))).toMatchObject({
       verdict: "kept_out",
-      reason: "Their package for LHR Full Legs ended on Tue 15 Sep 2026 with 2 sessions unused, so there is no next session to call about.",
+      reason: "Their package for LHR Full Legs ended on Tue 15 Sep 2026 with 2 sessions unused, so there is no next sitting to call about.",
     });
     // Past its end date, whatever status was last read.
-    expect(next(pack({ expiresOn: "2026-09-20" })).reason).toBe("Their package for LHR Full Legs ended on Sun 20 Sep 2026 with 2 sessions unused, so there is no next session to call about.");
-    expect(next(pack({ status: "expired", expiresOn: null })).reason).toBe("Their package for LHR Full Legs has expired in Zenoti with 2 sessions unused, so there is no next session to call about.");
-    expect(next(pack({ status: "cancelled" })).reason).toBe("Their package for LHR Full Legs was cancelled in Zenoti with 2 sessions unused, so there is no next session to call about.");
-    expect(next(pack({ status: "frozen" }))).toMatchObject({ verdict: "kept_out", reason: "Their package for LHR Full Legs is on hold in Zenoti with 2 sessions left, so no call about the next session while it is." });
+    expect(next(pack({ expiresOn: "2026-09-20" })).reason).toBe("Their package for LHR Full Legs ended on Sun 20 Sep 2026 with 2 sessions unused, so there is no next sitting to call about.");
+    expect(next(pack({ status: "expired", expiresOn: null })).reason).toBe("Their package for LHR Full Legs has expired in Zenoti with 2 sessions unused, so there is no next sitting to call about.");
+    expect(next(pack({ status: "cancelled" })).reason).toBe("Their package for LHR Full Legs was cancelled in Zenoti with 2 sessions unused, so there is no next sitting to call about.");
+    expect(next(pack({ status: "frozen" }))).toMatchObject({ verdict: "kept_out", reason: "Their package for LHR Full Legs is on hold in Zenoti with 2 sessions left, so no call about the next sitting while it is." });
     // Even when Zenoti gave no count of sessions left.
-    expect(next(pack({ status: "expired", expiresOn: null, total: null, used: null, balance: null })).reason).toBe("Their package for LHR Full Legs has expired in Zenoti, so there is no next session to call about.");
+    expect(next(pack({ status: "expired", expiresOn: null, total: null, used: null, balance: null })).reason).toBe("Their package for LHR Full Legs has expired in Zenoti, so there is no next sitting to call about.");
+    // The course stopped at that sitting: how it came out is still asked; on hold, it has not stopped.
+    expect(journey(plan({ visits: [laser("2026-09-10")], packages: [pack({ status: "cancelled" })] }), "result_check").verdict).toBe("call_now");
+    expect(plan({ visits: [laser("2026-09-10")], packages: [pack({ status: "frozen" })] }).some((r) => r.journey === "result_check")).toBe(false);
   });
 
   it("ignores a package that ended before their last visit, or gives no count of sessions, and prefers one with sessions left", () => {
-    const after = journey(plan({ visits: [laser("2026-09-10")], packages: [pack({ status: "expired", expiresOn: "2026-09-01" })] }), "next_session");
-    expect(after.verdict).toBe("waiting");
-    expect(after.callAt).toEqual(ist("2026-10-15 10:00"));
-    expect(only(plan({ visits: [laser("2026-08-01")], packages: [pack({ status: "not_started", total: null, used: null, balance: null })] })).reason).toMatch(/^Session 2 of 6/);
+    // The first sitting of the default course: its check-in 3 days before the next is due, on 15 Oct, and no result check.
+    const after = only(plan({ visits: [laser("2026-09-10")], packages: [pack({ status: "expired", expiresOn: "2026-09-01" })] }));
+    expect(after).toMatchObject({ journey: "course_checkin", verdict: "scheduled" });
+    expect(after.callAt).toEqual(ist("2026-10-12 10:00"));
+    expect(only(plan({ visits: [laser("2026-08-01")], packages: [pack({ status: "not_started", total: null, used: null, balance: null })] })).reason).toMatch(/^Sitting 2 of 6/);
     const both = only(plan({ visits: [laser("2026-08-01")], packages: [pack({ status: "expired", expiresOn: "2026-09-15" }), pack({ total: 6, used: 1, balance: 5 })] }));
-    expect(both).toMatchObject({ journey: "next_session", verdict: "call_now" });
-    expect(both.reason).toMatch(/^Session 2 of 6 of LHR Full Legs/);
+    expect(both).toMatchObject({ journey: "course_checkin", verdict: "call_now" });
+    expect(both.reason).toMatch(/^Sitting 2 of 6 of LHR Full Legs/);
   });
 
-  it("books the first session of a course bought again, not maintenance for the one it replaces", () => {
+  it("checks in before the first sitting of a course bought again, not maintenance for the one it replaces", () => {
     // Zenoti has no "completed": the used-up package stays Active beside the one bought again, not started yet.
     const usedUp = pack({ used: 5, balance: 0 });
     const again = pack({ status: "not_started", used: 0, balance: 5, expiresOn: "2027-06-01" });
     for (const packages of [[usedUp, again], [again, usedUp]]) {
       const r = only(plan({ visits: [laser("2026-08-01")], packages }));
-      expect(r).toMatchObject({ journey: "next_session", verdict: "call_now" });
-      expect(r.reason).toBe(`Session 1 of 5 of LHR Full Legs is due 35 days after the last, on Sat 1 Aug 2026. 5 sessions left on the package they bought, not started yet, which ends on Tue 1 Jun 2027.${DEFAULT_NOTE}`);
+      expect(r).toMatchObject({ journey: "course_checkin", verdict: "call_now" });
+      expect(r.reason).toBe(`Sitting 1 of 5 of LHR Full Legs is due 35 days after the last, on Sat 1 Aug 2026. 5 sessions left on the package they bought, not started yet, which ends on Tue 1 Jun 2027.${DEFAULT_NOTE}`);
+      // The sitting they had was of the course before, so the script is not told its number.
+      expect(r.context).toEqual({ caller_name: "Anitha", treatment: "LHR Full Legs", last_visit: "2026-08-01", sessions_left: "5", next_due: "2026-09-05" });
     }
     // One being used still speaks before one not started.
-    expect(only(plan({ visits: [laser("2026-08-01")], packages: [again, pack()] })).reason).toMatch(/^Session 4 of 5 .* 2 sessions left on their package, which ends on Mon 1 Mar 2027\./);
+    expect(only(plan({ visits: [laser("2026-08-01")], packages: [again, pack()] })).reason).toMatch(/^Sitting 4 of 5 .* 2 sessions left on their package, which ends on Mon 1 Mar 2027\./);
     // Alone, used up, it is maintenance as before.
     expect(only(plan({ visits: [laser("2026-06-01")], packages: [usedUp] })).journey).toBe("maintenance");
   });
 
   it("matches a package for a whole category by the visit's category, and one for a tag never", () => {
     const v = visit({ service: "LHR Full Legs", visitDate: "2026-08-01", categories: ["Laser", "Hair Reduction"] });
-    expect(only(plan({ visits: [v], packages: [pack({ service: "hair reduction", covers: "category" })] })).reason).toMatch(/^Session 4 of 5 of LHR Full Legs/);
+    expect(only(plan({ visits: [v], packages: [pack({ service: "hair reduction", covers: "category" })] })).reason).toMatch(/^Sitting 4 of 5 of LHR Full Legs/);
     // A tag, a category the visit is not in, or a category named like the service: the rule and the visits decide.
     for (const p of [pack({ service: "Hair Reduction", covers: "tag" }), pack({ service: "Facials", covers: "category" }), pack({ covers: "category" })]) {
-      expect(only(plan({ visits: [v], packages: [p] })).reason, JSON.stringify(p)).toMatch(/^Session 2 of 6/);
+      expect(only(plan({ visits: [v], packages: [p] })).reason, JSON.stringify(p)).toMatch(/^Sitting 2 of 6/);
     }
   });
 
   it("says when a service with sessions left has no gap set between sessions", () => {
     const r = only(plan({ visits: [visit({ service: "HIFU Face", visitDate: "2026-08-01" })], packages: [pack({ service: "HIFU Face", total: 2, used: 1, balance: 1 })] }));
     expect(r).toMatchObject({
-      journey: "next_session",
+      journey: "course_checkin",
       verdict: "kept_out",
       reason: "1 session of HIFU Face left on their package, but no gap between sessions is set for it, so JENAI cannot tell when the next is due. Add one in the treatment rules.",
     });
@@ -719,9 +730,9 @@ describe("an appointment with a date and no time", () => {
 });
 
 describe("recalls that have lapsed", () => {
-  it("keeps out a next session or maintenance long past due: that call would be a win-back offer", () => {
+  it("keeps out a course check-in or maintenance long past due: that call would be a win-back offer", () => {
     const lhr = plan({ visits: [visit({ service: "Laser Hair Removal", visitDate: "2024-04-01" })] }, ist("2026-10-01 12:00"));
-    expect(journey(lhr, "next_session")).toMatchObject({ verdict: "kept_out", reason: "Lapsed: last had Laser Hair Removal on Mon 1 Apr 2024. A call now would be a win-back offer, which needs a promotional number and consent." });
+    expect(journey(lhr, "course_checkin")).toMatchObject({ verdict: "kept_out", reason: "Lapsed: last had Laser Hair Removal on Mon 1 Apr 2024. A call now would be a win-back offer, which needs a promotional number and consent." });
     const facial = plan({ visits: [visit({ service: "Medifacial", visitDate: "2024-10-15" })] });
     expect(journey(facial, "maintenance").verdict).toBe("kept_out");
     // A converted lead from years ago is not a visit to recall either.
@@ -729,12 +740,188 @@ describe("recalls that have lapsed", () => {
     expect(old.every((r) => r.verdict === "kept_out")).toBe(true);
   });
 
-  it("still books a session a little overdue, within recallWithinDays", () => {
+  it("still checks in on a sitting a little overdue, within recallWithinDays", () => {
     // Due 5 Sep, 26 days ago.
     const r = only(plan({ visits: [visit({ service: "Glycolic Peel", visitDate: "2026-08-15" })] }));
-    expect(r).toMatchObject({ journey: "next_session", verdict: "call_now" });
+    expect(r).toMatchObject({ journey: "course_checkin", verdict: "call_now" });
     const strict = planSettingsOf({ recallWithinDays: 20 });
     expect(only(plan({ visits: [visit({ service: "Glycolic Peel", visitDate: "2026-08-15" })] }, NOW, strict)).verdict).toBe("kept_out");
+  });
+});
+
+describe("a course of treatment: one call per sitting", () => {
+  const NOTE = " Timing is JENAI's default until the clinic's doctors confirm it.";
+  /** Laser toning, as Zenoti's sales report gives it: the default rule has 6 sittings 21 days apart, a result check after 10 days and maintenance after 90. */
+  const toning = (visitDate: string, over: Partial<PlanVisit> = {}) => visit({ service: "Laser Toning", visitDate, doctor: "Dr. Asha", branch: "Kondapur", system: "Zenoti", source: "api", ...over });
+  const laser = (visitDate: string, over: Partial<PlanVisit> = {}) => visit({ service: "LHR Full Legs", visitDate, ...over });
+  const live = (rows: PlanRow[]) => rows.filter((r) => r.verdict !== "kept_out");
+  const kinds = (rows: PlanRow[]) => rows.map((r) => r.journey).sort();
+
+  it("plans one check-in after the 4th of 6 sittings, where feedback, a result check and a recall were planned before", () => {
+    // Sittings on 30 Jun, 30 Jul, 3 Sep and 1 Oct; the plan worked out on Saturday 3 Oct.
+    const rows = plan({ visits: ["2026-06-30", "2026-07-30", "2026-09-03", "2026-10-01"].map((d) => toning(d)) }, ist("2026-10-03 12:00"));
+    const r = only(rows);
+    expect(r).toMatchObject({ journey: "course_checkin", programKey: "clinic.course_checkin", verdict: "scheduled", originLabel: "Zenoti visit", reason: `Sitting 5 of 6 of Laser Toning is due 21 days after the last, on Thu 1 Oct 2026.${NOTE}` });
+    // Three days before the next sitting is due on Thu 22 Oct.
+    expect(r.callAt).toEqual(ist("2026-10-19 10:00"));
+    expect(r.context).toEqual({ caller_name: "Anitha", treatment: "Laser Toning", last_visit: "2026-10-01", sitting_number: "4", sessions_left: "2", next_due: "2026-10-22", doctor: "Dr. Asha", branch: "Kondapur" });
+    expect(PLAN_JOURNEYS.course_checkin).toEqual({ program: "clinic.course_checkin", label: "Check in and book their next sitting", priority: 65 });
+    const order = Object.keys(PLAN_JOURNEYS);
+    expect(order.indexOf("course_checkin")).toBe(order.indexOf("result_check") + 1);
+    expect(order.indexOf("visit_feedback")).toBe(order.indexOf("course_checkin") + 1);
+  });
+
+  it("makes 8 calls over a course of 6 sittings: feedback and a check-in, a check-in each, then the result and maintenance", () => {
+    const days = ["2026-04-01", "2026-04-22", "2026-05-13", "2026-06-03", "2026-06-24", "2026-07-15"];
+    const after = days.map((_, k) => kinds(live(plan({ visits: days.slice(0, k + 1).map((d) => toning(d)) }, ist(`${days[k]} 18:00`)))));
+    expect(after).toEqual([
+      ["course_checkin", "visit_feedback"],
+      ["course_checkin"],
+      ["course_checkin"],
+      ["course_checkin"],
+      ["course_checkin"],
+      ["maintenance", "result_check"],
+    ]);
+    expect(after.flat()).toHaveLength(8);
+  });
+
+  it("asks about the first sitting, and checks in before the second", () => {
+    const rows = plan({ visits: [toning("2026-09-30")] });
+    expect(kinds(rows)).toEqual(["course_checkin", "visit_feedback"]);
+    expect(journey(rows, "visit_feedback")).toMatchObject({ verdict: "scheduled", callAt: ist("2026-10-02 10:00"), reason: "Visited on Wed 30 Sep 2026 for Laser Toning." });
+    const r = journey(rows, "course_checkin");
+    // 3 days before 21 Oct; it waits for the feedback call.
+    expect(r).toMatchObject({ verdict: "waiting", callAt: ist("2026-10-19 10:00") });
+    expect(r.context).toMatchObject({ sitting_number: "1", sessions_left: "5", next_due: "2026-10-21" });
+  });
+
+  it("checks in only, after a sitting partway through, going by the visit list's own count", () => {
+    const r = only(plan({ visits: [toning("2026-09-30", { sessionsDone: 3, sessionsTotal: 8 })] }));
+    expect(r).toMatchObject({ journey: "course_checkin", verdict: "scheduled", reason: `Sitting 4 of 8 of Laser Toning is due 21 days after the last, on Wed 30 Sep 2026.${NOTE}` });
+    expect(r.context).toMatchObject({ sitting_number: "3", sessions_left: "5" });
+  });
+
+  it("asks whether they see a difference after the last sitting, then books maintenance, and asks no feedback", () => {
+    const days = ["2026-06-03", "2026-06-24", "2026-07-15", "2026-08-05", "2026-09-09", "2026-09-30"];
+    const rows = plan({ visits: days.map((d) => toning(d)) });
+    expect(kinds(rows)).toEqual(["maintenance", "result_check"]);
+    const rc = journey(rows, "result_check");
+    expect(rc).toMatchObject({ programKey: "clinic.prescription_followup", verdict: "scheduled", reason: `Finished the course of Laser Toning on Wed 30 Sep 2026; results usually show by about 10 days.${NOTE}` });
+    expect(rc.callAt).toEqual(ist("2026-10-10 10:00"));
+    expect(journey(rows, "maintenance")).toMatchObject({ verdict: "waiting", callAt: ist("2026-12-29 10:00") });
+    // The clinic's own count says so too, with only that sitting on the list.
+    expect(kinds(plan({ visits: [toning("2026-09-30", { sessionsDone: 6, sessionsTotal: 6 })] }))).toEqual(["maintenance", "result_check"]);
+  });
+
+  it("treats the sitting that uses up a package as the last, whatever the treatment rule's count", () => {
+    const rows = plan({ visits: [laser("2026-09-30")], packages: [pack({ used: 5, balance: 0 })] });
+    expect(kinds(rows)).toEqual(["maintenance", "result_check"]);
+    expect(journey(rows, "result_check")).toMatchObject({ verdict: "scheduled", callAt: ist("2026-10-14 10:00") });
+    // A package of 8 with 4 left, against the rule's 6: the package decides.
+    const more = only(plan({ visits: [laser("2026-09-30")], packages: [pack({ total: 8, used: 4, balance: 4 })] }));
+    expect(more.context).toMatchObject({ sitting_number: "4", sessions_left: "4" });
+    expect(more.reason).toMatch(/^Sitting 5 of 8 of LHR Full Legs/);
+  });
+
+  it("gives a service done once its feedback, result check and maintenance, as before, and no check-in", () => {
+    const hifu = plan({ visits: [visit({ service: "HIFU Face", visitDate: "2026-09-30" })] });
+    expect(kinds(hifu)).toEqual(["maintenance", "result_check", "visit_feedback"]);
+    // A facial kept up every month is a service given once, then kept up: a maintenance gap and no number of sittings.
+    const facial = plan({ visits: [visit({ visitDate: "2026-08-31" }), visit({ visitDate: "2026-09-30" })] });
+    expect(kinds(facial)).toEqual(["maintenance", "result_check", "visit_feedback"]);
+  });
+
+  it("checks in before each sitting with no set number of them, saying nothing of sittings left", () => {
+    const r = only(plan({ visits: [visit({ service: "IV Drip", visitDate: "2026-08-20" }), visit({ service: "IV Drip", visitDate: "2026-09-20" })] }));
+    expect(r).toMatchObject({ journey: "course_checkin", verdict: "scheduled", reason: `The next sitting of IV Drip is due 30 days after the last, on Sun 20 Sep 2026.${NOTE}` });
+    expect(r.callAt).toEqual(ist("2026-10-17 10:00"));
+    expect(r.context).toEqual({ caller_name: "Anitha", treatment: "IV Drip", last_visit: "2026-09-20", sitting_number: "2", next_due: "2026-10-20" });
+  });
+
+  it("starts a new course after a break longer than the course gap", () => {
+    // Six sittings last year, then one this week: a new course, not a seventh sitting.
+    const old = ["2025-01-10", "2025-02-14", "2025-03-21", "2025-04-25", "2025-05-30", "2025-07-04"].map((d) => laser(d));
+    const rows = plan({ visits: [...old, laser("2026-09-30")] });
+    expect(kinds(rows)).toEqual(["course_checkin", "visit_feedback"]);
+    expect(journey(rows, "course_checkin").context).toMatchObject({ sitting_number: "1", sessions_left: "5" });
+    // 117 days since the last: longer than 2.5 times the 35-day gap, so a new course; a clinic that allows longer breaks keeps it the same.
+    const back = [laser("2026-05-01"), laser("2026-06-05"), laser("2026-09-30")];
+    expect(kinds(plan({ visits: back }))).toEqual(["course_checkin", "visit_feedback"]);
+    const same = only(plan({ visits: back }, NOW, planSettingsOf({ courseGapDays: 150 })));
+    expect(same.context).toMatchObject({ sitting_number: "3", sessions_left: "3" });
+  });
+
+  it("follows two treatments at once as two courses, one call at a time, and asks feedback once for a day", () => {
+    const rows = plan({ visits: [toning("2026-09-09"), laser("2026-08-26"), toning("2026-09-30"), laser("2026-09-30")] });
+    expect(kinds(rows)).toEqual(["course_checkin", "course_checkin"]);
+    const [lhr, ton] = [rows.find((r) => r.context.treatment === "LHR Full Legs")!, rows.find((r) => r.context.treatment === "Laser Toning")!];
+    expect(ton).toMatchObject({ verdict: "scheduled", callAt: ist("2026-10-19 10:00") });
+    // 3 days before 4 Nov is a Sunday, so Monday; it waits for the toning check-in.
+    expect(lhr).toMatchObject({ verdict: "waiting", callAt: ist("2026-11-02 10:00"), reason: "Another call to this person comes first: Check in and book their next sitting" });
+    // Both started the same day: one feedback call for that day.
+    const both = plan({ visits: [toning("2026-09-30"), laser("2026-09-30")] });
+    expect(kinds(both)).toEqual(["course_checkin", "course_checkin", "visit_feedback"]);
+    // Two areas under one treatment rule are one course: one check-in that names both.
+    const areas = only(plan({ visits: [laser("2026-09-02"), laser("2026-09-30"), laser("2026-09-30", { service: "LHR Underarms" })] }));
+    expect(areas.context).toMatchObject({ treatment: "LHR Full Legs and LHR Underarms", sitting_number: "2" });
+  });
+
+  it("makes no check-in when the next sitting is already booked: the reminder before it is the call", () => {
+    const visits = [toning("2026-09-09"), toning("2026-09-30")];
+    const rows = plan({ visits, bookings: [booking({ service: "Laser Toning - Face", startsAt: ist("2026-10-21 10:30") })] });
+    expect(journey(rows, "course_checkin")).toMatchObject({ verdict: "kept_out", reason: "Their next sitting is already booked in Zenoti for Wed 21 Oct 2026 at 10:30 AM: the reminder before it is the call." });
+    expect(journey(rows, "appointment_reminder")).toMatchObject({ verdict: "scheduled", callAt: ist("2026-10-20 18:00") });
+    // Booked in Zoho, with a date and no time.
+    const zoho = plan({ visits, records: [lead({ status: "Existing Client", treatment: "laser toning", appointmentAt: ist("2026-10-21 00:00"), appointmentHasTime: false })] });
+    expect(journey(zoho, "course_checkin")).toMatchObject({ verdict: "kept_out", reason: "Their next sitting is already booked in Zoho for Wed 21 Oct 2026: the reminder before it is the call." });
+    // A booking for something else: the check-in stands, after the reminder.
+    const other = plan({ visits, bookings: [booking({ service: "Hydrafacial", startsAt: ist("2026-10-21 10:30") })] });
+    expect(journey(other, "course_checkin")).toMatchObject({ verdict: "waiting", reason: "Another call to this person comes first: Remind them of their appointment" });
+    // A booking for it that was cancelled books nothing.
+    const off = plan({ visits, bookings: [booking({ service: "Laser Toning", startsAt: ist("2026-10-21 10:30"), status: "cancelled" })] });
+    expect(journey(off, "course_checkin").verdict).not.toBe("kept_out");
+  });
+
+  it("checks in a week after the sitting at the soonest, however short the gap to the next", () => {
+    // Body contouring every 7 days: 3 days before the next would be 4 days after this one.
+    const r = only(plan({ visits: [visit({ service: "Body Contouring", visitDate: "2026-09-23" }), visit({ service: "Body Contouring", visitDate: "2026-09-30" })] }));
+    expect(r.callAt).toEqual(ist("2026-10-07 10:00"));
+  });
+
+  it("checks in as many days before the next sitting as the clinic sets", () => {
+    const s = planSettingsOf({ checkinLeadDays: 7 });
+    const r = only(plan({ visits: [toning("2026-09-09"), toning("2026-09-30")] }, NOW, s));
+    expect(r.callAt).toEqual(ist("2026-10-14 10:00"));
+  });
+});
+
+describe("the cap on calls to one person", () => {
+  const calls = (...at: string[]) => at.map((x) => ist(x));
+
+  it("moves a call due now to when their calls in the last 30 days fall under the cap, and says so", () => {
+    const person = { visits: [visit({ visitDate: "2026-09-29" })], recentCalls: calls("2026-09-05 11:00", "2026-09-12 11:00", "2026-09-20 11:00") };
+    const fb = journey(plan(person), "visit_feedback");
+    // Due since 1 Oct; the third call back, on 5 Sep, is 30 days old on 5 Oct at 11:00.
+    expect(fb).toMatchObject({ verdict: "scheduled", callAt: ist("2026-10-05 11:00") });
+    expect(fb.reason).toBe("Visited on Tue 29 Sep 2026 for Hydrafacial. Moved to Mon 5 Oct 2026: they have had 3 calls since Sat 5 Sep 2026, and the plan settings allow 3 in any 30 days.");
+    // The result check, due on 6 Oct, is not moved: by then only 2 of those calls are in the 30 days before it.
+    expect(journey(plan(person), "result_check")).toMatchObject({ verdict: "waiting", callAt: ist("2026-10-06 10:00") });
+    // A clinic that allows 4: due now.
+    expect(journey(plan(person, NOW, planSettingsOf({ maxCallsPer30Days: 4 })), "visit_feedback").verdict).toBe("call_now");
+    // Two calls: this one is the third, allowed.
+    expect(journey(plan({ ...person, recentCalls: person.recentCalls.slice(1) }), "visit_feedback").verdict).toBe("call_now");
+  });
+
+  it("moves a call later in the month by the calls in the 30 days before it, after the gap between calls", () => {
+    const r = only(plan({ visits: [visit({ service: "Laser Toning", visitDate: "2026-09-09" }), visit({ service: "Laser Toning", visitDate: "2026-09-30" })], recentCalls: calls("2026-09-25 11:00", "2026-09-28 11:00", "2026-09-30 11:00"), lastCallAt: ist("2026-09-30 11:00") }));
+    // Due Mon 19 Oct; the third call back is 30 days old on Sun 25 Oct, so Monday.
+    expect(r).toMatchObject({ journey: "course_checkin", verdict: "scheduled", callAt: ist("2026-10-26 10:00") });
+    expect(r.reason).toMatch(/ Moved to Mon 26 Oct 2026: they have had 3 calls since Fri 25 Sep 2026, and the plan settings allow 3 in any 30 days\.$/);
+  });
+
+  it("never holds back an appointment reminder", () => {
+    const r = only(plan({ bookings: [booking()], recentCalls: calls("2026-09-25 11:00", "2026-09-28 11:00", "2026-09-30 11:00") }));
+    expect(r).toMatchObject({ journey: "appointment_reminder", verdict: "scheduled", callAt: ist("2026-10-01 18:00") });
   });
 });
 
@@ -816,12 +1003,12 @@ describe("the front desk under the plan's own rules", () => {
     expect(journey(after, "cancelled_rebook").verdict).toBe("call_now");
   });
 
-  it("books sessions left on a package they paid for however long ago the last was, while a recall with no package lapses", () => {
+  it("books sessions left on a package they paid for however long ago the last was, while a course with no package lapses", () => {
     const paid = only(plan({ visits: [laser("2026-03-01")], packages: [pack()] }));
-    expect(paid).toMatchObject({ journey: "next_session", verdict: "call_now" });
-    expect(paid.reason).toMatch(/^Session 4 of 5 of LHR Full Legs is due 35 days after the last, on Sun 1 Mar 2026\./);
+    expect(paid).toMatchObject({ journey: "course_checkin", verdict: "call_now" });
+    expect(paid.reason).toMatch(/^Sitting 4 of 5 of LHR Full Legs is due 35 days after the last, on Sun 1 Mar 2026\./);
     expect(only(plan({ visits: [laser("2026-03-01")] }))).toMatchObject({
-      journey: "next_session",
+      journey: "course_checkin",
       verdict: "kept_out",
       reason: "Lapsed: last had LHR Full Legs on Sun 1 Mar 2026. A call now would be a win-back offer, which needs a promotional number and consent.",
     });
@@ -958,6 +1145,9 @@ describe("plan settings", () => {
     expect(planSettingsOf(null)).toEqual(DEFAULT_PLAN_SETTINGS);
     expect(planSettingsOf({ packageEndingWithinDays: 7 }).packageEndingWithinDays).toBe(7);
     expect(planSettingsOf({ packageEndingWithinDays: 500 }).packageEndingWithinDays).toBe(30);
+    const course = planSettingsOf({ checkinLeadDays: 5, maxCallsPer30Days: 0, courseGapDays: 90 });
+    expect([course.checkinLeadDays, course.maxCallsPer30Days, course.courseGapDays]).toEqual([5, 3, 90]);
+    expect([DEFAULT_PLAN_SETTINGS.checkinLeadDays, DEFAULT_PLAN_SETTINGS.maxCallsPer30Days, DEFAULT_PLAN_SETTINGS.courseGapDays]).toEqual([3, 3, 60]);
   });
 });
 
@@ -1077,6 +1267,32 @@ describe("replanning a client", () => {
     expect(after).toMatchObject({ waitingForPhone: 0, people: before.people + 1 });
     expect((await stored()).find((r) => r.originId === v!.id && r.journey === "visit_feedback")).toMatchObject({ verdict: "scheduled", phoneE164: phone(8) });
   });
+
+  it("holds a call back by the calls made to them in the last 30 days, counting only those that left the dialer", async () => {
+    const call = (at: string, over: Partial<typeof calls.$inferInsert> = {}) => ({ tenantId: org, direction: "outbound" as const, externalRunId: `run-${randomUUID()}`, toE164: phone(7), startedAt: ist(at), status: "completed" as const, ...over });
+    const made = await withTenant(org, (tx) =>
+      tx
+        .insert(calls)
+        .values([
+          call("2026-09-05 11:00"),
+          call("2026-09-12 11:00", { status: "no_answer" }),
+          call("2026-09-20 11:00"),
+          // Neither counts: a call they made to the clinic, and one that never left the dialer.
+          call("2026-09-25 11:00", { direction: "inbound", fromE164: phone(7), toE164: "+914000000000" }),
+          call("2026-09-26 11:00", { status: "failed" }),
+        ])
+        .returning({ id: calls.id }),
+    );
+    try {
+      await replanTenant(org, { now: NOW });
+      const fb = (await stored()).find((r) => r.phoneE164 === phone(7) && r.journey === "visit_feedback")!;
+      // Due on Fri 2 Oct; 3 calls since 5 Sep, so it waits until that one is 30 days old.
+      expect(fb).toMatchObject({ verdict: "scheduled", callAt: ist("2026-10-05 11:00") });
+      expect(fb.reason).toBe("Visited on Wed 30 Sep 2026 for Hydrafacial. Moved to Mon 5 Oct 2026: they have had 3 calls since Sat 5 Sep 2026, and the plan settings allow 3 in any 30 days.");
+    } finally {
+      await withTenant(org, (tx) => tx.delete(calls).where(inArray(calls.id, made.map((m) => m.id))));
+    }
+  });
 });
 
 describe("replanning a client with a front desk system", () => {
@@ -1098,7 +1314,7 @@ describe("replanning a client with a front desk system", () => {
       const [zoho] = await tx.insert(integrations).values({ tenantId: org, kind: "zoho_crm", name: "Zoho" }).returning();
       const [desk] = await tx.insert(integrations).values({ tenantId: org, kind: "zenoti", name: "Zenoti", direction: "in" }).returning();
       zenoti = desk!.id;
-      for (const programKey of ["clinic.appointment_reminder", "clinic.warm_followup", "clinic.feedback", "clinic.prescription_followup", "clinic.revisit_recall"])
+      for (const programKey of ["clinic.appointment_reminder", "clinic.warm_followup", "clinic.feedback", "clinic.prescription_followup", "clinic.revisit_recall", "clinic.course_checkin"])
         await tx.insert(clientPrograms).values({ tenantId: org, programKey, programVersion: 1, name: programKey });
       const rec = (externalId: string, p: string, appointmentAt: string) => ({
         tenantId: org,
@@ -1172,7 +1388,7 @@ describe("replanning a client with a front desk system", () => {
     expect(first.byJourney.appointment_reminder).toEqual({ scheduled: 2, kept_out: 1 });
     expect(first.byJourney.no_show_rebook).toEqual({ call_now: 1 });
     expect(first.byJourney.cancelled_rebook).toEqual({ call_now: 1 });
-    expect(first.byJourney.next_session).toEqual({ call_now: 1 });
+    expect(first.byJourney.course_checkin).toEqual({ scheduled: 1 });
     expect(first.byJourney.appointment_unclear).toBeUndefined();
 
     const rows = await stored();
@@ -1191,10 +1407,13 @@ describe("replanning a client with a front desk system", () => {
     expect(of(rows, "a3", "cancelled_rebook")).toMatchObject({ verdict: "call_now", priority: 25, programKey: "clinic.warm_followup", reason: "Cancelled their appointment for Consultation booked for Mon 28 Sep 2026." });
     expect(rows.some((r) => r.originId === ids.zoho4)).toBe(false);
     expect(of(rows, "v4", "visit_feedback")?.verdict).toBe("call_now");
-    expect(of(rows, "v5", "next_session")).toMatchObject({
-      verdict: "call_now",
-      reason: "2 sessions left, package ends on Mon 12 Oct 2026: called now so they can book before it does. Session 4 of 5 of LHR Full Legs is next; the last was on Wed 30 Sep 2026.",
+    expect(of(rows, "v5", "course_checkin")).toMatchObject({
+      verdict: "scheduled",
+      callAt: ist("2026-10-07 10:00"),
+      reason: "2 sessions left, package ends on Mon 12 Oct 2026: called in time to book before it does. Sitting 4 of 5 of LHR Full Legs is next; the last was on Wed 30 Sep 2026.",
     });
+    // Their third sitting of the package: no feedback call, no result check.
+    expect(rows.filter((r) => r.originId === ids.v5).map((r) => r.journey)).toEqual(["course_checkin"]);
     expect(of(rows, "a6", "appointment_reminder")).toMatchObject({ verdict: "scheduled", phoneE164: phone(6) });
     expect(of(rows, "a6", "appointment_reminder")!.callAt).toEqual(ist("2026-10-03 18:00"));
     expect(rows.some((r) => r.originId === ids.a7)).toBe(false);
@@ -1221,7 +1440,7 @@ describe("replanning a client with a front desk system", () => {
       await tx.update(packageBalances).set({ used: 5, balance: 0 }).where(eq(packageBalances.integrationId, zenoti));
     });
     const r = await replanTenant(org, { now: NOW });
-    // Gone: 1's reminder from the booking now cancelled, and 5's next session. 2's no-show call went with the booking, when it was deleted.
+    // Gone: 1's reminder from the booking now cancelled, and 5's check-in. 2's no-show call went with the booking, when it was deleted.
     expect(r.removed).toBe(2);
     const rows = await stored();
     expect(of(rows, "a3", "cancelled_rebook")).toMatchObject({ verdict: "kept_out", reason: "Cancelled their appointment for Consultation booked for Mon 28 Sep 2026, but is booked again for Tue 6 Oct 2026." });
@@ -1229,9 +1448,11 @@ describe("replanning a client with a front desk system", () => {
     expect(of(rows, "zoho1", "appointment_reminder")).toMatchObject({ verdict: "kept_out", reason: "Cancelled in Zenoti for Fri 2 Oct 2026 at 11:00 AM: no reminder, as Zenoti is the clinic's own system." });
     expect(of(rows, "a1", "cancelled_rebook")).toMatchObject({ verdict: "call_now", reason: "Cancelled their appointment for Hydrafacial booked for Fri 2 Oct 2026." });
     expect(rows.some((x) => x.originId === ids.a2)).toBe(false);
-    expect(of(rows, "v5", "next_session")).toBeUndefined();
-    // Maintenance, six months on, waiting behind the feedback call on the visit.
+    expect(of(rows, "v5", "course_checkin")).toBeUndefined();
+    // Their last sitting: whether they see a difference 14 days on, then maintenance six months on, waiting behind it.
+    expect(of(rows, "v5", "result_check")).toMatchObject({ verdict: "scheduled", callAt: ist("2026-10-14 10:00"), reason: expect.stringMatching(/^Finished the course of LHR Full Legs on Wed 30 Sep 2026; results usually show by about 14 days\./) });
     expect(of(rows, "v5", "maintenance")).toMatchObject({ verdict: "waiting", callAt: ist("2027-03-29 10:00") });
+    expect(of(rows, "v5", "visit_feedback")).toBeUndefined();
   });
 
   it("plans a visit read before its number by its guest's number once known, unless it copies a visit they have", async () => {

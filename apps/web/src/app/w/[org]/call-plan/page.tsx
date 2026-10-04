@@ -212,7 +212,7 @@ export default async function CallPlanPage({ params, searchParams }: { params: P
         ) : null}
 
         {canUpload ? (
-          <Section title="Upload visit list" sub="The services people actually took, from your billing or front-desk software. Each visit becomes its feedback call, result check or next session in the plan.">
+          <Section title="Upload visit list" sub="The services people actually took, from your billing or front-desk software. Each visit becomes its feedback call, course check-in, result check or maintenance call in the plan.">
             <VisitUploadForm slug={slug} />
           </Section>
         ) : null}

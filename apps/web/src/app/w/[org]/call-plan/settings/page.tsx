@@ -55,8 +55,11 @@ const NUMBERS: Array<{ key: string; label: string; help: string }> = [
   { key: "checkInAfterDays", label: "Check-in this many days after a consultation", help: "" },
   { key: "feedbackWithinDays", label: "Ask for feedback while the visit is this recent (days)", help: "" },
   { key: "resultCheckWithinDays", label: "Result check up to this many days past due", help: "" },
-  { key: "recallWithinDays", label: "Next session or maintenance up to this many days past due", help: "Later, a call is a win-back offer, which needs a promotional number and consent. Sessions left on a package they paid for are always theirs to book." },
-  { key: "packageEndingWithinDays", label: "Call about a package ending within (days)", help: "From your front desk system (Zenoti): sessions left on a package that ends this soon are called about now, so they can use what they paid for." },
+  { key: "recallWithinDays", label: "Course check-in or maintenance up to this many days past due", help: "Later, a call is a win-back offer, which needs a promotional number and consent. Sessions left on a package they paid for are always theirs to book." },
+  { key: "packageEndingWithinDays", label: "Call about a package ending within (days)", help: "From your front desk system (Zenoti): sessions left on a package that ends this soon are called about in time, so they can use what they paid for." },
+  { key: "checkinLeadDays", label: "Course check-in this many days before the next sitting is due", help: "The one call between sittings: how they have been, whether they see a difference, and booking the next. Never sooner than a week after the sitting, and none when the next sitting is already booked." },
+  { key: "courseGapDays", label: "A break longer than this starts a new course (days)", help: "Or 2.5 times the treatment's days between sessions, when that is longer." },
+  { key: "maxCallsPer30Days", label: "Most calls to one person in any 30 days", help: "A later call waits until the 30 days allow it. Appointment reminders are not held back by this." },
 ];
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
