@@ -26,6 +26,7 @@ export const CLIENT_MODULES = {
       "contacts:reveal_phone": "See full phone numbers",
       "contacts:import": "Import contacts (with consent attestation)",
       "contacts:export": "Export contacts",
+      "visits:import": "Upload the visit list (services people took)",
     },
   },
   campaigns: {

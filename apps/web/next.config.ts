@@ -13,6 +13,9 @@ const nextConfig: NextConfig = {
   serverExternalPackages: ["postgres"],
   poweredByHeader: false,
   typedRoutes: false,
+  // A clinic's visit list is uploaded through a server action and may be up to 5 MB (the
+  // action refuses more); the default 1 MB would cut it off before the action could say why.
+  experimental: { serverActions: { bodySizeLimit: "6mb" } },
   async headers() {
     return [
       {
