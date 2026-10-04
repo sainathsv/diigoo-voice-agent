@@ -48,6 +48,8 @@ async function importFile() {
   console.log(`\n  call plan  ${r.plan.people} people: ${v.call_now} to call now, ${v.scheduled} scheduled, ${v.waiting} waiting for another call, ${v.kept_out} kept out`);
   const w = r.plan.waitingForPhone;
   if (w) console.log(`    ${w} ${w === 1 ? "visit" : "visits"} from a connected system waiting for a phone number, not planned yet`);
+  const m = r.plan.marketingConsent;
+  if (m) console.log(`    ${m} ${m === 1 ? "person has" : "people have"} agreed to marketing SMS in their front desk system (a count only: no call is planned on it)`);
   for (const j of ["visit_feedback", "result_check", "next_session", "maintenance"] as const) {
     const n = r.plan.byJourney[j];
     if (n) console.log(`    ${j.padEnd(16)} ${Object.entries(n).map(([k, c]) => `${c} ${k.replace("_", " ")}`).join(", ")}`);

@@ -1371,7 +1371,8 @@ export const callPlanSettings = pgTable("call_plan_settings", {
 
 export const PLANNED_CALL_VERDICTS = ["call_now", "scheduled", "waiting", "kept_out"] as const;
 export type PlannedCallVerdict = (typeof PLANNED_CALL_VERDICTS)[number];
-export const PLAN_ORIGIN_TYPES = ["crm_record", "visit"] as const;
+/** What prompts a planned call: a CRM record, a visit, or a booking at the clinic's front desk (migration 0032). */
+export const PLAN_ORIGIN_TYPES = ["crm_record", "visit", "clinic_appointment"] as const;
 export type PlanOriginType = (typeof PLAN_ORIGIN_TYPES)[number];
 
 /**

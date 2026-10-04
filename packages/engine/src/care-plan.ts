@@ -2,31 +2,40 @@
  * The call plan: for every person in a client's records, which call JENAI
  * would make, when and why, or why it would not call them at all.
  *
- * Two sources: the client's CRM as last read (crm_records: enquiries,
- * callbacks, appointments) and the services people actually took (visits,
- * from the clinic's own software). planPerson() decides for one person and is
- * pure; replanTenant() reads one client's sources, plans everyone and stores
- * the result in planned_calls.
+ * Three sources: the client's CRM as last read (crm_records: enquiries,
+ * callbacks, appointments), the services people actually took (visits, from
+ * the clinic's own software), and what their front desk system (Zenoti) says
+ * besides: bookings coming up, missed or cancelled (clinic_appointments), and
+ * sessions left on packages (package_balances). planPerson() decides for one
+ * person and is pure; replanTenant() reads one client's sources, plans
+ * everyone and stores the result in planned_calls.
  *
  * This is a preview. Nothing here dials, creates campaign targets or writes to
  * the client's CRM. No promotional call is ever planned: an offer needs a
- * promotional number and recorded consent, which a plan cannot assume.
+ * promotional number and recorded consent, which a plan cannot assume. The
+ * SMS consents read from a front desk system are counted, never planned on.
  */
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import {
+  branches,
   callPlanSettings,
   calls,
   clientPrograms,
+  clinicAppointments,
   contacts,
   crmRecords,
+  externalPeople,
   integrations,
   organizations,
+  packageBalances,
   plannedCalls,
   suppressionReason,
   suppressions,
   treatmentRules,
   visits,
   withTenant,
+  type ClinicAppointmentStatus,
+  type PackageStatus,
   type PlanOriginType,
   type PlannedCallVerdict,
   type TreatmentRule,
@@ -59,6 +68,7 @@ export const PLAN_JOURNEYS = {
   callback_due: { program: "clinic.warm_followup", label: "Call back on the date the team noted", priority: 50 },
   new_enquiry: { program: "clinic.warm_followup", label: "Call to book a consultation", priority: 40 },
   no_show_rebook: { program: "clinic.warm_followup", label: "They missed their appointment: call to rebook", priority: 30 },
+  cancelled_rebook: { program: "clinic.warm_followup", label: "They cancelled: call to rebook", priority: 25 },
   next_session: { program: "clinic.revisit_recall", label: "Book their next session", priority: 20 },
   maintenance: { program: "clinic.revisit_recall", label: "Book their maintenance session", priority: 10 },
   appointment_unclear: { program: "", label: "Appointment outcome unknown", priority: 0 },
@@ -70,7 +80,7 @@ export type PlanJourney = keyof typeof PLAN_JOURNEYS;
 const FRESH_ENQUIRY_PRIORITY = 55;
 
 /** Calls whose point is to get them booked: an appointment already coming up makes them wait. */
-const BOOKING_JOURNEYS = new Set<PlanJourney>(["callback_due", "new_enquiry", "no_show_rebook", "next_session", "maintenance"]);
+const BOOKING_JOURNEYS = new Set<PlanJourney>(["callback_due", "new_enquiry", "no_show_rebook", "cancelled_rebook", "next_session", "maintenance"]);
 
 /** The variables each program's script fills in (packages/db/seed-data/programs). */
 const PROGRAM_VARIABLES: Record<string, readonly string[]> = {
@@ -112,6 +122,8 @@ export interface PlanSettings {
   feedbackWithinDays: number;
   /** A result check is made only this many days past its due date. */
   resultCheckWithinDays: number;
+  /** A package with sessions left that ends within this many days is called about now, not at the usual gap. */
+  packageEndingWithinDays: number;
   /** The client's time zone, from their organisation. Not a setting they edit here. */
   timezone: string;
 }
@@ -133,10 +145,11 @@ export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
   checkInAfterDays: 3,
   feedbackWithinDays: 14,
   resultCheckWithinDays: 30,
+  packageEndingWithinDays: 30,
   timezone: "Asia/Kolkata",
 };
 
-type NumberKey = "freshDays" | "minGapDays" | "reminderHour" | "consultationWithinDays" | "checkInAfterDays" | "feedbackWithinDays" | "resultCheckWithinDays";
+type NumberKey = "freshDays" | "minGapDays" | "reminderHour" | "consultationWithinDays" | "checkInAfterDays" | "feedbackWithinDays" | "resultCheckWithinDays" | "packageEndingWithinDays";
 type ListKey = "openStatuses" | "bookedStatuses" | "noShowStatuses" | "customerStatuses" | "neverStatuses" | "doNotCallStatuses" | "centres" | "contactOnlyModules";
 const NUMBER_LIMITS: Record<NumberKey, [number, number]> = {
   freshDays: [1, 365],
@@ -146,6 +159,7 @@ const NUMBER_LIMITS: Record<NumberKey, [number, number]> = {
   checkInAfterDays: [0, 60],
   feedbackWithinDays: [1, 90],
   resultCheckWithinDays: [1, 180],
+  packageEndingWithinDays: [0, 180],
 };
 const LIST_KEYS: ListKey[] = ["openStatuses", "bookedStatuses", "noShowStatuses", "customerStatuses", "neverStatuses", "doNotCallStatuses", "centres", "contactOnlyModules"];
 
@@ -301,14 +315,45 @@ export interface PlanVisit {
   source?: string;
 }
 
+/** A booking in the clinic's front desk system (a clinic_appointments row). */
+export interface PlanBooking {
+  id: string;
+  /** The system it came from, as the clinic knows it: "Zenoti". */
+  system?: string;
+  name?: string | null;
+  service: string;
+  startsAt: Date;
+  status: ClinicAppointmentStatus;
+  doctor?: string | null;
+  /** The branch it is at, by name. */
+  centre?: string | null;
+}
+
+/** Sessions on one package for one service in it (a package_balances row). */
+export interface PlanPackage {
+  /** The system it came from, as the clinic knows it: "Zenoti". */
+  system?: string;
+  service: string;
+  total?: number | null;
+  used?: number | null;
+  balance?: number | null;
+  status: PackageStatus;
+  /** "2026-12-31" */
+  expiresOn?: string | null;
+}
+
 export type SuppressionReason = (typeof suppressionReason.enumValues)[number];
 
-/** Everything known about one person: every record and visit with their number. */
+/** Everything known about one person: every record, visit, booking and package with their number. */
 export interface PlanPerson {
   /** Their number in E.164, or null for a record whose number could not be read. */
   phone: string | null;
   records: PlanRecord[];
   visits: PlanVisit[];
+  /** Bookings in their front desk system, whatever came of them. */
+  bookings?: PlanBooking[];
+  /** Packages in their front desk system, one per service in each. */
+  packages?: PlanPackage[];
   /** Live do-not-call entries for the number, the client's and the platform's. */
   suppressions?: Array<{ reason: SuppressionReason; expiresAt?: Date | null }>;
   /** Their last call with this client, either way. */
@@ -375,6 +420,7 @@ interface Ctx {
   today: string;
   lastCallAt: Date | null;
   personName: string | null;
+  packages: readonly PlanPackage[];
 }
 
 /** A visit as the plan reads it, uploaded or read off a customer's CRM record. */
@@ -397,6 +443,7 @@ interface VisitIn {
  */
 export function planPerson(person: PlanPerson, settings: PlanSettings, rules: readonly PlanRule[], now: Date): PlanRow[] {
   const tz = settings.timezone;
+  const bookings = person.bookings ?? [];
   const c: Ctx = {
     s: settings,
     rules,
@@ -404,7 +451,8 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
     tz,
     today: dayOf(now, tz),
     lastCallAt: person.lastCallAt ?? null,
-    personName: person.records.find((r) => r.name)?.name ?? person.visits.find((v) => v.name)?.name ?? null,
+    personName: person.records.find((r) => r.name)?.name ?? person.visits.find((v) => v.name)?.name ?? bookings.find((b) => b.name)?.name ?? null,
+    packages: person.packages ?? [],
   };
   const drafts: Draft[] = [];
   const uploaded = person.visits.filter((v) => v.visitDate <= c.today).map((v) => visitIn(v));
@@ -412,12 +460,32 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
   const derived: VisitIn[] = [];
   const isContactOnly = (r: PlanRecord) => !statusOf(r.status) && inList(settings.contactOnlyModules, r.module);
   const hasEnquiry = person.records.some((r) => !isContactOnly(r));
+  // Their front desk system is the clinic's own record of bookings: a reminder goes by it before any CRM's.
+  const upcoming = bookings.filter((b) => isBooked(b.status) && b.startsAt > now).sort((a, b) => a.startsAt.getTime() - b.startsAt.getTime());
+  const frontDesk = upcoming[0];
+  // A CRM booking whose date has passed is answered by a visit or a no-show at the front desk on or after it, or a cancellation there that day.
+  const answered = (appt: Date) => {
+    const day = dayOf(appt, tz);
+    if (uploaded.some((v) => v.day >= day)) return true;
+    return bookings.some((b) => {
+      const d = dayOf(b.startsAt, tz);
+      return ((b.status === "completed" || b.status === "no_show") && d >= day) || (b.status === "cancelled" && d === day);
+    });
+  };
+  // A CRM booking still to come: the front desk's own booking, or its cancellation that day, speaks for it.
+  const crmReminder = (o: Origin, appt: Date, values: Values) => {
+    if (frontDesk) return byFrontDesk(o, frontDesk, c);
+    const off = cancelledOn(bookings, appt, c);
+    if (off) return keep("appointment_reminder", o, `Cancelled in ${systemOf(off)} for ${whenText(off.startsAt, c)}: no reminder, as ${systemOf(off)} is the clinic's own system.`);
+    return reminderRow(appt, o, values, c);
+  };
+  const again = (at: Date) => bookedAgain(at, person.records, bookings, uploaded, c);
 
   for (const r of person.records) {
     const o = recordOrigin(r);
     const crm = r.crm ?? "their CRM";
     if (isContactOnly(r)) {
-      if (!hasEnquiry && !uploaded.length) drafts.push(keep("no_call", o, `Only in ${crm} ${r.module}: no enquiry or visit on record.`));
+      if (!hasEnquiry && !uploaded.length && !bookings.length) drafts.push(keep("no_call", o, `Only in ${crm} ${r.module}: no enquiry or visit on record.`));
       continue;
     }
     switch (classOf(r.status, settings)) {
@@ -431,15 +499,16 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
         drafts.push(...enquiryRows(r, o, c));
         break;
       case "booked":
-        // Still booked in their CRM, but the visit list shows they came: the visit speaks for it.
-        if (!(r.appointmentAt && r.appointmentAt <= now && uploadedDays.has(dayOf(r.appointmentAt, tz)))) drafts.push(bookedRow(r, o, c));
+        // Still booked in their CRM, but the visit list or front desk shows what happened: that speaks for it.
+        if (r.appointmentAt && r.appointmentAt <= now && answered(r.appointmentAt)) break;
+        drafts.push(bookedRow(r, o, c, crmReminder));
         break;
       case "no_show":
-        drafts.push(noShowRow(r, o, c));
+        drafts.push(noShowRow(r, o, c, again));
         break;
       case "customer": {
         const appt = r.appointmentAt;
-        if (appt && appt > now) drafts.push(reminderRow(r, o, c));
+        if (appt && appt > now) drafts.push(crmReminder(o, appt, recordValues(r, c)));
         else if (appt) {
           // Their visit, unless the visit list already has that day.
           const day = dayOf(appt, tz);
@@ -452,6 +521,7 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
     }
   }
 
+  drafts.push(...bookingRows(bookings, upcoming, again, c));
   const all = [...uploaded, ...derived];
   drafts.push(...visitRows(all, c));
   // Everyone shows in the plan, including a patient none of whose calls is due any more.
@@ -459,6 +529,7 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
     const last = all.reduce((a, b) => (b.day > a.day ? b : a));
     drafts.push(keep("no_call", last.origin, `Last visit on ${dateText(last.day)}${last.service ? ` for ${last.service}` : ""}: no call about it is due any more.`));
   }
+  if (!drafts.length && bookings.length) drafts.push(lastBookingRow(bookings, c));
 
   const live = (d: Draft) => d.verdict === "call_now" || d.verdict === "scheduled";
   const out = (d: Draft, reason: string) => Object.assign(d, { verdict: "kept_out" as const, reason, callAt: null, priority: 0 });
@@ -555,11 +626,11 @@ function enquiryRows(r: PlanRecord, o: Origin, c: Ctx): Draft[] {
 
 const coldCall = (F: number) => `Older than ${F} days counts as a cold call, which needs a promotional number and consent.`;
 
-function bookedRow(r: PlanRecord, o: Origin, c: Ctx): Draft {
+function bookedRow(r: PlanRecord, o: Origin, c: Ctx, remind: (o: Origin, appt: Date, values: Values) => Draft): Draft {
   const crm = r.crm ?? "their CRM";
   if (!r.appointmentAt) return keep("appointment_reminder", o, `${crm} says booked but has no appointment date, so JENAI cannot remind them. Add the date in ${crm}.`);
   if (r.appointmentAt <= c.now) return keep("appointment_unclear", o, `Their appointment date has passed and ${crm} still says booked, so JENAI cannot tell if they came. Update the status in ${crm}.`);
-  return reminderRow(r, o, c);
+  return remind(o, r.appointmentAt, recordValues(r, c));
 }
 
 /**
@@ -567,11 +638,9 @@ function bookedRow(r: PlanRecord, o: Origin, c: Ctx): Draft {
  * evening before is not one), or 3 hours before an appointment later today.
  * Not moved by the gap between calls: they expect it, and it is tied to the day.
  */
-function reminderRow(r: PlanRecord, o: Origin, c: Ctx): Draft {
-  const appt = r.appointmentAt!;
+function reminderRow(appt: Date, o: Origin, values: Values, c: Ctx, about = ""): Draft {
   const day = dayOf(appt, c.tz);
-  const when = `${dateText(day)} at ${timeText(appt, c.tz)}`;
-  const values = recordValues(r, c);
+  const when = whenText(appt, c);
   if (appt.getTime() - c.now.getTime() < REMINDER_CUTOFF_MS) return keep("appointment_reminder", o, `Their appointment on ${when} is under 2 hours away: too close for a reminder call.`);
   let target: Date | null = null;
   if (day !== c.today) {
@@ -582,10 +651,16 @@ function reminderRow(r: PlanRecord, o: Origin, c: Ctx): Draft {
   const due = target <= c.now;
   const at = nextWindowStart(due ? c.now : target, c.s.callingWindow, c.tz);
   if (at.getTime() > appt.getTime() - REMINDER_CUTOFF_MS) return keep("appointment_reminder", o, `No calling hours are left far enough before their appointment on ${when} for a reminder call.`);
-  return { origin: o, journey: "appointment_reminder", verdict: due ? "call_now" : "scheduled", reason: `Appointment on ${when}.`, callAt: at, priority: PLAN_JOURNEYS.appointment_reminder.priority, values };
+  return { origin: o, journey: "appointment_reminder", verdict: due ? "call_now" : "scheduled", reason: `Appointment on ${when}${about}.`, callAt: at, priority: PLAN_JOURNEYS.appointment_reminder.priority, values };
 }
 
-function noShowRow(r: PlanRecord, o: Origin, c: Ctx): Draft {
+/** A CRM's booking while their front desk has them booked: one reminder, from the front desk, which keeps the clinic's own diary. */
+function byFrontDesk(o: Origin, b: PlanBooking, c: Ctx): Draft {
+  const sys = systemOf(b);
+  return keep("appointment_reminder", o, `Booked in ${sys} for ${whenText(b.startsAt, c)}: the reminder goes by ${sys}, the clinic's own system.`);
+}
+
+function noShowRow(r: PlanRecord, o: Origin, c: Ctx, again: (at: Date) => string | null): Draft {
   const crm = r.crm ?? "their CRM";
   const ref = r.appointmentAt ?? r.createdExt ?? null;
   if (!ref) return keep("no_show_rebook", o, `${crm} has no appointment or enquiry date for this record, so JENAI cannot tell how recent it is.`);
@@ -593,25 +668,140 @@ function noShowRow(r: PlanRecord, o: Origin, c: Ctx): Draft {
   const ago = Math.max(0, daysBetween(day, c.today));
   const what = r.appointmentAt ? `Missed their appointment on ${dateText(day)}` : `Marked "${r.status}" in ${crm}, enquiry from ${dateText(day)}`;
   if (ago > c.s.freshDays) return keep("no_show_rebook", o, `${r.appointmentAt ? "Missed their appointment" : "Enquired"} ${plural(ago, "day")} ago. ${coldCall(c.s.freshDays)}`);
+  const since = again(ref);
+  if (since) return keep("no_show_rebook", o, `${what}, but ${since}.`);
   return callable("no_show_rebook", o, c.now, `${what}.`, recordValues(r, c), c);
+}
+
+// ---------------------------------------------------------------- bookings at their front desk
+
+const isBooked = (s: ClinicAppointmentStatus) => s === "booked" || s === "confirmed";
+const systemOf = (x: { system?: string }) => x.system ?? "their front desk system";
+/** Their front desk's cancellation on the day of `at`, if there is one. */
+const cancelledOn = (bookings: readonly PlanBooking[], at: Date, c: Ctx) => bookings.find((b) => b.status === "cancelled" && dayOf(b.startsAt, c.tz) === dayOf(at, c.tz));
+
+/**
+ * From their front desk: a reminder for each day they are booked, and a call
+ * to rebook their latest missed or cancelled booking. Several services
+ * booked for one day are one visit to them, so one reminder, for the first.
+ */
+function bookingRows(bookings: readonly PlanBooking[], upcoming: readonly PlanBooking[], again: (at: Date) => string | null, c: Ctx): Draft[] {
+  const rows: Draft[] = [];
+  const days = new Map<string, PlanBooking[]>();
+  for (const b of upcoming) {
+    const day = dayOf(b.startsAt, c.tz);
+    const list = days.get(day);
+    if (list) list.push(b);
+    else days.set(day, [b]);
+  }
+  for (const list of days.values()) {
+    const first = list[0]!;
+    const services = [...new Set(list.map((b) => b.service.trim()).filter(Boolean))];
+    rows.push(reminderRow(first.startsAt, bookingOrigin(first), bookingValues(first, c), c, `${services.length ? ` for ${listText(services)}` : ""}, booked in ${systemOf(first)}`));
+  }
+  // Only the latest missed booking: one call to rebook answers any before it. On one day, a no-show before a cancellation.
+  const missed = bookings
+    .filter((b) => b.status === "no_show" || b.status === "cancelled")
+    .sort((a, b) => dayOf(b.startsAt, c.tz).localeCompare(dayOf(a.startsAt, c.tz)) || Number(b.status === "no_show") - Number(a.status === "no_show") || a.startsAt.getTime() - b.startsAt.getTime())[0];
+  const row = missed ? missedRow(missed, again, c) : null;
+  if (row) rows.push(row);
+  return rows;
+}
+
+/** A call to rebook a no-show or a cancellation, unless they have booked again or come in since. */
+function missedRow(b: PlanBooking, again: (at: Date) => string | null, c: Ctx): Draft | null {
+  const o = bookingOrigin(b);
+  const noShow = b.status === "no_show";
+  const journey: PlanJourney = noShow ? "no_show_rebook" : "cancelled_rebook";
+  const day = dayOf(b.startsAt, c.tz);
+  const ago = daysBetween(day, c.today);
+  const service = b.service.trim() ? ` for ${b.service.trim()}` : "";
+  const what = noShow ? `Missed their appointment on ${dateText(day)}${service}` : `Cancelled their appointment${service} booked for ${dateText(day)}`;
+  const since = again(b.startsAt);
+  // Long past and followed by another booking, a missed one is history, and not worth a row of its own.
+  if (since) return ago <= c.s.freshDays ? keep(journey, o, `${what}, but ${since}.`) : null;
+  if (ago > c.s.freshDays) return keep(journey, o, `${noShow ? "Missed their appointment" : "Their cancelled appointment was"} ${plural(ago, "day")} ago. ${coldCall(c.s.freshDays)}`);
+  return callable(journey, o, c.now, `${what}.`, bookingValues(b, c), c);
+}
+
+/**
+ * How they have moved on since missing a booking at `at` (or since now, for
+ * one cancelled ahead of its day), in words, or null: a booking still to
+ * come, at the front desk or in their CRM, first; else a visit on or after
+ * that day; else a later booking whose outcome is not known.
+ */
+function bookedAgain(at: Date, records: readonly PlanRecord[], bookings: readonly PlanBooking[], visits: readonly VisitIn[], c: Ctx): string | null {
+  const from = at < c.now ? at : c.now;
+  const holding = (b: PlanBooking) => isBooked(b.status) || b.status === "checked_in";
+  const ahead = [
+    ...bookings.filter((b) => holding(b) && b.startsAt > c.now).map((b) => b.startsAt),
+    // A CRM booking counts unless the front desk cancelled that day.
+    ...records
+      .filter((r) => r.appointmentAt && r.appointmentAt > c.now && ["booked", "customer"].includes(classOf(r.status, c.s)) && !cancelledOn(bookings, r.appointmentAt, c))
+      .map((r) => r.appointmentAt!),
+  ].sort((a, b) => a.getTime() - b.getTime())[0];
+  if (ahead) return `is booked again for ${dateText(dayOf(ahead, c.tz))}`;
+  const fromDay = dayOf(from, c.tz);
+  const came = [...visits.filter((v) => v.day >= fromDay).map((v) => v.day), ...bookings.filter((b) => b.status === "completed" && b.startsAt > from).map((b) => dayOf(b.startsAt, c.tz))].sort().at(-1);
+  if (came) return `came in on ${dateText(came)}`;
+  const later = bookings
+    .filter((b) => holding(b) && b.startsAt > from)
+    .map((b) => b.startsAt)
+    .sort((a, b) => b.getTime() - a.getTime())[0];
+  return later ? `booked again for ${dateText(dayOf(later, c.tz))}` : null;
+}
+
+const BOOKING_STATUS_TEXT: Record<ClinicAppointmentStatus, string> = {
+  booked: "still booked",
+  confirmed: "confirmed",
+  checked_in: "checked in",
+  completed: "marked done",
+  no_show: "marked a no-show",
+  cancelled: "cancelled",
+  unknown: "in a state JENAI does not know",
+};
+
+/** Someone whose bookings prompt no call still shows in the plan, by their latest booking. */
+function lastBookingRow(bookings: readonly PlanBooking[], c: Ctx): Draft {
+  const b = bookings.reduce((x, y) => (y.startsAt > x.startsAt ? y : x));
+  const [o, sys, when] = [bookingOrigin(b), systemOf(b), whenText(b.startsAt, c)];
+  if (isBooked(b.status) && b.startsAt <= c.now) return keep("appointment_unclear", o, `Their appointment on ${when} has passed and ${sys} still says booked, so JENAI cannot tell if they came. Update it in ${sys}.`);
+  return keep("no_call", o, `Their latest booking in ${sys}, on ${when}, is ${BOOKING_STATUS_TEXT[b.status]}: no call about it is due.`);
+}
+
+function bookingOrigin(b: PlanBooking): Origin {
+  return { type: "clinic_appointment", id: b.id, label: `${b.system ?? "Front desk"} booking`, name: b.name ?? null, centre: b.centre ?? null };
+}
+
+function bookingValues(b: PlanBooking, c: Ctx): Values {
+  return {
+    enquiry_about: b.service || null,
+    treatment: b.service || null,
+    branch: b.centre,
+    doctor: b.doctor,
+    appointment_date: dayOf(b.startsAt, c.tz),
+    appointment_time: timeText(b.startsAt, c.tz),
+  };
 }
 
 /**
  * After a visit: feedback, a check on how they are doing, then the next
  * session of a course or, once it is done, maintenance. Per service, from its
  * latest visit; feedback once per visit day however many services they had.
+ * Their package for the service, when their front desk says, decides the
+ * course: sessions left, done, on hold or ended.
  */
 function visitRows(all: VisitIn[], c: Ctx): Draft[] {
   const groups = new Map<string, VisitIn[]>();
   for (const v of all) {
-    const key = v.service.trim().toLowerCase().replace(/\s+/g, " ");
+    const key = serviceKey(v.service);
     const g = groups.get(key);
     if (g) g.push(v);
     else groups.set(key, [v]);
   }
   const rows: Draft[] = [];
   const feedbackDays = new Set<string>();
-  for (const g of groups.values()) {
+  for (const [key, g] of groups) {
     g.sort((a, b) => a.day.localeCompare(b.day) || a.origin.id.localeCompare(b.origin.id));
     const last = g[g.length - 1]!;
     const rule = ruleFor(last.service, c.rules);
@@ -619,6 +809,11 @@ function visitRows(all: VisitIn[], c: Ctx): Draft[] {
     const note = rule.isDefault ? " Timing is JENAI's default until the clinic's doctors confirm it." : "";
     const values: Values = { visit_date: last.day, last_visit: last.day, treatment: last.service || null, doctor: last.doctor, branch: last.branch };
     const after = (n: number) => startOf(addDays(last.day, n), c.tz);
+    const every = rule.sessionIntervalDays;
+    const maintenance = (had: string) => {
+      const m = rule.maintenanceAfterDays;
+      if (m) rows.push(callable("maintenance", last.origin, after(m), `${had} on ${dateText(last.day)}; maintenance is due every ${plural(m, "day")}.${note}`, values, c));
+    };
 
     if (rule.feedbackAfterDays !== null && daysBetween(last.day, c.today) <= c.s.feedbackWithinDays && !feedbackDays.has(last.day)) {
       feedbackDays.add(last.day);
@@ -631,20 +826,97 @@ function visitRows(all: VisitIn[], c: Ctx): Draft[] {
           callable("result_check", last.origin, startOf(due, c.tz), `Had ${what} on ${dateText(last.day)}; results usually show by about ${plural(rule.resultCheckAfterDays, "day")}.${note}`, { ...values, review_due: due }, c),
         );
     }
-    const total = last.sessionsTotal ?? rule.courseSessions;
-    const done = last.sessionsDone ?? g.length;
-    const every = rule.sessionIntervalDays;
-    if (total !== null && done < total) {
-      if (every) rows.push(callable("next_session", last.origin, after(every), `Session ${done + 1} of ${total} of ${what} is due ${plural(every, "day")} after the last, on ${dateText(last.day)}.${note}`, values, c));
-    } else if (rule.maintenanceAfterDays) {
-      const had = total !== null ? `Finished the course of ${what}` : `Had ${what}`;
-      rows.push(callable("maintenance", last.origin, after(rule.maintenanceAfterDays), `${had} on ${dateText(last.day)}; maintenance is due every ${plural(rule.maintenanceAfterDays, "day")}.${note}`, values, c));
-    } else if (total === null && every) {
-      // Sessions with no set number (a drip, pigmentation): the next one, every interval.
-      rows.push(callable("next_session", last.origin, after(every), `Had ${what} on ${dateText(last.day)}; sessions are due every ${plural(every, "day")}.${note}`, values, c));
+
+    const pkg = packageFor(key, last.day, c);
+    if (pkg?.kind === "open") rows.push(openPackageRow(pkg, last, every, what, values, note, c));
+    else if (pkg?.kind === "complete") maintenance(`Finished the course of ${what}`);
+    else if (pkg?.kind === "frozen")
+      rows.push(keep("next_session", last.origin, `Their package for ${what} is on hold in ${systemOf(pkg.p)}${pkg.left ? ` with ${plural(pkg.left, "session")} left` : ""}, so no call about the next session while it is.`));
+    else if (pkg?.kind === "ended") {
+      const p = pkg.p;
+      const how = p.status === "cancelled" ? `was cancelled in ${systemOf(p)}` : p.expiresOn && p.expiresOn < c.today ? `ended on ${dateText(p.expiresOn)}` : `has expired in ${systemOf(p)}`;
+      rows.push(keep("next_session", last.origin, `Their package for ${what} ${how}${pkg.left ? ` with ${plural(pkg.left, "session")} unused` : ""}, so there is no next session to call about.`));
+    } else {
+      const total = last.sessionsTotal ?? rule.courseSessions;
+      const done = last.sessionsDone ?? g.length;
+      if (total !== null && done < total) {
+        if (every) rows.push(callable("next_session", last.origin, after(every), `Session ${done + 1} of ${total} of ${what} is due ${plural(every, "day")} after the last, on ${dateText(last.day)}.${note}`, values, c));
+      } else if (rule.maintenanceAfterDays) {
+        maintenance(total !== null ? `Finished the course of ${what}` : `Had ${what}`);
+      } else if (total === null && every) {
+        // Sessions with no set number (a drip, pigmentation): the next one, every interval.
+        rows.push(callable("next_session", last.origin, after(every), `Had ${what} on ${dateText(last.day)}; sessions are due every ${plural(every, "day")}.${note}`, values, c));
+      }
     }
   }
   return rows;
+}
+
+/** A service's name as visits and packages are matched on: any case, any spacing. */
+const serviceKey = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+
+interface PackageState {
+  /** open: sessions left to book; complete: none left; frozen: on hold; ended: expired or cancelled with sessions unused. */
+  kind: "open" | "complete" | "frozen" | "ended";
+  p: PlanPackage;
+  left: number | null;
+}
+const PACKAGE_ORDER: Record<PackageState["kind"], number> = { open: 0, frozen: 1, complete: 2, ended: 3 };
+
+/**
+ * What one package says about a course. One not started yet, in a state
+ * JENAI does not know, or active with no count of sessions left says
+ * nothing: the treatment rule and the visit's own counts decide. One that
+ * ended before their last visit says nothing either: that visit was not from it.
+ */
+function packageState(p: PlanPackage, lastDay: string, today: string): PackageState | null {
+  const left = p.balance ?? (p.total != null && p.used != null ? p.total - p.used : null);
+  // Past its end date it is over, whatever status was last read.
+  const ended = p.status === "cancelled" || p.status === "expired" || (!!p.expiresOn && p.expiresOn < today);
+  if (left !== null && left <= 0 && p.status !== "cancelled") return { kind: "complete", p, left: 0 };
+  if (ended) return p.expiresOn && p.expiresOn < lastDay ? null : { kind: "ended", p, left };
+  if (p.status === "frozen") return { kind: "frozen", p, left };
+  if (p.status === "active" && left !== null) return { kind: "open", p, left };
+  return null;
+}
+
+/** Of their packages for a service, the one that speaks for the course: sessions to book first, ending soonest. */
+function packageFor(key: string, lastDay: string, c: Ctx): PackageState | null {
+  let best: PackageState | null = null;
+  for (const p of c.packages) {
+    if (serviceKey(p.service) !== key) continue;
+    const st = packageState(p, lastDay, c.today);
+    if (!st) continue;
+    const ends = (x: PackageState) => x.p.expiresOn ?? "9999-12-31";
+    if (!best || PACKAGE_ORDER[st.kind] < PACKAGE_ORDER[best.kind] || (st.kind === best.kind && ends(st) < ends(best))) best = st;
+  }
+  return best;
+}
+
+/**
+ * The next session from a package with sessions left: at the usual gap after
+ * the last, or now when the package ends within packageEndingWithinDays, so
+ * they can use what they paid for before it does.
+ */
+function openPackageRow(pkg: PackageState, last: VisitIn, every: number | null, what: string, values: Values, note: string, c: Ctx): Draft {
+  const { p } = pkg;
+  const left = pkg.left!;
+  const total = p.total ?? last.sessionsTotal;
+  const done = p.used ?? (total !== null ? total - left : null);
+  const session = total !== null && done !== null && done >= 0 && done < total ? `Session ${done + 1} of ${total} of ${what}` : `The next session of ${what}`;
+  const ends = p.expiresOn ?? null;
+  if (ends && daysBetween(c.today, ends) <= c.s.packageEndingWithinDays)
+    return callable("next_session", last.origin, c.now, `${plural(left, "session")} left, package ends on ${dateText(ends)}: called now so they can book before it does. ${session} is next; the last was on ${dateText(last.day)}.`, values, c);
+  if (every)
+    return callable(
+      "next_session",
+      last.origin,
+      startOf(addDays(last.day, every), c.tz),
+      `${session} is due ${plural(every, "day")} after the last, on ${dateText(last.day)}. ${plural(left, "session")} left on their package${ends ? `, which ends on ${dateText(ends)}` : ""}.${note}`,
+      values,
+      c,
+    );
+  return keep("next_session", last.origin, `${plural(left, "session")} of ${what} left on their package, but no gap between sessions is set for it, so JENAI cannot tell when the next is due. Add one in the treatment rules.`);
 }
 
 /**
@@ -765,6 +1037,10 @@ function timeText(at: Date, tz: string): string {
   return `${h % 12 || 12}:${pad(minutes % 60)} ${h < 12 ? "AM" : "PM"}`;
 }
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+/** "Fri 2 Oct 2026 at 10:30 AM" */
+const whenText = (at: Date, c: Ctx) => `${dateText(dayOf(at, c.tz))} at ${timeText(at, c.tz)}`;
+/** "A, B and C" */
+const listText = (xs: readonly string[]) => (xs.length < 2 ? (xs[0] ?? "") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
 
 // ---------------------------------------------------------------- one client
 
@@ -778,6 +1054,12 @@ export interface ReplanResult {
   byJourney: Partial<Record<PlanJourney, Partial<Record<PlannedCallVerdict, number>>>>;
   /** Visits read from a connected system whose phone number has not been read yet: not planned until it is. */
   waitingForPhone: number;
+  /**
+   * People in this plan whose front desk profile says they agreed to
+   * marketing SMS (and none of their profiles says no). For the clinic's
+   * information only: no call is planned on it.
+   */
+  marketingConsent: number;
 }
 
 const CRM_NAMES: Record<string, string> = { zoho_crm: "Zoho", salesforce: "Salesforce", hubspot: "HubSpot", leadsquared: "LeadSquared", google_sheets: "their sheet", zenoti: "Zenoti" };
@@ -788,9 +1070,11 @@ const CHUNK = 500;
  * Plans everyone in one client's records again and stores it in
  * planned_calls: rows that still apply are updated in place (same id),
  * rows for records, visits or calls that no longer apply are removed.
- * Reads crm_records (not deleted), visits, do-not-call entries, the last
- * call with each number, plan settings and treatment rules. A visit still
- * waiting for its phone number is counted, not planned.
+ * Reads crm_records (not deleted), visits, front desk bookings
+ * (clinic_appointments), package balances and guests (external_people),
+ * do-not-call entries, the last call with each number, plan settings and
+ * treatment rules. A visit still waiting for its phone number is counted,
+ * not planned; a booking or package with no number known is left out.
  *
  * A preview only: never creates campaign targets, never dials, never writes
  * to the client's CRM.
@@ -804,9 +1088,29 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
     const [own] = await tx.select({ settings: callPlanSettings.settings }).from(callPlanSettings).where(eq(callPlanSettings.tenantId, tenantId));
     const settings = planSettingsOf(own?.settings, org?.timezone ?? DEFAULT_PLAN_SETTINGS.timezone);
     const rules = treatmentRulesFor(await tx.select().from(treatmentRules), org?.vertical);
-    const crmOf = new Map((await tx.select({ id: integrations.id, kind: integrations.kind }).from(integrations)).map((i) => [i.id, CRM_NAMES[i.kind] ?? "their CRM"]));
+    const kindOf = new Map((await tx.select({ id: integrations.id, kind: integrations.kind }).from(integrations)).map((i) => [i.id, i.kind as string]));
+    const systemNamed = (integrationId: string) => CRM_NAMES[kindOf.get(integrationId) ?? ""];
     const records = await tx.select().from(crmRecords).where(isNull(crmRecords.deletedAt));
     const taken = await tx.select().from(visits);
+    const guests = await tx
+      .select({ integrationId: externalPeople.integrationId, ref: externalPeople.externalId, phone: externalPeople.phoneE164, marketing: externalPeople.marketingSmsConsent })
+      .from(externalPeople);
+    const booked = await tx
+      .select({
+        id: clinicAppointments.id,
+        integrationId: clinicAppointments.integrationId,
+        guestRef: clinicAppointments.guestRef,
+        phone: clinicAppointments.phoneE164,
+        name: clinicAppointments.name,
+        service: clinicAppointments.service,
+        startsAt: clinicAppointments.startsAt,
+        status: clinicAppointments.status,
+        doctor: clinicAppointments.doctor,
+        centre: branches.name,
+      })
+      .from(clinicAppointments)
+      .leftJoin(branches, and(eq(branches.tenantId, clinicAppointments.tenantId), eq(branches.id, clinicAppointments.branchId)));
+    const held = await tx.select().from(packageBalances);
     const blocked = await tx
       .select({ phone: suppressions.phoneE164, reason: suppressions.reason, expiresAt: suppressions.expiresAt })
       .from(suppressions)
@@ -823,10 +1127,10 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
     const people = new Map<string, PlanPerson>();
     const personFor = (key: string, phone: string | null) => {
       let p = people.get(key);
-      if (!p) people.set(key, (p = { phone, records: [], visits: [], suppressions: [], lastCallAt: null, contactId: phone ? (contactOf.get(phone) ?? null) : null, programs }));
+      if (!p) people.set(key, (p = { phone, records: [], visits: [], bookings: [], packages: [], suppressions: [], lastCallAt: null, contactId: phone ? (contactOf.get(phone) ?? null) : null, programs }));
       return p;
     };
-    for (const r of records) personFor(r.phoneE164 ?? `record:${r.id}`, r.phoneE164).records.push({ ...r, crm: crmOf.get(r.integrationId) ?? "their CRM" });
+    for (const r of records) personFor(r.phoneE164 ?? `record:${r.id}`, r.phoneE164).records.push({ ...r, crm: systemNamed(r.integrationId) ?? "their CRM" });
     // A visit read from their system before its number: counted, and planned once the number arrives.
     let waitingForPhone = 0;
     for (const v of taken) {
@@ -838,6 +1142,19 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
       const p = personFor(phone, phone);
       p.visits.push({ ...v, phoneE164: phone });
       p.contactId ??= v.contactId;
+    }
+    // A booking or package carries the number known when it was read; their guest record may know it since.
+    const guestPhone = new Map(guests.filter((g) => g.phone).map((g) => [`${g.integrationId}:${g.ref}`, g.phone!]));
+    const phoneOf = (x: { integrationId: string; guestRef: string; phone?: string | null; phoneE164?: string | null }) =>
+      x.phone ?? x.phoneE164 ?? guestPhone.get(`${x.integrationId}:${x.guestRef}`) ?? null;
+    for (const b of booked) {
+      const phone = phoneOf(b);
+      if (phone) personFor(phone, phone).bookings!.push({ ...b, system: systemNamed(b.integrationId) });
+    }
+    // A package alone prompts no call: it only tells the calls about visits and bookings how the course stands.
+    for (const k of held) {
+      const phone = phoneOf(k);
+      if (phone) people.get(phone)?.packages!.push({ ...k, system: systemNamed(k.integrationId) });
     }
     for (const b of blocked) people.get(b.phone)?.suppressions!.push({ reason: b.reason, expiresAt: b.expiresAt });
     for (const l of lastCalls) {
@@ -887,6 +1204,10 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
       const j = (byJourney[r.journey] ??= {});
       j[r.verdict] = (j[r.verdict] ?? 0) + 1;
     }
-    return { people: people.size, rows: list.length, removed: removed.length, byVerdict, byJourney, waitingForPhone };
+    // Agreed only when every profile with the number that says anything says yes.
+    const agreed = new Map<string, boolean>();
+    for (const g of guests) if (g.phone && g.marketing !== null) agreed.set(g.phone, (agreed.get(g.phone) ?? true) && g.marketing);
+    const marketingConsent = [...people.keys()].filter((k) => agreed.get(k) === true).length;
+    return { people: people.size, rows: list.length, removed: removed.length, byVerdict, byJourney, waitingForPhone, marketingConsent };
   });
 }

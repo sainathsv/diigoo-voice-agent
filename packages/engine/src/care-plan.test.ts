@@ -10,26 +10,34 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import {
+  branches,
   campaignTargets,
   calls,
   clientPrograms,
+  clinicAppointments,
   crmRecords,
+  externalPeople,
   integrationEvents,
   integrations,
   organizations,
+  packageBalances,
   plannedCalls,
   platformDb,
   suppressions,
   visits,
   withTenant,
+  type ClinicAppointmentStatus,
 } from "@jenai/db";
 import {
   DEFAULT_PLAN_SETTINGS,
+  PLAN_JOURNEYS,
   planPerson,
   planSettingsOf,
   replanTenant,
   ruleFor,
   treatmentRulesFor,
+  type PlanBooking,
+  type PlanPackage,
   type PlanPerson,
   type PlanRecord,
   type PlanRow,
@@ -56,6 +64,20 @@ const lead = (over: Partial<PlanRecord> = {}): PlanRecord => ({
   ...over,
 });
 const visit = (over: Partial<PlanVisit> = {}): PlanVisit => ({ id: `visit-${++n}`, phoneE164: PHONE, name: "Anitha", service: "Hydrafacial", visitDate: "2026-09-30", ...over });
+/** A booking in Zenoti, the clinic's front desk system. */
+const booking = (over: Partial<PlanBooking> = {}): PlanBooking => ({
+  id: `booking-${++n}`,
+  system: "Zenoti",
+  name: "Anitha",
+  service: "LHR Full Legs",
+  startsAt: ist("2026-10-02 10:30"),
+  status: "booked",
+  doctor: "Dr. Asha",
+  centre: "Kondapur",
+  ...over,
+});
+/** Their laser package in Zenoti: 3 of 5 sessions used. */
+const pack = (over: Partial<PlanPackage> = {}): PlanPackage => ({ system: "Zenoti", service: "LHR Full Legs", total: 5, used: 3, balance: 2, status: "active", expiresOn: "2027-03-01", ...over });
 const plan = (p: Partial<PlanPerson>, now = NOW, settings = DEFAULT_PLAN_SETTINGS) => planPerson({ phone: PHONE, records: [], visits: [], ...p }, settings, RULES, now);
 const only = (rows: PlanRow[]) => {
   expect(rows).toHaveLength(1);
@@ -382,6 +404,215 @@ describe("one call per person", () => {
   });
 });
 
+describe("bookings at the front desk", () => {
+  const live = (rows: PlanRow[]) => rows.filter((r) => r.verdict !== "kept_out");
+
+  it("reminds them of a booking in Zenoti, the evening before, with what the script needs", () => {
+    const r = only(plan({ bookings: [booking()] }));
+    expect(r).toMatchObject({ journey: "appointment_reminder", programKey: "clinic.appointment_reminder", verdict: "scheduled", originType: "clinic_appointment", originLabel: "Zenoti booking" });
+    expect(r.callAt).toEqual(ist("2026-10-01 18:00"));
+    expect(r.reason).toBe("Appointment on Fri 2 Oct 2026 at 10:30 AM for LHR Full Legs, booked in Zenoti.");
+    expect(r.context).toEqual({ caller_name: "Anitha", appointment_date: "2026-10-02", appointment_time: "10:30 AM", doctor: "Dr. Asha", branch: "Kondapur" });
+    expect(only(plan({ bookings: [booking({ status: "confirmed" })] })).journey).toBe("appointment_reminder");
+  });
+
+  it("makes one reminder for several services booked the same day", () => {
+    const r = only(plan({ bookings: [booking({ service: "Hydrafacial", startsAt: ist("2026-10-02 11:30") }), booking()] }));
+    expect(r.reason).toBe("Appointment on Fri 2 Oct 2026 at 10:30 AM for LHR Full Legs and Hydrafacial, booked in Zenoti.");
+  });
+
+  it("reminds nobody of a booking checked in or in a state JENAI does not know, and still shows them", () => {
+    const r = only(plan({ bookings: [booking({ status: "unknown" })] }));
+    expect(r).toMatchObject({ journey: "no_call", verdict: "kept_out", reason: "Their latest booking in Zenoti, on Fri 2 Oct 2026 at 10:30 AM, is in a state JENAI does not know: no call about it is due." });
+    expect(only(plan({ bookings: [booking({ status: "checked_in" })] })).journey).toBe("no_call");
+    const stale = only(plan({ bookings: [booking({ startsAt: ist("2026-09-28 11:00") })] }));
+    expect(stale).toMatchObject({ journey: "appointment_unclear", verdict: "kept_out" });
+    expect(stale.reason).toBe("Their appointment on Mon 28 Sep 2026 at 11:00 AM has passed and Zenoti still says booked, so JENAI cannot tell if they came. Update it in Zenoti.");
+  });
+
+  it("plans one reminder when Zoho and Zenoti both have them booked, going by Zenoti", () => {
+    for (const status of ["Appointment Booked", "Existing Client"]) {
+      for (const at of ["2026-10-02 10:30", "2026-10-03 16:00"]) {
+        const rows = plan({ records: [lead({ status, appointmentAt: ist(at) })], bookings: [booking()] });
+        expect(only(live(rows))).toMatchObject({ journey: "appointment_reminder", originType: "clinic_appointment", verdict: "scheduled" });
+        expect(rows.find((r) => r.originType === "crm_record")).toMatchObject({
+          journey: "appointment_reminder",
+          verdict: "kept_out",
+          reason: "Booked in Zenoti for Fri 2 Oct 2026 at 10:30 AM: the reminder goes by Zenoti, the clinic's own system.",
+        });
+      }
+    }
+  });
+
+  it("reminds nobody of a Zoho booking for a day Zenoti says was cancelled, and calls to rebook instead", () => {
+    const rows = plan({ records: [lead({ status: "Appointment Booked", appointmentAt: ist("2026-10-02 11:00") })], bookings: [booking({ status: "cancelled", startsAt: ist("2026-10-02 11:00") })] });
+    expect(rows.find((r) => r.originType === "crm_record")).toMatchObject({
+      journey: "appointment_reminder",
+      verdict: "kept_out",
+      reason: "Cancelled in Zenoti for Fri 2 Oct 2026 at 11:00 AM: no reminder, as Zenoti is the clinic's own system.",
+    });
+    expect(only(live(rows))).toMatchObject({ journey: "cancelled_rebook", verdict: "call_now", reason: "Cancelled their appointment for LHR Full Legs booked for Fri 2 Oct 2026." });
+  });
+
+  it("does not show the Zoho Contacts note for someone booked in Zenoti", () => {
+    const contact = { id: "c-2", module: "Contacts", crm: "Zoho", phoneE164: PHONE, name: "Anitha" };
+    expect(plan({ records: [contact], bookings: [booking()] }).some((r) => r.originId === "c-2")).toBe(false);
+  });
+
+  it("keeps a booking at a centre the plan does not cover out, naming it", () => {
+    const settings = planSettingsOf({ centres: ["Kondapur"] });
+    expect(only(plan({ bookings: [booking({ centre: "Jubilee Hills" })] }, NOW, settings))).toMatchObject({ verdict: "kept_out", reason: "For the Jubilee Hills centre, which this plan does not cover." });
+  });
+});
+
+describe("missed and cancelled bookings at the front desk", () => {
+  const noShow = (over: Partial<PlanBooking> = {}) => booking({ status: "no_show", service: "PRP - Hair", startsAt: ist("2026-09-20 16:30"), ...over });
+  const cancelled = (over: Partial<PlanBooking> = {}) => booking({ status: "cancelled", service: "Consultation", startsAt: ist("2026-09-28 11:00"), ...over });
+
+  it("calls to rebook a recent no-show in Zenoti", () => {
+    const r = only(plan({ bookings: [noShow()] }));
+    expect(r).toMatchObject({ journey: "no_show_rebook", programKey: "clinic.warm_followup", verdict: "call_now", originType: "clinic_appointment", reason: "Missed their appointment on Sun 20 Sep 2026 for PRP - Hair." });
+    expect(r.callAt).toEqual(NOW);
+    expect(r.context).toEqual({ caller_name: "Anitha", enquiry_about: "PRP - Hair", branch: "Kondapur" });
+  });
+
+  it("does not call a no-show who has booked again or come in since", () => {
+    const rows = plan({ bookings: [noShow(), booking()] });
+    expect(journey(rows, "no_show_rebook")).toMatchObject({ verdict: "kept_out", reason: "Missed their appointment on Sun 20 Sep 2026 for PRP - Hair, but is booked again for Fri 2 Oct 2026." });
+    expect(journey(rows, "appointment_reminder").verdict).toBe("scheduled");
+    const came = plan({ bookings: [noShow()], visits: [visit({ visitDate: "2026-09-25" })] });
+    expect(journey(came, "no_show_rebook")).toMatchObject({ verdict: "kept_out", reason: "Missed their appointment on Sun 20 Sep 2026 for PRP - Hair, but came in on Fri 25 Sep 2026." });
+    // Long past and followed by a visit, it is history: no row at all.
+    expect(plan({ bookings: [noShow({ startsAt: ist("2026-08-01 11:00") })], visits: [visit({ visitDate: "2026-08-10" })] }).some((r) => r.journey === "no_show_rebook")).toBe(false);
+  });
+
+  it("keeps out a no-show older than the fresh limit", () => {
+    expect(only(plan({ bookings: [noShow({ startsAt: ist("2026-08-22 11:00") })] }))).toMatchObject({ journey: "no_show_rebook", verdict: "kept_out", reason: `Missed their appointment 40 days ago. ${COLD}` });
+  });
+
+  it("calls to rebook a recent cancellation, below a no-show", () => {
+    const r = only(plan({ bookings: [cancelled()] }));
+    expect(r).toMatchObject({ journey: "cancelled_rebook", programKey: "clinic.warm_followup", verdict: "call_now", priority: 25, reason: "Cancelled their appointment for Consultation booked for Mon 28 Sep 2026." });
+    expect(PLAN_JOURNEYS.cancelled_rebook).toEqual({ program: "clinic.warm_followup", label: "They cancelled: call to rebook", priority: 25 });
+    const order = Object.keys(PLAN_JOURNEYS);
+    expect(order.indexOf("cancelled_rebook")).toBe(order.indexOf("no_show_rebook") + 1);
+    expect(PLAN_JOURNEYS.cancelled_rebook.priority).toBeLessThan(PLAN_JOURNEYS.no_show_rebook.priority);
+    // A no-show in Zoho and a cancellation in Zenoti, both due now: the no-show call first.
+    const both = plan({ records: [lead({ status: "No Show", appointmentAt: ist("2026-09-26 11:00") })], bookings: [cancelled()] });
+    expect(journey(both, "no_show_rebook").verdict).toBe("call_now");
+    expect(journey(both, "cancelled_rebook")).toMatchObject({ verdict: "waiting", reason: "Another call to this person comes first: They missed their appointment: call to rebook" });
+  });
+
+  it("does not call to rebook a cancellation moved to another day, and keeps out an old one", () => {
+    const moved = plan({ bookings: [cancelled({ startsAt: ist("2026-10-10 11:00") }), booking({ service: "Consultation", startsAt: ist("2026-10-06 10:00") })] });
+    expect(journey(moved, "cancelled_rebook")).toMatchObject({ verdict: "kept_out", reason: "Cancelled their appointment for Consultation booked for Sat 10 Oct 2026, but is booked again for Tue 6 Oct 2026." });
+    expect(journey(moved, "appointment_reminder")).toMatchObject({ verdict: "scheduled" });
+    expect(only(plan({ bookings: [cancelled({ startsAt: ist("2026-08-22 11:00") })] }))).toMatchObject({ verdict: "kept_out", reason: `Their cancelled appointment was 40 days ago. ${COLD}` });
+  });
+
+  it("calls about their latest missed booking only, a no-show before a cancellation the same day", () => {
+    expect(only(plan({ bookings: [noShow(), cancelled()] })).journey).toBe("cancelled_rebook");
+    expect(only(plan({ bookings: [cancelled({ startsAt: ist("2026-09-28 10:00") }), noShow({ startsAt: ist("2026-09-28 12:00") })] })).journey).toBe("no_show_rebook");
+  });
+
+  it("does not call a Zoho no-show who has come in since, as Zenoti shows", () => {
+    const r = only(plan({ records: [lead({ status: "No Show", appointmentAt: ist("2026-09-20 11:00") })], bookings: [booking({ status: "completed", startsAt: ist("2026-09-24 11:00") })] }));
+    expect(r).toMatchObject({ journey: "no_show_rebook", verdict: "kept_out", reason: "Missed their appointment on Sun 20 Sep 2026, but came in on Thu 24 Sep 2026." });
+  });
+});
+
+describe("a Zoho booking whose date has passed, answered by Zenoti", () => {
+  const passed = () => lead({ status: "Appointment Booked", appointmentAt: ist("2026-09-28 11:00") });
+
+  it("drops 'outcome unknown' when Zenoti shows a visit on or after the day", () => {
+    const rows = plan({ records: [passed()], visits: [visit({ visitDate: "2026-09-30", source: "api" })] });
+    expect(rows.some((r) => r.originType === "crm_record")).toBe(false);
+    const done = plan({ records: [passed()], bookings: [booking({ status: "completed", startsAt: ist("2026-09-29 11:00") })] });
+    expect(done.some((r) => r.originType === "crm_record")).toBe(false);
+  });
+
+  it("drops it for a no-show in Zenoti, which is called to rebook instead", () => {
+    const rows = plan({ records: [passed()], bookings: [booking({ status: "no_show", startsAt: ist("2026-09-28 11:00") })] });
+    expect(only(rows)).toMatchObject({ originType: "clinic_appointment", journey: "no_show_rebook", verdict: "call_now" });
+  });
+
+  it("keeps it when what Zenoti shows came before the day", () => {
+    const rows = plan({ records: [passed()], visits: [visit({ visitDate: "2026-09-20", source: "api" })], bookings: [booking({ status: "no_show", startsAt: ist("2026-09-21 11:00") })] });
+    expect(journey(rows, "appointment_unclear").originType).toBe("crm_record");
+  });
+});
+
+describe("packages at the front desk", () => {
+  const laser = (visitDate: string) => visit({ service: "LHR Full Legs", visitDate });
+  const DEFAULT_NOTE = " Timing is JENAI's default until the clinic's doctors confirm it.";
+
+  it("books the next session from the sessions left on their package", () => {
+    const r = only(plan({ visits: [laser("2026-08-01")], packages: [pack()] }));
+    expect(r).toMatchObject({ journey: "next_session", verdict: "call_now", programKey: "clinic.revisit_recall" });
+    expect(r.reason).toBe(`Session 4 of 5 of LHR Full Legs is due 35 days after the last, on Sat 1 Aug 2026. 2 sessions left on their package, which ends on Mon 1 Mar 2027.${DEFAULT_NOTE}`);
+    // Without the package, the default course and their visits count.
+    expect(only(plan({ visits: [laser("2026-08-01")] })).reason).toMatch(/^Session 2 of 6 of LHR Full Legs/);
+    // Matched however the service is spelled.
+    expect(only(plan({ visits: [laser("2026-08-01")], packages: [pack({ service: "lhr  FULL legs" })] })).reason).toMatch(/^Session 4 of 5/);
+  });
+
+  it("calls now when the package ends within 30 days, and says so", () => {
+    const rows = plan({ visits: [laser("2026-09-30")], packages: [pack({ expiresOn: "2026-10-12" })] });
+    const r = journey(rows, "next_session");
+    expect(r).toMatchObject({ verdict: "call_now", reason: "2 sessions left, package ends on Mon 12 Oct 2026: called now so they can book before it does. Session 4 of 5 of LHR Full Legs is next; the last was on Wed 30 Sep 2026." });
+    expect(r.callAt).toEqual(NOW);
+    expect(journey(rows, "visit_feedback").verdict).toBe("waiting");
+    // A clinic that wants less notice: the usual gap.
+    const later = journey(plan({ visits: [laser("2026-09-30")], packages: [pack({ expiresOn: "2026-10-12" })] }, NOW, planSettingsOf({ packageEndingWithinDays: 7 })), "next_session");
+    expect(later.callAt).toEqual(ist("2026-11-04 10:00"));
+  });
+
+  it("books maintenance once the package is used up", () => {
+    const r = only(plan({ visits: [laser("2026-06-01")], packages: [pack({ used: 5, balance: 0 })] }));
+    expect(r).toMatchObject({ journey: "maintenance", verdict: "scheduled" });
+    expect(r.callAt).toEqual(ist("2026-11-28 10:00"));
+    expect(r.reason).toMatch(/^Finished the course of LHR Full Legs on Mon 1 Jun 2026; maintenance is due every 180 days\./);
+  });
+
+  it("never calls about the next session of an expired or cancelled package", () => {
+    const next = (p: PlanPackage) => {
+      const rows = plan({ visits: [laser("2026-09-10")], packages: [p] });
+      expect(rows.some((r) => r.journey === "maintenance")).toBe(false);
+      return journey(rows, "next_session");
+    };
+    expect(next(pack({ status: "expired", expiresOn: "2026-09-15" }))).toMatchObject({
+      verdict: "kept_out",
+      reason: "Their package for LHR Full Legs ended on Tue 15 Sep 2026 with 2 sessions unused, so there is no next session to call about.",
+    });
+    // Past its end date, whatever status was last read.
+    expect(next(pack({ expiresOn: "2026-09-20" })).reason).toBe("Their package for LHR Full Legs ended on Sun 20 Sep 2026 with 2 sessions unused, so there is no next session to call about.");
+    expect(next(pack({ status: "expired", expiresOn: null })).reason).toBe("Their package for LHR Full Legs has expired in Zenoti with 2 sessions unused, so there is no next session to call about.");
+    expect(next(pack({ status: "cancelled" })).reason).toBe("Their package for LHR Full Legs was cancelled in Zenoti with 2 sessions unused, so there is no next session to call about.");
+    expect(next(pack({ status: "frozen" }))).toMatchObject({ verdict: "kept_out", reason: "Their package for LHR Full Legs is on hold in Zenoti with 2 sessions left, so no call about the next session while it is." });
+    // Even when Zenoti gave no count of sessions left.
+    expect(next(pack({ status: "expired", expiresOn: null, total: null, used: null, balance: null })).reason).toBe("Their package for LHR Full Legs has expired in Zenoti, so there is no next session to call about.");
+  });
+
+  it("ignores a package that ended before their last visit, or has not started, and prefers one with sessions left", () => {
+    const after = journey(plan({ visits: [laser("2026-09-10")], packages: [pack({ status: "expired", expiresOn: "2026-09-01" })] }), "next_session");
+    expect(after.verdict).toBe("waiting");
+    expect(after.callAt).toEqual(ist("2026-10-15 10:00"));
+    expect(only(plan({ visits: [laser("2026-08-01")], packages: [pack({ status: "not_started" })] })).reason).toMatch(/^Session 2 of 6/);
+    const both = only(plan({ visits: [laser("2026-08-01")], packages: [pack({ status: "expired", expiresOn: "2026-09-15" }), pack({ total: 6, used: 1, balance: 5 })] }));
+    expect(both).toMatchObject({ journey: "next_session", verdict: "call_now" });
+    expect(both.reason).toMatch(/^Session 2 of 6 of LHR Full Legs/);
+  });
+
+  it("says when a service with sessions left has no gap set between sessions", () => {
+    const r = only(plan({ visits: [visit({ service: "HIFU Face", visitDate: "2026-08-01" })], packages: [pack({ service: "HIFU Face", total: 2, used: 1, balance: 1 })] }));
+    expect(r).toMatchObject({
+      journey: "next_session",
+      verdict: "kept_out",
+      reason: "1 session of HIFU Face left on their package, but no gap between sessions is set for it, so JENAI cannot tell when the next is due. Add one in the treatment rules.",
+    });
+  });
+});
+
 describe("plan settings", () => {
   it("keeps the default for anything missing or unusable", () => {
     const s = planSettingsOf({ freshDays: 45, minGapDays: -1, reminderHour: "6pm", openStatuses: ["Warm", 3], callingWindow: { days: [1], start: "21:00", end: "23:00" } }, "Asia/Kolkata");
@@ -391,6 +622,8 @@ describe("plan settings", () => {
     expect(s.openStatuses).toEqual(["Warm"]);
     expect(s.callingWindow).toEqual(DEFAULT_PLAN_SETTINGS.callingWindow);
     expect(planSettingsOf(null)).toEqual(DEFAULT_PLAN_SETTINGS);
+    expect(planSettingsOf({ packageEndingWithinDays: 7 }).packageEndingWithinDays).toBe(7);
+    expect(planSettingsOf({ packageEndingWithinDays: 500 }).packageEndingWithinDays).toBe(30);
   });
 });
 
@@ -505,5 +738,157 @@ describe("replanning a client", () => {
     const after = await replanTenant(org, { now: NOW });
     expect(after).toMatchObject({ waitingForPhone: 0, people: before.people + 1 });
     expect((await stored()).find((r) => r.originId === v!.id && r.journey === "visit_feedback")).toMatchObject({ verdict: "scheduled", phoneE164: phone(8) });
+  });
+});
+
+describe("replanning a client with a front desk system", () => {
+  let org = "";
+  let zenoti = "";
+  const ids: Record<string, string> = {};
+  const phone = (k: number) => `+91980000${String(k).padStart(4, "0")}`;
+
+  beforeAll(async () => {
+    const [o] = await platformDb()
+      .insert(organizations)
+      .values({ kind: "client", name: "Front Desk Clinic", slug: `front-desk-${randomUUID().slice(0, 8)}`, status: "active", vertical: "dermatology", languages: ["en"] })
+      .returning({ id: organizations.id });
+    org = o!.id;
+    await withTenant(org, async (tx) => {
+      const [b] = await tx.insert(branches).values({ tenantId: org, name: "Kondapur", languages: ["en"] }).returning();
+      const [zoho] = await tx.insert(integrations).values({ tenantId: org, kind: "zoho_crm", name: "Zoho" }).returning();
+      const [desk] = await tx.insert(integrations).values({ tenantId: org, kind: "zenoti", name: "Zenoti", direction: "in" }).returning();
+      zenoti = desk!.id;
+      for (const programKey of ["clinic.appointment_reminder", "clinic.warm_followup", "clinic.feedback", "clinic.prescription_followup", "clinic.revisit_recall"])
+        await tx.insert(clientPrograms).values({ tenantId: org, programKey, programVersion: 1, name: programKey });
+      const rec = (externalId: string, p: string, appointmentAt: string) => ({
+        tenantId: org,
+        integrationId: zoho!.id,
+        module: "Leads",
+        externalId,
+        phoneE164: p,
+        name: "Patient",
+        status: "Appointment Booked",
+        appointmentAt: ist(appointmentAt),
+        createdExt: ist("2026-09-20 10:00"),
+      });
+      // 1 is booked in Zoho and in Zenoti for the same visit; 4 was booked in Zoho for a day that has passed, and came in two days later.
+      for (const r of await tx.insert(crmRecords).values([rec("1", phone(1), "2026-10-02 11:00"), rec("4", phone(4), "2026-09-25 11:00")]).returning()) ids[`zoho${r.externalId}`] = r.id;
+      const appt = (externalId: string, guestRef: string, p: string | null, status: ClinicAppointmentStatus, at: string, service = "Hydrafacial") => ({
+        tenantId: org,
+        integrationId: zenoti,
+        externalId,
+        guestRef,
+        phoneE164: p,
+        name: "Patient",
+        service,
+        startsAt: ist(at),
+        status,
+        doctor: "Dr. Asha",
+        centreRef: "zenoti-centre",
+        branchId: b!.id,
+      });
+      const made = await tx
+        .insert(clinicAppointments)
+        .values([
+          appt("a1", "g1", phone(1), "booked", "2026-10-02 11:00"),
+          appt("a2", "g2", phone(2), "no_show", "2026-09-26 16:30", "PRP - Hair"),
+          appt("a3", "g3", phone(3), "cancelled", "2026-09-28 11:00", "Consultation"),
+          // No number on the booking, but their guest record has one.
+          appt("a6", "g6", null, "booked", "2026-10-05 12:00"),
+          // No number anywhere: left out.
+          appt("a7", "g7", null, "booked", "2026-10-05 12:00"),
+        ])
+        .returning();
+      for (const a of made) ids[a.externalId] = a.id;
+      const seen = (externalId: string, guestRef: string, p: string, service: string, visitDate: string) => ({ tenantId: org, integrationId: zenoti, externalId, guestRef, phoneE164: p, name: "Patient", service, visitDate, source: "api" });
+      for (const v of await tx.insert(visits).values([seen("v4", "g4", phone(4), "Hydrafacial", "2026-09-27"), seen("v5", "g5", phone(5), "LHR Full Legs", "2026-09-30")]).returning()) ids[v.externalId!] = v.id;
+      // 5's laser package, read before their number: it ends within the month.
+      await tx.insert(packageBalances).values({ tenantId: org, integrationId: zenoti, guestRef: "g5", phoneE164: null, packageName: "LHR 5 Sessions", service: "LHR Full Legs", total: 5, used: 3, balance: 2, status: "active", expiresOn: "2026-10-12" });
+      const guest = (externalId: string, p: string, marketingSmsConsent: boolean | null) => ({ tenantId: org, integrationId: zenoti, externalId, phoneE164: p, marketingSmsConsent });
+      await tx.insert(externalPeople).values([
+        guest("g2", phone(2), true),
+        guest("g3", phone(3), false),
+        guest("g5", phone(5), true),
+        guest("g6", phone(6), null),
+        // Agreed, but nothing in the plan for them.
+        guest("g8", phone(8), true),
+      ]);
+    });
+  });
+
+  afterAll(async () => {
+    await platformDb().delete(organizations).where(eq(organizations.id, org));
+  });
+
+  const stored = () =>
+    withTenant(org, async (tx) =>
+      (await tx.select().from(plannedCalls)).map(({ computedAt: _, ...r }) => r).sort((a, b) => `${a.originId}${a.journey}`.localeCompare(`${b.originId}${b.journey}`)),
+    );
+  const of = (rows: Awaited<ReturnType<typeof stored>>, key: string, j: string) => rows.find((r) => r.originId === ids[key] && r.journey === j);
+
+  it("plans bookings, missed bookings and package sessions from Zenoti, counts consent, and gives the same rows when run again", async () => {
+    const first = await replanTenant(org, { now: NOW });
+    expect(first).toMatchObject({ people: 6, removed: 0, waitingForPhone: 0, marketingConsent: 2 });
+    expect(first.byJourney.appointment_reminder).toEqual({ scheduled: 2, kept_out: 1 });
+    expect(first.byJourney.no_show_rebook).toEqual({ call_now: 1 });
+    expect(first.byJourney.cancelled_rebook).toEqual({ call_now: 1 });
+    expect(first.byJourney.next_session).toEqual({ call_now: 1 });
+    expect(first.byJourney.appointment_unclear).toBeUndefined();
+
+    const rows = await stored();
+    expect(rows).toHaveLength(first.rows);
+    expect(of(rows, "a1", "appointment_reminder")).toMatchObject({
+      verdict: "scheduled",
+      originType: "clinic_appointment",
+      originLabel: "Zenoti booking",
+      phoneE164: phone(1),
+      reason: "Appointment on Fri 2 Oct 2026 at 11:00 AM for Hydrafacial, booked in Zenoti.",
+      context: { caller_name: "Patient", appointment_date: "2026-10-02", appointment_time: "11:00 AM", doctor: "Dr. Asha", branch: "Kondapur" },
+    });
+    expect(of(rows, "a1", "appointment_reminder")!.callAt).toEqual(ist("2026-10-01 18:00"));
+    expect(of(rows, "zoho1", "appointment_reminder")).toMatchObject({ verdict: "kept_out", reason: "Booked in Zenoti for Fri 2 Oct 2026 at 11:00 AM: the reminder goes by Zenoti, the clinic's own system." });
+    expect(of(rows, "a2", "no_show_rebook")).toMatchObject({ verdict: "call_now", reason: "Missed their appointment on Sat 26 Sep 2026 for PRP - Hair." });
+    expect(of(rows, "a3", "cancelled_rebook")).toMatchObject({ verdict: "call_now", priority: 25, programKey: "clinic.warm_followup", reason: "Cancelled their appointment for Consultation booked for Mon 28 Sep 2026." });
+    expect(rows.some((r) => r.originId === ids.zoho4)).toBe(false);
+    expect(of(rows, "v4", "visit_feedback")?.verdict).toBe("call_now");
+    expect(of(rows, "v5", "next_session")).toMatchObject({
+      verdict: "call_now",
+      reason: "2 sessions left, package ends on Mon 12 Oct 2026: called now so they can book before it does. Session 4 of 5 of LHR Full Legs is next; the last was on Wed 30 Sep 2026.",
+    });
+    expect(of(rows, "a6", "appointment_reminder")).toMatchObject({ verdict: "scheduled", phoneE164: phone(6) });
+    expect(of(rows, "a6", "appointment_reminder")!.callAt).toEqual(ist("2026-10-03 18:00"));
+    expect(rows.some((r) => r.originId === ids.a7)).toBe(false);
+    // The count of consents is a number only, and no call is made of it.
+    expect(JSON.stringify(first)).not.toMatch(/\+91|Patient/);
+
+    const again = await replanTenant(org, { now: NOW });
+    expect(again).toEqual(first);
+    expect(await stored()).toEqual(rows);
+  });
+
+  it("follows Zenoti as it changes: booked again, cancelled, a no-show gone, a package used up", async () => {
+    await withTenant(org, async (tx) => {
+      const [a] = await tx.select().from(clinicAppointments).where(eq(clinicAppointments.id, ids.a3!));
+      const [a9] = await tx
+        .insert(clinicAppointments)
+        .values({ ...a!, id: undefined, externalId: "a9", status: "booked", service: "Consultation", startsAt: ist("2026-10-06 10:00"), updatedAt: undefined })
+        .returning();
+      ids.a9 = a9!.id;
+      await tx.update(clinicAppointments).set({ status: "cancelled" }).where(eq(clinicAppointments.id, ids.a1!));
+      await tx.delete(clinicAppointments).where(eq(clinicAppointments.id, ids.a2!));
+      await tx.update(packageBalances).set({ used: 5, balance: 0 }).where(eq(packageBalances.integrationId, zenoti));
+    });
+    const r = await replanTenant(org, { now: NOW });
+    // Gone: 2's no-show call, 1's reminder from the booking now cancelled, and 5's next session.
+    expect(r.removed).toBe(3);
+    const rows = await stored();
+    expect(of(rows, "a3", "cancelled_rebook")).toMatchObject({ verdict: "kept_out", reason: "Cancelled their appointment for Consultation booked for Mon 28 Sep 2026, but is booked again for Tue 6 Oct 2026." });
+    expect(of(rows, "a9", "appointment_reminder")?.verdict).toBe("scheduled");
+    expect(of(rows, "zoho1", "appointment_reminder")).toMatchObject({ verdict: "kept_out", reason: "Cancelled in Zenoti for Fri 2 Oct 2026 at 11:00 AM: no reminder, as Zenoti is the clinic's own system." });
+    expect(of(rows, "a1", "cancelled_rebook")).toMatchObject({ verdict: "call_now", reason: "Cancelled their appointment for Hydrafacial booked for Fri 2 Oct 2026." });
+    expect(rows.some((x) => x.originId === ids.a2)).toBe(false);
+    expect(of(rows, "v5", "next_session")).toBeUndefined();
+    // Maintenance, six months on, waiting behind the feedback call on the visit.
+    expect(of(rows, "v5", "maintenance")).toMatchObject({ verdict: "waiting", callAt: ist("2027-03-29 10:00") });
   });
 });
