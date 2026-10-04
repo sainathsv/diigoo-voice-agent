@@ -7,3 +7,4 @@ export * from "./queue";
 export * from "./events";
 export * from "./inbound";
 export * from "./crm-sync";
+export * from "./zenoti-sync";

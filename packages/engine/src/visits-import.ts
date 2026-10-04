@@ -391,11 +391,12 @@ function sessionsOf(done: string | null, total: string | null): { sessionsDone: 
 }
 
 /**
- * The client's branch a name in the file means: the same name or code, or
- * failing that the one branch whose name it contains ("Zennara Kondapur"
- * is the Kondapur branch). Null when none or several match.
+ * The client's branch a name in the file (or a centre in their connected
+ * system) means: the same name or code, or failing that the one branch whose
+ * name it contains ("Zennara Kondapur" is the Kondapur branch). Null when
+ * none or several match.
  */
-function branchMatcher(list: ReadonlyArray<{ id: string; name: string; code?: string | null }>) {
+export function branchMatcher(list: ReadonlyArray<{ id: string; name: string; code?: string | null }>) {
   const seen = new Map<string, string | null>();
   return (text: string | null): string | null => {
     const k = norm(text);

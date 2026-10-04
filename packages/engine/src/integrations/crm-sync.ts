@@ -56,20 +56,7 @@ export interface CrmSyncResult {
  * meanwhile returns at once with ran: false.
  */
 export async function syncIntegration(tenantId: string, integrationId: string, opts: { pageBudget?: number; fetchImpl?: typeof fetch } = {}): Promise<CrmSyncResult> {
-  const taken = await withTenant(tenantId, async (tx) => {
-    const [i] = await tx
-      .update(integrations)
-      .set({ pullLeaseUntil: sql`now() + make_interval(mins => ${LEASE_MINUTES})` })
-      .where(and(eq(integrations.id, integrationId), or(isNull(integrations.pullLeaseUntil), lt(integrations.pullLeaseUntil, sql`now()`))))
-      .returning();
-    if (!i) {
-      const [there] = await tx.select({ id: integrations.id }).from(integrations).where(eq(integrations.id, integrationId));
-      if (!there) throw new Error("No such connection for this client");
-      return null;
-    }
-    const [org] = await tx.select({ timezone: organizations.timezone }).from(organizations).where(eq(organizations.id, tenantId));
-    return { i, timeZone: org?.timezone ?? "Asia/Kolkata" };
-  });
+  const taken = await takePullLease(tenantId, integrationId);
   if (!taken) return { ran: false, modules: [], pages: 0, done: false, error: null };
   const { i, timeZone } = taken;
 
@@ -118,14 +105,35 @@ export async function syncIntegration(tenantId: string, integrationId: string, o
     problems.push(`Reading stopped: ${(e as Error).message}`.slice(0, 300));
   } finally {
     result.error = problems.length ? problems.join(" ").slice(0, 1000) : null;
-    await withTenant(tenantId, (tx) =>
-      tx
-        .update(integrations)
-        .set({ lastPullAt: new Date(), lastPullError: result.error, pullLeaseUntil: null })
-        .where(eq(integrations.id, i.id)),
-    );
+    await endPull(tenantId, i.id, result.error);
   }
   return result;
+}
+
+/**
+ * Takes a connection's pull lease, so one run reads it at a time: null when
+ * another run holds it. Throws when the client has no such connection.
+ */
+export async function takePullLease(tenantId: string, integrationId: string): Promise<{ i: Integration; timeZone: string } | null> {
+  return withTenant(tenantId, async (tx) => {
+    const [i] = await tx
+      .update(integrations)
+      .set({ pullLeaseUntil: sql`now() + make_interval(mins => ${LEASE_MINUTES})` })
+      .where(and(eq(integrations.id, integrationId), or(isNull(integrations.pullLeaseUntil), lt(integrations.pullLeaseUntil, sql`now()`))))
+      .returning();
+    if (!i) {
+      const [there] = await tx.select({ id: integrations.id }).from(integrations).where(eq(integrations.id, integrationId));
+      if (!there) throw new Error("No such connection for this client");
+      return null;
+    }
+    const [org] = await tx.select({ timezone: organizations.timezone }).from(organizations).where(eq(organizations.id, tenantId));
+    return { i, timeZone: org?.timezone ?? "Asia/Kolkata" };
+  });
+}
+
+/** Lets go of the pull lease and records when the run ended and what went wrong, in plain words. */
+export async function endPull(tenantId: string, integrationId: string, error: string | null): Promise<void> {
+  await withTenant(tenantId, (tx) => tx.update(integrations).set({ lastPullAt: new Date(), lastPullError: error, pullLeaseUntil: null }).where(eq(integrations.id, integrationId)));
 }
 
 function modulesOf(i: Integration, fallback: string[] | undefined): string[] {

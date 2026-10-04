@@ -97,6 +97,23 @@ export class ZenotiUnavailableError extends ZenotiError {
   }
 }
 
+/** This run has made every call it was given. Nothing is wrong: the rest is read next time. */
+export class ZenotiBudgetSpent extends ZenotiError {
+  override name = "ZenotiBudgetSpent";
+  constructor(what: string) {
+    super(`JENAI made every call to Zenoti this run was given before reading ${what}; the rest is read next time.`, 0, what, false, true);
+  }
+}
+
+/**
+ * Calls one run may still make, retries and checks included. The clinic's
+ * other apps share Zenoti's minute, so a run never spends more than it was given.
+ */
+export interface ZenotiCallBudget {
+  left: number;
+  used: number;
+}
+
 // ---------------------------------------------------------------- pacing
 
 export interface ZenotiClock {
@@ -315,6 +332,8 @@ export class ZenotiClient {
   constructor(
     private readonly ctx: ConnectorContext,
     private readonly clock: ZenotiClock = realClock,
+    /** Shared with everything else one run reads. Left out, no limit beyond the pace. */
+    private readonly budget?: ZenotiCallBudget,
   ) {
     this.base = zenotiBase(ctx.integration.config);
     const key = ctx.credentials.api_key?.trim();
@@ -336,6 +355,11 @@ export class ZenotiClient {
     if (req.body !== undefined) headers["Content-Type"] = "application/json";
     let last: Answer = { status: 0, json: null, headers: new Headers() };
     for (let attempt = 0; attempt < MAX_TRIES; attempt++) {
+      if (this.budget) {
+        if (this.budget.left <= 0) throw new ZenotiBudgetSpent(req.what);
+        this.budget.left--;
+        this.budget.used++;
+      }
       await take(this.gate, this.perMinute, this.clock);
       let res: Response;
       try {
@@ -538,16 +562,18 @@ function centresLine(centres: ZenotiCentre[]): string {
  * What was found is kept on the connection (config.access, config.centres)
  * for the sync.
  */
-export async function testZenoti(ctx: ConnectorContext, clock: ZenotiClock = realClock): Promise<ZenotiTestResult> {
+export async function testZenoti(ctx: ConnectorContext, clock: ZenotiClock = realClock, budget?: ZenotiCallBudget): Promise<ZenotiTestResult> {
   const none: ZenotiCapabilities = { appointments: null, guestDetails: null, guestPackages: null, salesAccrual: null, salesReport: null };
   const fail = (message: string, advice: string[] = []): ZenotiTestResult => ({ ok: false, message: [message, ...advice].join(" "), centres: [], capabilities: none, path: null, advice });
 
   let client: ZenotiClient;
   let centres: ZenotiCentre[];
   try {
-    client = new ZenotiClient(ctx, clock);
+    client = new ZenotiClient(ctx, clock, budget);
     centres = await client.centres();
   } catch (e) {
+    // Out of calls is the caller's to handle, not something wrong with the key.
+    if (e instanceof ZenotiBudgetSpent) throw e;
     if (e instanceof ZenotiKeyError) {
       return fail(e.message, ["Ask your Zenoti admin for the API key of the backend app made for JENAI (in Zenoti: Configuration, then Apps under Integrations) and save it here again."]);
     }
@@ -935,7 +961,13 @@ export function zenotiAppointmentVisit(a: unknown, opts: ZenotiReadOptions = {})
   };
 }
 
-/** A report line for a service: item type 0 in the older report, "Service" in the accrual report. */
+/**
+ * A report line for a service: item type 0 in the older report (where 2 is a
+ * product, 3 a membership, 4 a package, 6 a gift card), "Service" in the
+ * accrual report. A session taken from a package is a service line too, its
+ * package_redemption or redeemed saying how much of it the package paid; the
+ * package's own sale (4) is not a session.
+ */
 const isService = (v: unknown) => v === 0 || (typeof v === "string" && /^(0|service)$/i.test(v.trim()));
 
 /** A line that took nothing away (a refund or a correction) is not a visit. */
@@ -1067,7 +1099,8 @@ export function zenotiPackageBalances(guestRef: string, packages: unknown): Zeno
     const expiresOn = centreDay(obj(pk.date).end, null, "UTC");
     for (const s of listOf(pk.services)) {
       const sv = obj(s);
-      const service = text(sv.name, 300) ?? text(obj(sv.service).name, 300);
+      // Documented under service_type_info; the other two are kept for answers shaped otherwise.
+      const service = text(obj(sv.service_type_info).name, 300) ?? text(sv.name, 300) ?? text(obj(sv.service).name, 300);
       if (!service) continue;
       const row: ZenotiPackageRow = {
         guestRef,

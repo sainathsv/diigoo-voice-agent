@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import type { Integration } from "@jenai/db";
 import type { ConnectorContext } from "./types";
 import {
+  ZenotiBudgetSpent,
   ZenotiClient,
   ZenotiKeyError,
   ZenotiPermissionError,
@@ -386,6 +387,24 @@ describe("zenoti: pace and retries", () => {
       expect(c.slept).toEqual([1000, 2000, 4000]);
     }
   });
+
+  it("stops at the calls it was given, retries and checks counted, and says so without blaming the key", async () => {
+    const flaky = fakeZenoti(() => ({ status: 503 }));
+    const budget = { left: 2, used: 0 };
+    const err = await new ZenotiClient(connection(flaky.fetchImpl).ctx, fakeClock(), budget).centres().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ZenotiBudgetSpent);
+    expect(err).toMatchObject({ retryLater: true, connectionBroken: false });
+    expect(flaky.seen).toHaveLength(2);
+    expect(budget).toEqual({ left: 0, used: 2 });
+
+    // A Test that runs out part way hands that back, rather than reporting the key as wrong.
+    const z = zenotiAllowing(new Set(ENDPOINTS));
+    const { ctx, saved } = connection(z.fetchImpl);
+    await expect(testZenoti(ctx, fakeClock(), { left: 3, used: 0 })).rejects.toBeInstanceOf(ZenotiBudgetSpent);
+    expect(z.seen).toHaveLength(3);
+    expect(saved).toEqual([]);
+    expect((await testZenoti(connection(z.fetchImpl).ctx, fakeClock(), { left: 6, used: 0 })).ok).toBe(true);
+  });
 });
 
 describe("zenoti: refusals", () => {
@@ -673,6 +692,18 @@ describe("zenoti: mappers", () => {
     expect(zenotiPackageBalances("g-1", [...packages].reverse()).find((r) => r.service === "LHR Full Legs")?.packageRef).toBe("up-new");
     // Wrapped under a key, as some answers are.
     expect(zenotiPackageBalances("g-1", { packages })).toHaveLength(3);
+    // As list-the-series-packages-of-a-guest documents it: the service's name under service_type_info.
+    const documented = {
+      user_package_id: "c3122758",
+      status: 1,
+      package: { type: 0, id: "f784690e", name: "Luxury Series Package" },
+      date: { end_date_with_grace: "2020-05-14T00:00:00", start: "2020-02-03T21:43:42", end: "2020-04-29T00:00:00" },
+      products: [{ product_type_info: { product_category_type: 1, name: "Mask", id: "29893bd5" }, total: 4, used: 1, balance: 3 }],
+      services: [{ service_type_info: { service_category_type: 1, id: "21077983", name: "Feet Massage", duration: 0 }, exists_in_current_center: true, total: 1, used: 0, balance: 1, balance_amount: 205.25 }],
+    };
+    expect(zenotiPackageBalances("g-2", [documented])).toEqual([
+      { guestRef: "g-2", packageRef: "c3122758", packageName: "Luxury Series Package", service: "Feet Massage", total: 1, used: 0, balance: 1, status: "active", expiresOn: "2020-04-29" },
+    ]);
     expect(zenotiPackageBalances("g-1", null)).toEqual([]);
   });
 });

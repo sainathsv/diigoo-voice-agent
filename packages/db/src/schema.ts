@@ -1423,7 +1423,11 @@ export const externalPeople = pgTable(
     name: text("name"),
     marketingSmsConsent: boolean("marketing_sms_consent"),
     transactionalSmsConsent: boolean("transactional_sms_consent"),
-    fetchedAt: ts("fetched_at").notNull().defaultNow(),
+    /** When their profile was last read (migration 0031). Empty for someone seen only on a booking or a sales line. */
+    fetchedAt: ts("fetched_at"),
+    /** When their packages were last read, whether or not they have any (migration 0031). */
+    packagesFetchedAt: ts("packages_fetched_at"),
+    /** Also touched whenever they are seen again on a booking or a sales line. */
     updatedAt: ts("updated_at").notNull().defaultNow(),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
