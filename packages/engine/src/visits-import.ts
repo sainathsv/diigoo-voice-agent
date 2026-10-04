@@ -144,6 +144,17 @@ export function visitColumnsOf(raw: unknown): Record<VisitField, readonly string
   return out;
 }
 
+/** Why a value cannot be the visitColumns setting, in plain words, or null when it can. visitColumnsOf() would ignore it quietly. */
+export function visitColumnsProblem(value: unknown): string | null {
+  const example = `such as {"phone": ["Mobile No"]}. The fields are ${FIELDS.join(", ")}.`;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return `visitColumns must list, per field, the column names to look for, ${example}`;
+  for (const [field, names] of Object.entries(value)) {
+    if (!(FIELDS as string[]).includes(field)) return `"${field}" is not a field of the visit list. The fields are ${FIELDS.join(", ")}.`;
+    if (!Array.isArray(names) || !names.every((x) => typeof x === "string" && norm(x))) return `visitColumns.${field} must be a list of column names, ${example}`;
+  }
+  return null;
+}
+
 export interface VisitColumns {
   /** Index of the row holding the column names (0 is the file's first row). */
   header: number;

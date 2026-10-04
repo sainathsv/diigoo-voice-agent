@@ -1,9 +1,16 @@
 /**
  * Connect a client's Zoho CRM, or connect it again after their admin changed
- * what JENAI may do.
+ * what JENAI may do. Or read it now for the call plan.
  *
  *   ZOHO_CLIENT_ID=... ZOHO_CLIENT_SECRET=... ZOHO_CODE=... \
  *     pnpm --filter @jenai/db zoho connect --tenant zennara --dc in --module Leads
+ *
+ *   pnpm --filter @jenai/db zoho pull --tenant zennara [--pages 10]
+ *
+ * pull reads what changed in their Leads and Contacts since the last read
+ * (read only), plans everyone's calls again and prints counts: per module,
+ * and per journey and verdict. Nothing is dialled and nothing is written to
+ * Zoho. It never prints a name or number.
  *
  * The three secrets come from the environment, never from arguments, so they
  * stay out of shell history and the process list. The grant code is spent here
@@ -18,8 +25,9 @@
  */
 import "./env";
 import { eq } from "drizzle-orm";
-import { exchangeGrantCode, saveZohoConnection, testConnection } from "@jenai/engine";
+import { exchangeGrantCode, pullAndPlan, pullableConnections, saveZohoConnection, testConnection } from "@jenai/engine";
 import { organizations, platformDb, withTenant } from "../index";
+import { planTable, when } from "./plan-text";
 
 const arg = (name: string, fallback = "") => {
   const i = process.argv.indexOf(`--${name}`);
@@ -68,9 +76,50 @@ async function connect() {
   console.log(`  The grant code is now spent. The refresh token is sealed and does not expire.\n`);
 }
 
-if (process.argv[2] !== "connect") {
-  console.log("usage: zoho connect --tenant <address> [--dc in] [--module Leads]\n  with ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_CODE in the environment");
+async function pull() {
+  const slug = arg("tenant");
+  if (!slug) throw new Error("need --tenant <address>");
+  const pages = Math.max(1, Math.floor(Number(arg("pages", "10")) || 10));
+  const [org] = await platformDb().select().from(organizations).where(eq(organizations.slug, slug));
+  if (!org || org.kind !== "client") throw new Error(`No client with the address "${slug}".`);
+  const connections = await pullableConnections(org.id);
+  if (!connections.length) {
+    console.error(`\n  ${org.name} has no connection JENAI can read records from. Connect Zoho first with: zoho connect --tenant ${slug}\n`);
+    process.exit(1);
+  }
+
+  for (const c of connections) {
+    console.log(`\n${org.name}: reading ${c.name} (${c.status}), up to ${pages} requests`);
+    const r = await pullAndPlan(org.id, c.id, { pageBudget: pages });
+    if (!r.sync.ran) {
+      console.log("  Another read of this connection is running now. Try again in a few minutes.");
+      continue;
+    }
+    for (const m of r.sync.modules) {
+      const state = m.skipped ? "left out" : m.error ? "stopped" : m.done ? "caught up" : "more to read";
+      console.log(`  ${m.module.padEnd(10)} ${String(m.read).padStart(6)} read  ${String(m.deleted).padStart(5)} deleted  ${state}`);
+      for (const n of m.notes ?? []) console.log(`    note: ${n}`);
+    }
+    console.log(`  requests   ${r.sync.pages}`);
+    if (r.sync.error) console.log(`  problem    ${r.sync.error}`);
+    if (r.planError) console.log(`  problem    ${r.planError}`);
+    if (r.plan) {
+      console.log(`\n  call plan  ${r.plan.people} people, ${r.plan.rows} rows (${r.plan.removed} no longer apply)`);
+      for (const line of planTable(r.plan.byVerdict, r.plan.byJourney)) console.log(`  ${line}`);
+    }
+    if (r.nextPullAt) console.log(`\n  next scheduled read ${when(r.nextPullAt, org.timezone)} (when the worker reads on a timer)`);
+  }
+  console.log("  Nothing was dialled and nothing was written to Zoho. This is the plan only.\n");
+}
+
+const command = process.argv[2];
+if (command === "connect") await connect();
+else if (command === "pull") await pull();
+else {
+  console.log(
+    "usage: zoho connect --tenant <address> [--dc in] [--module Leads]\n  with ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_CODE in the environment\n" +
+      "       zoho pull --tenant <address> [--pages 10]",
+  );
   process.exit(1);
 }
-await connect();
 process.exit(0);

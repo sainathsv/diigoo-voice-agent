@@ -17,7 +17,7 @@ import type { ConnectorContext, PullResult, PulledRecord } from "./types";
 /** Requests for records one run makes when the caller does not say: up to 2,000 changed records. */
 const DEFAULT_PAGE_BUDGET = 10;
 /** Long enough for a run's requests. A worker that dies lets go of the connection after this. */
-const LEASE_MINUTES = 15;
+export const PULL_LEASE_MINUTES = 15;
 /** Rows per insert statement. */
 const CHUNK = 200;
 
@@ -46,6 +46,17 @@ export interface CrmSyncResult {
   error: string | null;
 }
 
+export interface SyncOptions {
+  pageBudget?: number;
+  fetchImpl?: typeof fetch;
+  /**
+   * The caller holds the lease already (claimPulls) and lets go of it itself,
+   * once it has also set when the next read is due. Without this the lease is
+   * taken here and let go at the end.
+   */
+  leased?: boolean;
+}
+
 /**
  * Reads what changed in each module of one connection's CRM since the last
  * run (config.pull.modules, else the connector's own list, for Zoho Leads
@@ -55,13 +66,15 @@ export interface CrmSyncResult {
  * Holds the connection's pull lease while it runs, so a second run started
  * meanwhile returns at once with ran: false.
  */
-export async function syncIntegration(tenantId: string, integrationId: string, opts: { pageBudget?: number; fetchImpl?: typeof fetch } = {}): Promise<CrmSyncResult> {
+export async function syncIntegration(tenantId: string, integrationId: string, opts: SyncOptions = {}): Promise<CrmSyncResult> {
   const taken = await withTenant(tenantId, async (tx) => {
-    const [i] = await tx
-      .update(integrations)
-      .set({ pullLeaseUntil: sql`now() + make_interval(mins => ${LEASE_MINUTES})` })
-      .where(and(eq(integrations.id, integrationId), or(isNull(integrations.pullLeaseUntil), lt(integrations.pullLeaseUntil, sql`now()`))))
-      .returning();
+    const [i] = opts.leased
+      ? await tx.select().from(integrations).where(eq(integrations.id, integrationId))
+      : await tx
+          .update(integrations)
+          .set({ pullLeaseUntil: sql`now() + make_interval(mins => ${PULL_LEASE_MINUTES})` })
+          .where(and(eq(integrations.id, integrationId), or(isNull(integrations.pullLeaseUntil), lt(integrations.pullLeaseUntil, sql`now()`))))
+          .returning();
     if (!i) {
       const [there] = await tx.select({ id: integrations.id }).from(integrations).where(eq(integrations.id, integrationId));
       if (!there) throw new Error("No such connection for this client");
@@ -121,7 +134,7 @@ export async function syncIntegration(tenantId: string, integrationId: string, o
     await withTenant(tenantId, (tx) =>
       tx
         .update(integrations)
-        .set({ lastPullAt: new Date(), lastPullError: result.error, pullLeaseUntil: null })
+        .set({ lastPullAt: new Date(), lastPullError: result.error, ...(opts.leased ? {} : { pullLeaseUntil: null }) })
         .where(eq(integrations.id, i.id)),
     );
   }

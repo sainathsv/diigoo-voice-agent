@@ -5,7 +5,13 @@
  *   JENAI_REAL_DIALS=true   place real calls (still only for clients in managed mode with an API key)
  *   JENAI_SYNC=true         pull calls from the voice engine every JENAI_SYNC_SECONDS (default 300)
  *   JENAI_ANALYZE=true      read new transcripts with the analyzer (Bedrock Mumbai, or a local model)
+ *   JENAI_PULL=true         read each client's CRM (Zoho Leads and Contacts, read only) every
+ *                           config.pull.intervalMinutes (default 10), JENAI_PULL_PAGES requests
+ *                           a read (default 5), and plan everyone's calls again after each read;
+ *                           clients with visits but no CRM read are planned again hourly
  * Without them the dialer uses the simulated carrier and nothing touches the live engine.
+ * The call plan is a preview: the pull never dials, never creates campaign targets and never
+ * writes to a client's CRM.
  *
  * The AI safety loop is ON by default (JENAI_SAFETY=false turns it off): it runs
  * the red-team checks that publishing waits for, and re-checks live agents when
@@ -52,7 +58,9 @@ import {
   remindPending,
   resendFailed,
   keepWhatsappConnected,
+  acrossDatabases,
   claimDeliveries,
+  claimPulls,
   claimSafetyChecks,
   deliver,
   enqueueFleetSweep,
@@ -63,6 +71,10 @@ import {
   logNotifier,
   notifyPending,
   maintainSecurityEvents,
+  plansToRefresh,
+  pullAndPlan,
+  replanTenant,
+  requeueStuckPulls,
   runDialerTick,
   snsNotifier,
   syncTenantCalls,
@@ -83,6 +95,12 @@ const RECHECK_DAYS = Math.max(1, Number(process.env.JENAI_SAFETY_RECHECK_DAYS ??
 const INTEGRATIONS = !POLICE && process.env.JENAI_INTEGRATIONS !== "false";
 const WHATSAPP = process.env.JENAI_WHATSAPP !== "false";
 const DELIVERY_BATCH = Math.max(1, Number(process.env.JENAI_INTEGRATIONS_BATCH ?? 10));
+const PULL = !POLICE && process.env.JENAI_PULL === "true"; // a police server sends nothing elsewhere
+const PULL_PAGES = Math.max(1, Number(process.env.JENAI_PULL_PAGES ?? 5) || 5);
+/** Connections read at once by this worker. Each is a different client's CRM, so they do not wait on each other. */
+const PULL_BATCH = 3;
+/** Clients planned again per pass of the hourly refresh, so a large fleet is spread over passes. */
+const REPLAN_BATCH = 50;
 const SYNC_MS = Math.max(60, Number(process.env.JENAI_SYNC_SECONDS ?? 300)) * 1000;
 const TICK_MS = 3000;
 let stopping = false;
@@ -313,6 +331,76 @@ async function integrationsLoop() {
   }
 }
 
+/**
+ * Keeps every client's call plan current. Reads due CRM connections a few at
+ * a time and plans that client again after each read; every few minutes,
+ * plans again the clients whose plan is over an hour old and that no read
+ * will plan soon. One client failing is logged and the rest carry on. Never
+ * dials and never creates campaign targets.
+ */
+async function planLoop() {
+  let lastRequeue = 0;
+  let lastRefresh = 0;
+  /** A client whose plan failed is not tried again for an hour, so one fault does not fill the log. */
+  const failed = new Map<string, number>();
+  while (!stopping) {
+    let claimed: Array<{ tenantId: string; id: string }> = [];
+    try {
+      if (Date.now() - lastRequeue > 60_000) {
+        lastRequeue = Date.now();
+        const stuck = await acrossDatabases(async (db) => [await requeueStuckPulls(db)]);
+        const n = stuck.rows.reduce((a, b) => a + b, 0);
+        if (n) log("plan.pull_requeued", { count: n });
+        for (const e of stuck.errors) log("plan.error", { message: e });
+      }
+      const due = await acrossDatabases((db) => claimPulls(db, PULL_BATCH));
+      for (const e of due.errors) log("plan.error", { message: e });
+      claimed = due.rows;
+      await Promise.all(
+        claimed.map(async (c) => {
+          try {
+            const r = await pullAndPlan(c.tenantId, c.id, { pageBudget: PULL_PAGES, scheduled: true });
+            log("plan.pulled", {
+              tenant: c.tenantId.slice(0, 8),
+              read: r.sync.modules.reduce((n, m) => n + m.read, 0),
+              deleted: r.sync.modules.reduce((n, m) => n + m.deleted, 0),
+              pages: r.sync.pages,
+              caughtUp: r.sync.done,
+              planned: r.plan?.rows ?? null,
+              error: (r.planError ?? r.sync.error)?.slice(0, 160),
+            });
+          } catch (e) {
+            log("plan.pull_error", { tenant: c.tenantId.slice(0, 8), message: (e as Error).message.slice(0, 200) });
+          }
+        }),
+      );
+      if (Date.now() - lastRefresh > 5 * 60_000) {
+        lastRefresh = Date.now();
+        // Asked for as many more as are resting after a failure, so they never crowd out the rest.
+        const old = await acrossDatabases((db) => plansToRefresh(db, REPLAN_BATCH + failed.size));
+        for (const e of old.errors) log("plan.error", { message: e });
+        let done = 0;
+        for (const tenantId of old.rows) {
+          if (stopping || done >= REPLAN_BATCH) break;
+          if (Date.now() - (failed.get(tenantId) ?? 0) < 3_600_000) continue;
+          done++;
+          try {
+            const p = await replanTenant(tenantId);
+            failed.delete(tenantId);
+            log("plan.refreshed", { tenant: tenantId.slice(0, 8), people: p.people, rows: p.rows, removed: p.removed });
+          } catch (e) {
+            failed.set(tenantId, Date.now());
+            log("plan.refresh_error", { tenant: tenantId.slice(0, 8), message: (e as Error).message.slice(0, 200) });
+          }
+        }
+      }
+    } catch (e) {
+      log("plan.error", { message: (e as Error).message });
+    }
+    if (!claimed.length) await new Promise((r) => setTimeout(r, 15_000));
+  }
+}
+
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     log("worker.stopping", { signal: sig });
@@ -321,7 +409,7 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
-log("worker.started", { whatsapp: WHATSAPP, edition: POLICE ? "police" : "full", realDials: REAL, sync: SYNC, analyze: ANALYZE, syncSeconds: SYNC_MS / 1000, security: SECURITY, alertTopic: ALERT_TOPIC ? "sns" : "log", safety: SAFETY, safetyRecheckDays: RECHECK_DAYS, integrations: INTEGRATIONS });
+log("worker.started", { whatsapp: WHATSAPP, edition: POLICE ? "police" : "full", realDials: REAL, sync: SYNC, analyze: ANALYZE, syncSeconds: SYNC_MS / 1000, security: SECURITY, alertTopic: ALERT_TOPIC ? "sns" : "log", safety: SAFETY, safetyRecheckDays: RECHECK_DAYS, integrations: INTEGRATIONS, pull: PULL, pullPages: PULL_PAGES });
 void dialerLoop();
 if (SYNC) void syncLoop();
 if (SYNC && ANALYZE) void analyzeLoop();
@@ -329,6 +417,7 @@ if (SECURITY) void securityLoop();
 if (SAFETY) void safetyLoop();
 if (INTEGRATIONS) void integrationsLoop();
 if (WHATSAPP) void whatsappLoop();
+if (PULL) void planLoop();
 try {
   const line = lineConfigFromEnv();
   if (line) void lineLoop(line);

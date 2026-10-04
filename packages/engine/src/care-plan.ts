@@ -170,6 +170,28 @@ export function planSettingsOf(raw: unknown, timezone = DEFAULT_PLAN_SETTINGS.ti
   return s;
 }
 
+/** The settings a client can change here. The time zone is not one: it is their organisation's. */
+export const PLAN_SETTING_KEYS = [...(Object.keys(NUMBER_LIMITS) as NumberKey[]), ...LIST_KEYS, "callingWindow" as const];
+export type PlanSettingKey = NumberKey | ListKey | "callingWindow";
+
+/**
+ * Why a value cannot be stored as this setting, in plain words, or null when
+ * it can. planSettingsOf() quietly keeps the default for a value it cannot
+ * use, so whoever sets one is told here instead.
+ */
+export function planSettingProblem(key: PlanSettingKey, value: unknown): string | null {
+  if (key === "callingWindow") {
+    const days = (value as { days?: unknown } | null)?.days;
+    const ok = Array.isArray(days) && days.every((d) => Number.isInteger(d) && d >= 0 && d <= 6) && windowOf(value);
+    return ok ? null : `callingWindow must look like {"days": [1, 2, 3, 4, 5, 6], "start": "10:00", "end": "19:00"}, where day 0 is Sunday, and leave some calling time between 09:00 and 21:00.`;
+  }
+  if ((LIST_KEYS as string[]).includes(key)) {
+    return Array.isArray(value) && value.every((x) => typeof x === "string" && x.trim()) ? null : `${key} must be a list of names in quotes, such as ["First", "Second"], or [] for none.`;
+  }
+  const [min, max] = NUMBER_LIMITS[key as NumberKey];
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max ? null : `${key} must be a whole number from ${min} to ${max}.`;
+}
+
 function windowOf(v: unknown): Windows | null {
   if (!v || typeof v !== "object") return null;
   const w = v as Record<string, unknown>;
