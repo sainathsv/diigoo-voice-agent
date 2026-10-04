@@ -1,10 +1,25 @@
 import { assertClientUrl, toE164 } from "@jenai/voice";
-import { CALL_DETAIL, HEALTH_DETAIL, applyMapping, retryable, type Connector, type ConnectorContext, type OutEvent, type SendResult } from "./types";
+import { zoned } from "../dialer/time";
+import {
+  CALL_DETAIL,
+  HEALTH_DETAIL,
+  applyMapping,
+  retryable,
+  type Connector,
+  type ConnectorContext,
+  type OutEvent,
+  type PullInput,
+  type PullResult,
+  type PulledRecord,
+  type SendResult,
+} from "./types";
 
 /**
  * Zoho CRM. The client keeps running Zoho exactly as they do today; JENAI adds
  * a note to the right record after every call, updates the fields they choose,
- * and can create a follow-up task. We never copy their database out.
+ * and can create a follow-up task. For the call plan it reads their Leads and
+ * Contacts, keeping only the few fields planning uses (never their notes), and
+ * writes nothing back for it.
  *
  * Setup on their side: a Self Client or server-based app in the Zoho API
  * console, scopes ZohoCRM.modules.ALL (or the narrower ones below),
@@ -200,11 +215,32 @@ interface Token {
 const GRANT_GONE = new Set(["invalid_code", "invalid_client", "invalid_client_secret"]);
 class GrantGoneError extends Error {}
 
+/**
+ * Refreshes under way, per connection. The pull and the write-backs share one
+ * refresh token, and Zoho keeps only the newest 15 access tokens per refresh
+ * token and limits how fast new ones are made, so callers that find the token
+ * stale at the same moment wait for one refresh instead of each making their own.
+ */
+const refreshing = new Map<string, Promise<{ token: string; until: string }>>();
+
 /** Zoho access tokens last an hour; the refresh token is the long-lived one we store. */
 async function accessToken(ctx: ConnectorContext, fresh = false): Promise<string> {
   const cached = ctx.credentials.access_token;
   const until = Number(ctx.credentials.access_token_until ?? 0);
   if (!fresh && cached && until > Date.now() + 60_000) return cached;
+  const key = `${ctx.integration.tenantId}:${ctx.integration.id}`;
+  let flight = refreshing.get(key);
+  if (!flight) {
+    flight = refresh(ctx).finally(() => refreshing.delete(key));
+    refreshing.set(key, flight);
+  }
+  const t = await flight;
+  ctx.credentials.access_token = t.token;
+  ctx.credentials.access_token_until = t.until;
+  return t.token;
+}
+
+async function refresh(ctx: ConnectorContext): Promise<{ token: string; until: string }> {
   const dc = dcOf(ctx);
   const url = `${ACCOUNTS[dc] ?? ACCOUNTS.in}/oauth/v2/token`;
   await assertClientUrl(url);
@@ -220,10 +256,9 @@ async function accessToken(ctx: ConnectorContext, fresh = false): Promise<string
     const why = `Zoho refused the refresh token: ${j.error ?? res.status}`;
     throw GRANT_GONE.has(j.error ?? "") ? new GrantGoneError(`${why}. Reconnect Zoho.`) : new Error(why);
   }
-  await ctx.save({ credentials: { ...ctx.credentials, access_token: j.access_token, access_token_until: String(Date.now() + (j.expires_in ?? 3600) * 1000) } });
-  ctx.credentials.access_token = j.access_token;
-  ctx.credentials.access_token_until = String(Date.now() + (j.expires_in ?? 3600) * 1000);
-  return j.access_token;
+  const until = String(Date.now() + (j.expires_in ?? 3600) * 1000);
+  await ctx.save({ credentials: { ...ctx.credentials, access_token: j.access_token, access_token_until: until } });
+  return { token: j.access_token, until };
 }
 
 interface Answer {
@@ -241,10 +276,13 @@ async function call(ctx: ConnectorContext, path: string, init: RequestInit = {},
     headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json", ...(init.headers ?? {}) },
     redirect: "error",
   });
-  const text = (await res.text().catch(() => "")).slice(0, 4000);
+  // The whole body is read as JSON (a page of 200 records runs far past the
+  // part kept as text for the delivery log).
+  const body = await res.text().catch(() => "");
+  const text = body.slice(0, 4000);
   let json: Record<string, unknown> = {};
   try {
-    json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    json = body ? (JSON.parse(body) as Record<string, unknown>) : {};
   } catch {
     json = {};
   }
@@ -654,8 +692,451 @@ function shares(ctx: ConnectorContext): string {
 /** A number nobody has, for the Test button's search: Zoho answers it with nothing found when searching is allowed. */
 const PROBE = "0000000000";
 
+// ---------------------------------------------------------------- reading their records, for the call plan
+
+const PULL_KEYS = [
+  "phone",
+  "fullName",
+  "firstName",
+  "lastName",
+  "status",
+  "source",
+  "notes",
+  "appointment",
+  "followUp",
+  "treatment",
+  "subTreatment",
+  "category",
+  "consultant",
+  "centre",
+] as const;
+type PullKey = (typeof PULL_KEYS)[number];
+
+/**
+ * Where each thing the call plan reads usually sits in a clinic's Zoho, by the
+ * label their admin gave the field. Labels differ from one Zoho to the next,
+ * so each is a list tried in order, and a client's own list
+ * (config.pull.fieldLabels.<item>) replaces the default for that item. A label
+ * also matches a field's API name, case, spaces and punctuation aside.
+ */
+export const ZOHO_PULL_LABELS: Record<PullKey, string[]> = {
+  phone: ["Mobile", "Phone"],
+  fullName: ["Full Name"],
+  firstName: ["First Name"],
+  lastName: ["Last Name"],
+  status: ["Lead Status"],
+  source: ["Lead Source"],
+  notes: ["Description"],
+  appointment: ["Appointment Date/Time", "Appointment Date", "Appointment"],
+  followUp: ["Follow Up Date/Time", "Follow-up Date", "Callback Date"],
+  treatment: ["Treatment", "Service"],
+  subTreatment: ["Sub Category", "Sub Treatment"],
+  category: ["Category"],
+  consultant: ["Consultant Name", "Doctor"],
+  centre: ["Select Your Centre", "Select Your Branch", "Centre", "Branch", "Location"],
+};
+
+/** Records per page: Zoho's most (get-records: per_page "default and maximum is 200"). */
+const PER_PAGE = 200;
+/**
+ * The deepest page asked for. Zoho's later API versions stop page-based
+ * listing at 2,000 records; v2's page does not say, so we stop there too and
+ * start again from the newest change read instead.
+ */
+const MAX_PAGE = 10;
+const READ_TIMEOUT_MS = 30_000;
+const FIELDS_SCOPE = "ZohoCRM.settings.fields.READ";
+/** How long a module's field list is trusted before it is read again. */
+const FIELD_MAP_MS = 60 * 60_000;
+
+const squash = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+
+function labelsOf(ctx: ConnectorContext): Record<PullKey, string[]> {
+  const pull = (ctx.integration.config.pull ?? {}) as Record<string, unknown>;
+  const theirs = (pull.fieldLabels ?? {}) as Record<string, unknown>;
+  return Object.fromEntries(
+    PULL_KEYS.map((k) => {
+      const own = theirs[k];
+      return [k, Array.isArray(own) && own.length ? own.map(String) : ZOHO_PULL_LABELS[k]];
+    }),
+  ) as Record<PullKey, string[]>;
+}
+
+/** The fields of theirs, by API name, that each label list points at, in the order of the labels. */
+function namesFor(labels: Record<PullKey, string[]>, fields: Array<{ api: string; labels: string[] }>): Record<PullKey, string[]> {
+  const out = {} as Record<PullKey, string[]>;
+  for (const k of PULL_KEYS) {
+    out[k] = [];
+    for (const label of labels[k]) {
+      const want = squash(label);
+      if (!want) continue;
+      for (const f of fields) if (!out[k].includes(f.api) && f.labels.some((l) => squash(l) === want)) out[k].push(f.api);
+    }
+  }
+  return out;
+}
+
+interface FieldMap {
+  /** API names per item. Null when their field list could not be read: then each record's own keys are matched. */
+  names: Record<PullKey, string[]> | null;
+  /** The fields to ask for. Empty asks for every field. */
+  ask: string[];
+  note?: string;
+}
+
+const fieldMaps = new Map<string, { at: number; map: FieldMap }>();
+
+/** Whether their admin granted reading the field list. Unknown scopes mean try, unless Zoho refused it since. */
+function mayReadFields(ctx: ConnectorContext): boolean {
+  if (denied(ctx).has(FIELDS_SCOPE)) return false;
+  const g = granted(ctx);
+  return !g.size || [FIELDS_SCOPE, "ZohoCRM.settings.fields.ALL", "ZohoCRM.settings.READ", "ZohoCRM.settings.ALL"].some((s) => g.has(s));
+}
+
+/**
+ * Which of their fields hold what the plan reads, from Zoho's own field list
+ * (settings/fields), kept for an hour per connection. Without the settings
+ * scope every field is asked for and matched by its API name instead, which
+ * finds the standard fields and most custom ones.
+ */
+async function fieldMap(ctx: ConnectorContext, module: string): Promise<FieldMap | { refused: Answer }> {
+  const labels = labelsOf(ctx);
+  const fallback = (why: string): FieldMap => ({ names: null, ask: [], note: `${why}, so ${module} fields were matched by their API names.` });
+  if (!mayReadFields(ctx)) return fallback(`Zoho was not granted ${FIELDS_SCOPE}`);
+  const key = `${ctx.integration.tenantId}:${ctx.integration.id}:${dcOf(ctx)}:${module}:${JSON.stringify(labels)}`;
+  const hit = fieldMaps.get(key);
+  if (hit && Date.now() - hit.at < FIELD_MAP_MS) return hit.map;
+  const r = await call(ctx, `/crm/v2/settings/fields?module=${encodeURIComponent(module)}`, { signal: AbortSignal.timeout(READ_TIMEOUT_MS) });
+  if (r.status !== 200) {
+    if (judge(r) !== "not-allowed") return { refused: r };
+    await learn(ctx, r, FIELDS_SCOPE);
+    return fallback(`Zoho would not list the fields (${said(r)})`);
+  }
+  const fields = ((r.json.fields as Array<Record<string, unknown>> | undefined) ?? [])
+    .filter((f) => typeof f.api_name === "string")
+    .map((f) => ({ api: String(f.api_name), labels: [f.field_label, f.display_label, f.api_name].filter((x): x is string => typeof x === "string") }));
+  const names = namesFor(labels, fields);
+  // Modified_Time orders the read and moves the cursor, so it is always asked for.
+  const map: FieldMap = { names, ask: [...new Set(["Modified_Time", "Created_Time", ...PULL_KEYS.flatMap((k) => names[k])])] };
+  fieldMaps.set(key, { at: Date.now(), map });
+  return map;
+}
+
+/** A field's value as plain text: a pick list, a lookup ({name}), a multi-select, a number. */
+function textOf(v: unknown, max = 200): string | null {
+  if (v === null || v === undefined || typeof v === "boolean") return null;
+  if (Array.isArray(v)) return textOf(v.map((x) => textOf(x, max)).filter(Boolean).join(", "), max);
+  if (typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return textOf(o.name ?? o.display_value ?? null, max);
+  }
+  const s = String(v).replace(/\s+/g, " ").trim();
+  return s ? s.slice(0, max) : null;
+}
+
+const instant = (v: unknown): Date | null => {
+  if (typeof v !== "string" || !v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+/** Zoho's If-Modified-Since takes ISO 8601 with an offset ("2019-07-25T15:26:49+05:30"). */
+const zohoTime = (d: Date) => `${d.toISOString().slice(0, 19)}+00:00`;
+
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/**
+ * A day written the Indian way, day first: 3/10/26, 5-10-2026, 12/10,
+ * "3 /10/ 26", 5.10.2026, 5th Oct, 5 October 2026. A dot needs the year, so
+ * a time such as 10.30 is never read as a day, and neither is a span of
+ * hours or days ("5-6 pm", "2-3 days").
+ */
+const NOT_A_SPAN = String.raw`(?!\d)(?!\s*(?:am|pm|a\.m|p\.m|o'?clock|hrs?|hours?|mins?|minutes?|days?|weeks?|wks?|months?|years?|yrs?)\b)`;
+const DAY_FIRST = [
+  String.raw`(\d{1,2})\s*[/-]\s*(\d{1,2})(?:\s*[/-]\s*(\d{4}|\d{2}))?${NOT_A_SPAN}`,
+  String.raw`(\d{1,2})\s*\.\s*(\d{1,2})\s*\.\s*(\d{4}|\d{2})${NOT_A_SPAN}`,
+  String.raw`(\d{1,2})(?:st|nd|rd|th)?\s*(?:of\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?(?:,?\s*(\d{4}))?\b`,
+].join("|");
+
+/**
+ * Words that say a callback is meant, then the few words that may stand
+ * between them and the day ("call back after", "cb", "call her on",
+ * "follow up by"). Anything else in between ("call received on 2/9") is not a
+ * callback, and its date is left alone.
+ */
+const CUE = String.raw`\b(?:call(?:ing)?[\s-]*back|callback|cb|call|ring|follow[\s-]*up|f\/u|remind(?:er)?)\b`;
+const FILLER = String.raw`(?:[\s:,.@-]*\b(?:after|on|by|before|from|for|the|again|date|dt|is|at|next|this|me|him|her|them|pt|patient|client)\b)*[\s:,.@-]*`;
+const CALLBACK = new RegExp(`${CUE}${FILLER}(?:${DAY_FIRST})`, "gi");
+const A_DAY = new RegExp(`(?<![\\d./-])(?:${DAY_FIRST})`, "i");
+
+/**
+ * The day a match names. Without a year (or with one that cannot be meant),
+ * the year that puts it nearest the record's own time is taken, so a note
+ * "call on 5/1" written in late December reads as January next year.
+ */
+function dayOf(g: Array<string | undefined>, ref: Date, tz: string): Date | null {
+  const [d, m, y] = g[0] ? [g[0], g[1], g[2]] : g[3] ? [g[3], g[4], g[5]] : [g[6], String(MONTHS.indexOf(String(g[7]).toLowerCase().slice(0, 3)) + 1), g[8]];
+  const day = Number(d);
+  const month = Number(m);
+  if (!(day >= 1 && day <= 31 && month >= 1 && month <= 12)) return null;
+  const refYear = ref.getUTCFullYear();
+  let year = y ? Number(y.length === 2 ? `20${y}` : y) : null;
+  if (year !== null && (year < refYear - 1 || year > refYear + 2)) year = null;
+  const real = (yy: number) => {
+    const t = new Date(Date.UTC(yy, month - 1, day));
+    return t.getUTCMonth() === month - 1 ? zoned(yy, month, day, 0, tz) : null;
+  };
+  if (year !== null) return real(year);
+  const near = [refYear - 1, refYear, refYear + 1].map(real).filter((x): x is Date => x !== null);
+  return near.sort((a, b) => Math.abs(a.getTime() - ref.getTime()) - Math.abs(b.getTime() - ref.getTime()))[0] ?? null;
+}
+
+/**
+ * A callback date the team wrote in a record's notes ("call back after 3 /10/
+ * 26", "cb 5-10-2026", "call on 12/10"), as the start of that day in the
+ * client's time zone. The latest one, when the notes name several, since a
+ * callback is pushed forward more often than back. Null for anything else.
+ * Only the date leaves here: the notes themselves are never kept or logged.
+ */
+export function callbackFromNotes(notes: string | null | undefined, ref: Date, tz = "Asia/Kolkata"): Date | null {
+  if (!notes) return null;
+  let latest: Date | null = null;
+  for (const m of notes.matchAll(CALLBACK)) {
+    const day = dayOf(m.slice(1), ref, tz);
+    if (day && (!latest || day > latest)) latest = day;
+  }
+  return latest;
+}
+
+/**
+ * A date or time field's value: Zoho's datetime ("2026-10-05T11:00:00+05:30"),
+ * its date ("2026-10-05", the start of that day for the client), or a day
+ * typed into a text field, read day first.
+ */
+function whenOf(v: unknown, ref: Date, tz: string): Date | null {
+  const s = textOf(v);
+  if (!s) return null;
+  // Year first is ISO: Zoho's own date and datetime, or a date typed that way.
+  const iso = /^(\d{4})-(\d{2})-(\d{2})(T)?/.exec(s);
+  if (iso) {
+    const at = iso[4] ? instant(s) : null;
+    if (at) return at;
+    const [y, m, d] = [Number(iso[1]), Number(iso[2]), Number(iso[3])];
+    const day = new Date(Date.UTC(y, m - 1, d));
+    return day.getUTCMonth() === m - 1 && day.getUTCDate() === d ? zoned(y, m, d, 0, tz) : null;
+  }
+  const m = A_DAY.exec(s);
+  return m ? dayOf(m.slice(1), ref, tz) : null;
+}
+
+/** One Zoho record as the plan reads it. Nothing else of it, the notes least of all, goes further. */
+function readRecord(raw: Record<string, unknown>, module: string, map: FieldMap, labels: Record<PullKey, string[]>, tz: string): PulledRecord | null {
+  const externalId = textOf(raw.id, 64);
+  if (!externalId) return null;
+  const names = map.names ?? namesFor(labels, Object.keys(raw).map((k) => ({ api: k, labels: [k] })));
+  const values = (k: PullKey) => names[k].map((n) => raw[n]);
+  const first = (k: PullKey, max?: number) => values(k).map((v) => textOf(v, max)).find(Boolean) ?? null;
+  const modifiedAt = instant(raw.Modified_Time);
+  const createdAt = instant(raw.Created_Time);
+  const ref = modifiedAt ?? createdAt ?? new Date();
+  const when = (k: PullKey) => values(k).map((v) => whenOf(v, ref, tz)).find(Boolean) ?? null;
+  // Mobile first: it is the number the person answers.
+  const phone = values("phone").map((v) => toE164(textOf(v, 40))).find(Boolean) ?? null;
+  const name = first("fullName") ?? ([first("firstName"), first("lastName")].filter(Boolean).join(" ") || null);
+  // A Lead Zoho itself converted is a Contact now, whatever its status said when it was.
+  const status = raw.$converted === true ? "Converted" : first("status");
+  const parts = [first("treatment"), first("subTreatment"), first("category")].filter((x): x is string => !!x);
+  const treatment = parts.filter((p, i) => parts.findIndex((q) => q.toLowerCase() === p.toLowerCase()) === i).join(" / ").slice(0, 300) || null;
+  return {
+    externalId,
+    module,
+    modifiedAt,
+    createdAt,
+    phone,
+    name,
+    status,
+    source: first("source"),
+    centre: first("centre"),
+    appointmentAt: when("appointment"),
+    followUpAt: when("followUp") ?? callbackFromNotes(first("notes", 32_000), ref, tz),
+    treatment,
+    consultant: first("consultant"),
+  };
+}
+
+/** Where one module got to: the newest change stored, and a page only while stuck on one second (see pullZoho). */
+interface ModuleCursor {
+  since?: string;
+  page?: number;
+  deleted?: { since?: string; page?: number; newest?: string };
+}
+
+function cursorOf(raw: Record<string, unknown>): ModuleCursor {
+  const str = (v: unknown) => (typeof v === "string" && instant(v) ? v : undefined);
+  const num = (v: unknown) => (typeof v === "number" && Number.isInteger(v) && v > 1 && v <= MAX_PAGE ? v : undefined);
+  const d = (raw.deleted ?? {}) as Record<string, unknown>;
+  return { since: str(raw.since), page: num(raw.page), deleted: { since: str(d.since), page: num(d.page), newest: str(d.newest) } };
+}
+
+const later = (a: Date | null, b: Date | null) => (!a ? b : !b ? a : a > b ? a : b);
+
+/**
+ * What changed in one module since the cursor, oldest change first, and what
+ * was deleted there. Read only.
+ *
+ * Changes are listed by Modified_Time with If-Modified-Since one second before
+ * the newest change already stored, so records sharing that second are read
+ * again rather than lost; storing them twice changes nothing. The cursor moves
+ * only as far as what this read hands back, and the caller stores it after
+ * the records. Page-based listing stops at page 10, so a longer backlog is
+ * read again from its newest change, on this run if the budget allows or the
+ * next.
+ *
+ * Deletions are read once the changes are caught up. On the first read they
+ * start from now: a record deleted before we ever read it was never listed.
+ */
+async function pullZoho(ctx: ConnectorContext, input: PullInput): Promise<PullResult> {
+  const { module } = input;
+  const tz = input.timeZone ?? "Asia/Kolkata";
+  const cur = cursorOf(input.cursor);
+  const out: PullResult = { records: [], deleted: [], cursor: input.cursor, done: false, pages: 0 };
+  const notes: string[] = [];
+  if (!may(ctx, module, "READ")) return { ...out, done: true, skipped: `${module} not read: Zoho was not granted ${scopeFor(module, "READ")}.` };
+  let budget = Math.max(0, Math.floor(input.pageBudget));
+  const signal = () => AbortSignal.timeout(READ_TIMEOUT_MS);
+
+  // Changes. `from` is the time the listing reads from, `newest` the newest change read so far.
+  let from = cur.since ? new Date(cur.since) : null;
+  let page = cur.page ?? 1;
+  let newest: Date | null = from;
+  let more = true;
+  let stopped = false;
+  // Zoho lists no deeper than MAX_PAGE, so the listing starts again from the newest change read.
+  const restart = () => {
+    if (newest && (!from || newest > from)) from = newest;
+    else {
+      // A whole listing changed within one second (a mass update): the rest
+      // of that second is passed over and read the next time it changes.
+      const at = newest ?? from;
+      from = at ? new Date(at.getTime() + 2000) : null;
+      notes.push(`More than ${MAX_PAGE * PER_PAGE} ${module} changed within one second; Zoho lists no further, so the rest are read when they next change.`);
+    }
+    page = 1;
+  };
+  // Deletions are counted from the first read on.
+  const deletedSince = cur.deleted?.since ? new Date(cur.deleted.since) : new Date(Date.now() - 10 * 60_000);
+  let deleted: ModuleCursor["deleted"] = { ...cur.deleted, since: deletedSince.toISOString() };
+
+  const stop = (r: Answer, what: string) => {
+    stopped = true;
+    if (verdict(r).code === "INVALID_MODULE") out.skipped = `${module} not read: Zoho has no module by that name.`;
+    else if (judge(r) === "not-allowed") out.skipped = `${module} not read: Zoho answered ${said(r)} to ${what}. The grant needs ${scopeFor(module, "READ")}.`;
+    else out.error = `Zoho answered ${said(r)} to ${what} in ${module}.`;
+  };
+
+  try {
+    const map = await fieldMap(ctx, module);
+    if ("refused" in map) {
+      stop(map.refused, "the list of fields");
+      return { ...out, done: !!out.skipped, notes };
+    }
+    if (map.note) notes.push(map.note);
+    const labels = labelsOf(ctx);
+
+    while (more && budget > 0) {
+      if (page > MAX_PAGE) restart();
+      const q = new URLSearchParams({ sort_by: "Modified_Time", sort_order: "asc", per_page: String(PER_PAGE), page: String(page) });
+      if (map.ask.length) q.set("fields", map.ask.join(","));
+      // Zoho leaves converted Leads out unless asked, and they are the ones not to chase.
+      if (module === "Leads") q.set("converted", "both");
+      const headers: Record<string, string> = from ? { "If-Modified-Since": zohoTime(new Date(from.getTime() - 1000)) } : {};
+      const r = await call(ctx, `/crm/v2/${encodeURIComponent(module)}?${q}`, { headers, signal: signal() });
+      budget--;
+      out.pages++;
+      if (r.status === 204 || r.status === 304) {
+        more = false;
+        break;
+      }
+      if (r.status !== 200) {
+        if (judge(r) === "not-allowed") await learn(ctx, r, scopeFor(module, "READ"));
+        stop(r, "a request for records");
+        break;
+      }
+      for (const raw of (r.json.data as Array<Record<string, unknown>> | undefined) ?? []) {
+        const rec = readRecord(raw, module, map, labels, tz);
+        if (!rec) continue;
+        out.records.push(rec);
+        newest = later(newest, rec.modifiedAt);
+      }
+      more = (r.json.info as { more_records?: boolean } | undefined)?.more_records === true;
+      if (more) page++;
+    }
+  } catch (e) {
+    stopped = true;
+    out.error = `Reading ${module} stopped: ${(e as Error).message}`.slice(0, 300);
+  }
+
+  // Where the next read starts: from the newest change read, or, while one
+  // second's changes run deeper than a page, the next page of that listing.
+  if (more && page > MAX_PAGE) restart();
+  const next: ModuleCursor =
+    !more || (newest && (!from || newest > from)) ? { since: later(newest, from)?.toISOString() } : { since: from?.toISOString(), page: page > 1 ? page : undefined };
+
+  // Deletions, once the changes are caught up.
+  let deletionsDone = false;
+  if (!more && !stopped) {
+    let dPage = cur.deleted?.page ?? 1;
+    let dNewest: Date | null = cur.deleted?.newest ? new Date(cur.deleted.newest) : deletedSince;
+    let dMore = true;
+    try {
+      while (dMore && budget > 0 && dPage <= MAX_PAGE) {
+        const r = await call(ctx, `/crm/v2/${encodeURIComponent(module)}/deleted?type=all&per_page=${PER_PAGE}&page=${dPage}`, {
+          headers: { "If-Modified-Since": zohoTime(new Date(deletedSince.getTime() - 1000)) },
+          signal: signal(),
+        });
+        budget--;
+        out.pages++;
+        if (r.status === 204 || r.status === 304) {
+          dMore = false;
+          break;
+        }
+        if (r.status !== 200) {
+          if (judge(r) === "not-allowed") {
+            // Not worth stopping the plan for: the records read stay good.
+            notes.push(`Deleted ${module} not read: Zoho answered ${said(r)}.`);
+            dMore = false;
+            dNewest = deletedSince;
+          } else out.error = `Zoho answered ${said(r)} to the list of deleted ${module}.`;
+          break;
+        }
+        for (const x of (r.json.data as Array<Record<string, unknown>> | undefined) ?? []) {
+          const id = textOf(x.id, 64);
+          const at = instant(x.deleted_time);
+          if (!id || !at) continue;
+          out.deleted.push({ externalId: id, deletedAt: at });
+          dNewest = later(dNewest, at);
+        }
+        dMore = (r.json.info as { more_records?: boolean } | undefined)?.more_records === true;
+        if (dMore) dPage++;
+      }
+    } catch (e) {
+      out.error = `Reading deleted ${module} stopped: ${(e as Error).message}`.slice(0, 300);
+    }
+    if (!dMore || dPage > MAX_PAGE) {
+      deleted = { since: (dNewest ?? deletedSince).toISOString() };
+      deletionsDone = !dMore;
+      if (dMore) notes.push(`More than ${MAX_PAGE * PER_PAGE} ${module} were deleted since the last read; Zoho lists no further, so some of them may still show here as not deleted.`);
+    } else deleted = { since: deletedSince.toISOString(), page: dPage, newest: dNewest?.toISOString() };
+  }
+
+  // A module skipped for good (a scope, a name) has nothing more to read until someone changes that.
+  return { ...out, cursor: { ...next, deleted }, done: !!out.skipped || (!more && deletionsDone && !out.error), notes };
+}
+
 export const zohoConnector: Connector = {
   kind: "zoho_crm",
+  pullModules: PEOPLE,
+  pull: pullZoho,
 
   wants(integration, kind) {
     // A kind with nothing to say on a record reaches Zoho only through the

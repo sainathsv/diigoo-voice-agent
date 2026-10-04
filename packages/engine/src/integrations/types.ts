@@ -69,6 +69,56 @@ export interface SendResult {
   forget?: boolean;
 }
 
+/**
+ * One record read from their system, cut down to what the call plan uses.
+ * Their free-text notes never travel in it: only a date read out of them.
+ */
+export interface PulledRecord {
+  externalId: string;
+  module: string;
+  modifiedAt: Date | null;
+  createdAt: Date | null;
+  /** E.164, or null when no number on the record can be dialled. */
+  phone: string | null;
+  name: string | null;
+  status: string | null;
+  source: string | null;
+  centre: string | null;
+  appointmentAt: Date | null;
+  /** Their follow-up field, or else a callback date the team wrote in their notes. */
+  followUpAt: Date | null;
+  treatment: string | null;
+  consultant: string | null;
+}
+
+export interface PullInput {
+  module: string;
+  /** Where this module got to last time, as the connector left it. Empty on the first read. */
+  cursor: Record<string, unknown>;
+  /** Requests for records this read may make, at most. */
+  pageBudget: number;
+  /** The client's time zone, for a date written without a time. */
+  timeZone?: string;
+}
+
+export interface PullResult {
+  records: PulledRecord[];
+  /** Records their system says were deleted or merged away since the last read. */
+  deleted: Array<{ externalId: string; deletedAt: Date }>;
+  /** Where to start next time. Stored only once the records above are. */
+  cursor: Record<string, unknown>;
+  /** Nothing more to read for now; false when the page budget ran out first. */
+  done: boolean;
+  /** Requests for records this read made, against the budget. */
+  pages: number;
+  /** Why the module was not read at all, in plain words (a scope not granted). */
+  skipped?: string;
+  /** What stopped the read part way. The records before it are still good. */
+  error?: string;
+  /** Things worth knowing that did not stop the read. */
+  notes?: string[];
+}
+
 export interface Connector {
   kind: IntegrationKind;
   /** A one-line answer for the client: does this connection work right now. */
@@ -80,6 +130,13 @@ export interface Connector {
    * skipped with "nothing to write", which buries the skips that matter.
    */
   wants?(integration: Integration, kind: string): boolean;
+  /**
+   * Reads what changed in one of their modules since the cursor, for the call
+   * plan. Read only: nothing is written to their system.
+   */
+  pull?(ctx: ConnectorContext, input: PullInput): Promise<PullResult>;
+  /** The modules read when the client has not chosen their own (config.pull.modules). */
+  pullModules?: string[];
 }
 
 /** Reads a value out of the event payload by a dotted path, for field mapping. */

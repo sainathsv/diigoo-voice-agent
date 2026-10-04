@@ -15,6 +15,7 @@ import {
   campaigns,
   clientPrograms,
   contacts,
+  crmRecords,
   externalLinks,
   integrationEvents,
   integrations,
@@ -30,10 +31,11 @@ import { analyzeCalls, heardOptOut, type Extractor } from "../analyze";
 import { setUpProgram } from "../programs";
 import { addCarrierAccount, addPhoneNumber } from "../telephony";
 import { claimDeliveries, credentialsOf, deliver, enqueueEvent, sealCredentials, subscribers, testConnection } from "./queue";
-import { zohoConnector } from "./zoho";
+import { callbackFromNotes, zohoConnector } from "./zoho";
+import { syncIntegration } from "./crm-sync";
 import { exchangeGrantCode, saveZohoConnection } from "./zoho-connect";
 import { EVENT_KINDS, emitCallCompleted, emitLeadUpdated, healthWithheld } from "./events";
-import { sharedWith } from "./types";
+import { sharedWith, type ConnectorContext } from "./types";
 import { verifySignature } from "./http";
 import { CallRequestError, requestCall } from "./inbound";
 
@@ -1462,5 +1464,422 @@ describe("what a call hands on, and to whom", () => {
     const hit = received.filter((x) => x.path === "/plain").at(-1)!;
     expect(JSON.parse(hit.body).lead).toMatchObject({ id: lead!.id, stage: "won" });
     expect((await eventRow(booked!.id)).payload.lead).toMatchObject({ stage: "won" }); // the log shows what was sent
+  });
+});
+
+describe("reading their Zoho records for the call plan", () => {
+  let org = "";
+  let zohoId = "";
+  // Zennara's grant, with the field list.
+  const SCOPES = ["leads.READ", "leads.UPDATE", "contacts.READ", "contacts.UPDATE", "calls.CREATE", "notes.CREATE"].map((s) => `ZohoCRM.modules.${s}`).concat("ZohoCRM.settings.fields.READ");
+  const BASE = Date.UTC(2026, 8, 1, 4, 30); // 1 Sep 2026, 10:00 in India
+  /** Zoho writes its times in the account's own offset. */
+  const ist = (ms: number) => `${new Date(ms + 330 * 60_000).toISOString().slice(0, 19)}+05:30`;
+  const minute = (n: number) => ist(BASE + n * 60_000);
+  const isoAt = (n: number) => new Date(BASE + n * 60_000).toISOString();
+  /** What we send as If-Modified-Since: a second before the newest change stored. */
+  const askedAfter = (n: number) => `${new Date(BASE + n * 60_000 - 1000).toISOString().slice(0, 19)}+00:00`;
+  /** The start of a day in India. */
+  const dayIn = (y: number, m: number, d: number) => new Date(Date.UTC(y, m - 1, d) - 330 * 60_000);
+
+  const field = (api_name: string, field_label: string, data_type = "text") => ({ api_name, field_label, display_label: field_label, data_type });
+  // Zennara's Leads, as settings/fields lists them.
+  const LEAD_FIELDS = [
+    field("First_Name", "First Name"),
+    field("Last_Name", "Last Name"),
+    field("Full_Name", "Full Name"),
+    field("Mobile", "Mobile", "phone"),
+    field("Phone", "Phone", "phone"),
+    field("Email", "Email", "email"),
+    field("Lead_Status", "Lead Status", "picklist"),
+    field("Lead_Source", "Lead Source", "picklist"),
+    field("Description", "Description", "textarea"),
+    field("Appointment_Date_Time", "Appointment Date/Time", "datetime"),
+    field("Follow_Up_Date_Time", "Follow Up Date/Time", "datetime"),
+    field("Treatment", "Treatment", "picklist"),
+    field("Sub_Category", "Sub Category", "picklist"),
+    field("Category", "Category", "picklist"),
+    field("Consultant_Name", "Consultant Name", "picklist"),
+    field("Select_Your_Centre", "Select Your Centre", "picklist"),
+    field("Created_Time", "Created Time", "datetime"),
+    field("Modified_Time", "Modified Time", "datetime"),
+  ];
+  // Their Contacts are a WhatsApp list: a name and a mobile.
+  const CONTACT_FIELDS = [field("First_Name", "First Name"), field("Last_Name", "Last Name"), field("Full_Name", "Full Name"), field("Mobile", "Mobile", "phone"), field("Modified_Time", "Modified Time", "datetime")];
+
+  const pad = (n: number) => String(n).padStart(5, "0");
+  const lead = (n: number, extra: Record<string, unknown> = {}) => ({
+    id: `41508680000010${pad(n)}`,
+    Full_Name: `Lead ${n}`,
+    Mobile: `98480${pad(n)}`,
+    Phone: null,
+    Lead_Status: "Follow-up",
+    Lead_Source: "Instagram",
+    Created_Time: minute(n),
+    Modified_Time: minute(n),
+    ...extra,
+  });
+  const contact = (n: number) => ({ id: `41508680000020${pad(n)}`, Full_Name: `Contact ${n}`, Mobile: `97010${pad(n)}`, Created_Time: minute(n), Modified_Time: minute(n) });
+
+  interface Asked {
+    path: string;
+    query: URLSearchParams;
+    headers: Record<string, string>;
+  }
+  const asked: Asked[] = [];
+  let tokens = 0;
+  /** What their Zoho holds, and what it refuses, by path. */
+  let crm: {
+    records: Record<string, Array<Record<string, unknown>>>;
+    deleted: Record<string, Array<{ id: string; deleted_time: string }>>;
+    fields: Record<string, Array<Record<string, unknown>>>;
+    refuse: Record<string, { status: number; body?: unknown }>;
+  } = { records: {}, deleted: {}, fields: {}, refuse: {} };
+  const reset = (c: Partial<typeof crm> = {}) => {
+    asked.length = 0;
+    tokens = 0;
+    crm = { records: {}, deleted: {}, fields: {}, refuse: {}, ...c };
+  };
+
+  /**
+   * Stands in for Zoho: lists what changed after If-Modified-Since, oldest
+   * first, 200 to a page with info.more_records, and 204 when there is nothing,
+   * as get-records and get-deleted-records document.
+   */
+  const zohoFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const headers = { ...((init?.headers ?? {}) as Record<string, string>) };
+    asked.push({ path: url.pathname, query: url.searchParams, headers });
+    const answer = (status: number, body?: unknown) => new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+    if (url.pathname === "/oauth/v2/token") {
+      tokens++;
+      await new Promise((r) => setTimeout(r, 30)); // Zoho takes its time, so callers overlap
+      return answer(200, { access_token: `fresh-${tokens}`, expires_in: 3600 });
+    }
+    const refused = crm.refuse[url.pathname];
+    if (refused) return answer(refused.status, refused.body);
+    if (url.pathname === "/crm/v2/settings/fields") return answer(200, { fields: crm.fields[url.searchParams.get("module") ?? ""] ?? [] });
+    const m = /^\/crm\/v2\/(\w+)(\/deleted)?$/.exec(url.pathname);
+    if (!m) return answer(500);
+    const after = headers["If-Modified-Since"] ? Date.parse(headers["If-Modified-Since"]) : -Infinity;
+    const page = Number(url.searchParams.get("page") ?? 1);
+    const per = Number(url.searchParams.get("per_page") ?? 200);
+    const all: Array<Record<string, unknown>> = m[2]
+      ? (crm.deleted[m[1]!] ?? []).filter((d) => Date.parse(d.deleted_time) > after)
+      : (crm.records[m[1]!] ?? []).filter((r) => Date.parse(String(r.Modified_Time)) > after).sort((a, b) => Date.parse(String(a.Modified_Time)) - Date.parse(String(b.Modified_Time)));
+    const data = all.slice((page - 1) * per, page * per);
+    return data.length ? answer(200, { data, info: { per_page: per, count: data.length, page, more_records: all.length > page * per } }) : answer(204);
+  }) as typeof fetch;
+
+  const ctxFor = (config: Record<string, unknown> = {}, credentials: Record<string, string> = { access_token: "cached", access_token_until: String(Date.now() + 3_600_000) }, id = randomUUID()): ConnectorContext => ({
+    integration: { tenantId: org, id, kind: "zoho_crm", name: "Zoho", status: "connected", config: { dc: "in", scopes: SCOPES, ...config }, mapping: {} } as unknown as Integration,
+    credentials: { ...credentials },
+    fetch: zohoFetch,
+    async save() {},
+  });
+  const pull = (ctx: ConnectorContext, module = "Leads", cursor: Record<string, unknown> = {}, pageBudget = 10) => zohoConnector.pull!(ctx, { module, cursor, pageBudget });
+  const listings = (module = "Leads") => asked.filter((a) => a.path === `/crm/v2/${module}`);
+
+  beforeAll(async () => {
+    const [o] = await platformDb()
+      .insert(organizations)
+      .values({ kind: "client", name: "Zoho Pull Clinic", slug: `zoho-pull-${randomUUID().slice(0, 8)}`, status: "active", vertical: "derma", languages: ["en"] })
+      .returning();
+    org = o!.id;
+    const credentials = { client_id: "cid", client_secret: "secret", refresh_token: "refresh", access_token: "cached", access_token_until: String(Date.now() + 3_600_000) };
+    const [i] = await withTenant(org, (tx) =>
+      tx.insert(integrations).values({ tenantId: org, kind: "zoho_crm", name: "Zoho", status: "connected", config: { dc: "in", module: "Leads", scopes: SCOPES }, credentials: sealCredentials(org, credentials) }).returning(),
+    );
+    zohoId = i!.id;
+  });
+  afterAll(async () => {
+    await platformDb().delete(organizations).where(eq(organizations.id, org));
+  });
+
+  it("finds the clinic's own fields by their labels, and reads only what the plan needs", async () => {
+    reset({
+      fields: { Leads: LEAD_FIELDS },
+      records: {
+        Leads: [
+          lead(1, {
+            Mobile: "098480 12345 ",
+            Appointment_Date_Time: "2026-10-05T11:00:00+05:30",
+            Follow_Up_Date_Time: null,
+            Description: "Hair fall since 2 yrs, tried oils. call back after 3 /10/ 26",
+            Treatment: "Hair",
+            Sub_Category: "PRP",
+            Category: "hair",
+            Consultant_Name: "Dr. Rao",
+            Select_Your_Centre: "Kondapur",
+            Email: "someone@example.in",
+          }),
+          // Their follow-up field, when filled, wins over a date in the notes.
+          lead(2, { Follow_Up_Date_Time: "2026-10-07T16:00:00+05:30", Description: "cb 5-10-2026" }),
+          // A Lead Zoho converted is a Contact now.
+          lead(3, { $converted: true, Lead_Status: "Interested", Follow_Up_Date_Time: "2026-10-08" }),
+          // A date typed into a text field, year first or day first.
+          lead(4, { Follow_Up_Date_Time: "2026-10-09 11:00", Appointment_Date_Time: "10/10/2026 4 pm" }),
+        ],
+      },
+    });
+    const ctx = ctxFor();
+    const r = await pull(ctx);
+    expect(r).toMatchObject({ done: true, pages: 2 }); // one page of changes, one of deletions
+
+    const ask = listings()[0]!;
+    expect(Object.fromEntries(ask.query)).toMatchObject({ sort_by: "Modified_Time", sort_order: "asc", per_page: "200", page: "1", converted: "both" });
+    expect(ask.query.get("fields")!.split(",")).toEqual(
+      expect.arrayContaining(["Mobile", "Phone", "Full_Name", "Lead_Status", "Lead_Source", "Description", "Appointment_Date_Time", "Follow_Up_Date_Time", "Treatment", "Sub_Category", "Category", "Consultant_Name", "Select_Your_Centre", "Modified_Time"]),
+    );
+    expect(ask.query.get("fields")).not.toMatch(/Email/);
+    expect(ask.headers["If-Modified-Since"]).toBeUndefined(); // the first read takes everything
+
+    expect(r.records[0]).toEqual({
+      externalId: lead(1).id,
+      module: "Leads",
+      createdAt: new Date(minute(1)),
+      modifiedAt: new Date(minute(1)),
+      phone: "+919848012345",
+      name: "Lead 1",
+      status: "Follow-up",
+      source: "Instagram",
+      centre: "Kondapur",
+      appointmentAt: new Date("2026-10-05T05:30:00Z"),
+      followUpAt: dayIn(2026, 10, 3),
+      treatment: "Hair / PRP",
+      consultant: "Dr. Rao",
+    });
+    expect(r.records[1]!.followUpAt).toEqual(new Date("2026-10-07T10:30:00Z"));
+    expect(r.records[2]).toMatchObject({ status: "Converted", followUpAt: dayIn(2026, 10, 8) });
+    expect(r.records[3]).toMatchObject({ followUpAt: dayIn(2026, 10, 9), appointmentAt: dayIn(2026, 10, 10) });
+    // The notes themselves go no further than the date read out of them.
+    expect(JSON.stringify(r)).not.toMatch(/hair fall|tried oils|call back|cb 5/i);
+
+    // The field list is read once an hour, not on every pull.
+    await pull(ctx);
+    expect(asked.filter((a) => a.path === "/crm/v2/settings/fields")).toHaveLength(1);
+  });
+
+  it("takes a client's own labels, and matches API names when the field list is not granted", async () => {
+    reset({ fields: { Leads: [...LEAD_FIELDS, field("Clinic_Branch", "Clinic Branch", "picklist")] }, records: { Leads: [lead(1, { Select_Your_Centre: "Kondapur", Clinic_Branch: "Jubilee Hills" })] } });
+    let r = await pull(ctxFor({ pull: { fieldLabels: { centre: ["Clinic Branch"] } } }));
+    expect(r.records[0]!.centre).toBe("Jubilee Hills");
+    expect(listings()[0]!.query.get("fields")).not.toMatch(/Select_Your_Centre/);
+
+    // No settings scope: every field is asked for, and matched by its API name.
+    reset({ records: { Leads: [lead(1, { Appointment_Date_Time: "2026-10-05T11:00:00+05:30", Select_Your_Centre: "Kondapur", Description: "call on 12/10" })] } });
+    r = await pull(ctxFor({ scopes: SCOPES.filter((s) => !s.includes("settings")) }));
+    expect(asked.map((a) => a.path)).not.toContain("/crm/v2/settings/fields");
+    expect(listings()[0]!.query.has("fields")).toBe(false);
+    expect(r.records[0]).toMatchObject({ centre: "Kondapur", appointmentAt: new Date("2026-10-05T05:30:00Z"), followUpAt: dayIn(2026, 10, 12), status: "Follow-up" });
+    expect(r.notes!.join(" ")).toMatch(/Zoho was not granted ZohoCRM\.settings\.fields\.READ, so Leads fields were matched by their API names/);
+  });
+
+  it("reads page after page, moves the cursor only as far as it read, and then asks only for what changed since", async () => {
+    reset({ fields: { Leads: LEAD_FIELDS }, records: { Leads: Array.from({ length: 450 }, (_, n) => lead(n + 1)) } });
+    const ctx = ctxFor();
+    let r = await pull(ctx, "Leads", {}, 1);
+    expect(r).toMatchObject({ done: false, pages: 1 });
+    expect(r.records).toHaveLength(200);
+    expect(r.cursor.since).toBe(isoAt(200));
+
+    asked.length = 0;
+    r = await pull(ctx, "Leads", r.cursor, 10);
+    const [first, second] = listings();
+    expect(first!.headers["If-Modified-Since"]).toBe(askedAfter(200));
+    expect([first!.query.get("page"), second!.query.get("page")]).toEqual(["1", "2"]);
+    // The newest change stored before is read again, which changes nothing; none is missed.
+    expect(r.records).toHaveLength(251);
+    expect(r.records[0]!.externalId).toBe(lead(200).id);
+    expect(r).toMatchObject({ done: true, pages: 3 }); // two pages of changes, one of deletions
+    expect(r.cursor.since).toBe(isoAt(450));
+    const deletions = asked.find((a) => a.path === "/crm/v2/Leads/deleted")!;
+    expect(deletions.query.get("type")).toBe("all");
+    expect(deletions.headers["If-Modified-Since"]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$/);
+  });
+
+  it("never asks past page 10, and starts again from the newest change it read", async () => {
+    reset({ fields: { Leads: LEAD_FIELDS }, records: { Leads: Array.from({ length: 2300 }, (_, n) => lead(n + 1)) } });
+    const r = await pull(ctxFor(), "Leads", {}, 15);
+    expect(listings().map((a) => Number(a.query.get("page")))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2]);
+    expect(listings()[10]!.headers["If-Modified-Since"]).toBe(askedAfter(2000));
+    expect(new Set(r.records.map((x) => x.externalId)).size).toBe(2300);
+    expect(r).toMatchObject({ done: true, pages: 13 });
+
+    // A mass update: more than Zoho will list, all in one second. Read as far
+    // as Zoho goes, then passed over, rather than read again for ever.
+    reset({ fields: { Leads: LEAD_FIELDS }, records: { Leads: Array.from({ length: 2100 }, (_, n) => lead(n + 1, { Modified_Time: minute(0) })) } });
+    const stuck = await pull(ctxFor(), "Leads", {}, 30);
+    expect(Math.max(...listings().map((a) => Number(a.query.get("page"))))).toBe(10);
+    expect(stuck.done).toBe(true);
+    expect(stuck.cursor.since).toBe(new Date(BASE + 2000).toISOString());
+    expect(stuck.notes!.join(" ")).toMatch(/More than 2000 Leads changed within one second/);
+  });
+
+  it("ends the read on an empty answer, and leaves the cursor where it was", async () => {
+    reset({ fields: { Leads: LEAD_FIELDS } });
+    const cursor = { since: isoAt(5), deleted: { since: isoAt(5) } };
+    let r = await pull(ctxFor(), "Leads", cursor);
+    expect(r).toMatchObject({ records: [], deleted: [], done: true, pages: 2 });
+    expect(r.cursor).toEqual(cursor);
+    expect(listings()[0]!.headers["If-Modified-Since"]).toBe(askedAfter(5));
+    // Zoho's 304 for nothing changed since If-Modified-Since says the same.
+    reset({ fields: { Leads: LEAD_FIELDS }, refuse: { "/crm/v2/Leads": { status: 304 } } });
+    r = await pull(ctxFor(), "Leads", cursor);
+    expect(r).toMatchObject({ records: [], done: true });
+    expect(r.cursor).toEqual(cursor);
+  });
+
+  it("reads the callback date the team wrote, the Indian way, and nothing else", () => {
+    const ref = new Date("2026-10-01T04:30:00Z");
+    const day = (s: string) => callbackFromNotes(s, ref);
+    expect(day("call back after 3 /10/ 26")).toEqual(dayIn(2026, 10, 3));
+    expect(day("cb 5-10-2026")).toEqual(dayIn(2026, 10, 5));
+    expect(day("call on 12/10")).toEqual(dayIn(2026, 10, 12)); // the year is the record's
+    expect(day("Follow up by 15.10.2026")).toEqual(dayIn(2026, 10, 15));
+    expect(day("not picking. call her on 5th Oct")).toEqual(dayIn(2026, 10, 5));
+    // Pushed forward: the latest one counts.
+    expect(day("call back after 3 /10/ 26. Busy, CB 9/10")).toEqual(dayIn(2026, 10, 9));
+    // Written in December for January.
+    expect(callbackFromNotes("call on 5/1", new Date("2026-12-20T10:00:00Z"))).toEqual(dayIn(2027, 1, 5));
+    for (const notCallback of [
+      "asdf ;; 12 /// ?? lorem",
+      "visited on 2/9/26, happy with results",
+      "call received on 2/9",
+      "call at 10.30",
+      "call after 5-6 pm",
+      "call back after 2-3 days",
+      "call back on 31/02/26",
+      "Interested in laser. Not now.",
+      "",
+    ]) {
+      expect(day(notCallback), notCallback).toBeNull();
+    }
+    expect(callbackFromNotes(null, ref)).toBeNull();
+  });
+
+  it("leaves out a module whose scope was not granted, says why, and reads the others", async () => {
+    reset({ fields: { Contacts: CONTACT_FIELDS }, records: { Contacts: [contact(1)] } });
+    const ctx = ctxFor({ scopes: ["ZohoCRM.modules.contacts.READ", "ZohoCRM.settings.fields.READ"] });
+    const leads = await pull(ctx, "Leads");
+    expect(leads).toMatchObject({ records: [], done: true, pages: 0, skipped: "Leads not read: Zoho was not granted ZohoCRM.modules.leads.READ." });
+    expect(asked).toEqual([]); // not even asked
+    expect((await pull(ctx, "Contacts")).records).toHaveLength(1);
+
+    // Zoho did not say what it granted, and refuses: remembered, so it is not asked again.
+    const mismatch = { code: "OAUTH_SCOPE_MISMATCH", details: {}, message: "invalid oauth scope to access this URL", status: "error" };
+    reset({ fields: { Leads: LEAD_FIELDS }, refuse: { "/crm/v2/Leads": { status: 401, body: mismatch } } });
+    const unknown = ctxFor({ scopes: [] });
+    const refused = await pull(unknown, "Leads");
+    expect(refused.skipped).toBe("Leads not read: Zoho answered OAUTH_SCOPE_MISMATCH to a request for records. The grant needs ZohoCRM.modules.leads.READ.");
+    expect(refused.done).toBe(true);
+    expect(unknown.integration.config.denied).toEqual(["ZohoCRM.modules.leads.READ"]);
+    asked.length = 0;
+    expect((await pull(unknown, "Leads")).skipped).toMatch(/not granted ZohoCRM\.modules\.leads\.READ/);
+    expect(asked).toEqual([]);
+  });
+
+  it("refreshes the token once when the pull and a write-back find it stale together", async () => {
+    reset({ fields: { Leads: LEAD_FIELDS, Contacts: CONTACT_FIELDS }, records: { Leads: [lead(1)], Contacts: [contact(1)] } });
+    const id = randomUUID();
+    const stale = { client_id: "cid", client_secret: "secret", refresh_token: "refresh", access_token: "old", access_token_until: String(Date.now() - 1000) };
+    const saved: unknown[] = [];
+    const pulling = { ...ctxFor({}, stale, id), save: async (p: unknown) => void saved.push(p) };
+    const writing = { ...ctxFor({}, stale, id), save: async (p: unknown) => void saved.push(p) };
+    const [a, b] = await Promise.all([
+      pull(pulling, "Leads"),
+      // A write-back on the same connection at the same moment.
+      zohoConnector.send(writing, { id: "e1", kind: "call.completed", idempotencyKey: "k1", externalId: "ZOHO-LEAD-1", externalType: "Leads", payload: { call: { outcome: "booked", seconds: 60 } } }),
+    ]);
+    expect(tokens).toBe(1);
+    expect(saved).toHaveLength(1);
+    expect([pulling.credentials.access_token, writing.credentials.access_token]).toEqual(["fresh-1", "fresh-1"]);
+    expect(asked.filter((q) => q.path.startsWith("/crm/")).every((q) => q.headers.Authorization === "Zoho-oauthtoken fresh-1")).toBe(true);
+    expect(a.records).toHaveLength(1);
+    expect(b.ok).toBe(false); // our fake Zoho has no Calls; what matters is the one token
+  });
+
+  const rows = () => withTenant(org, (tx) => tx.select().from(crmRecords).where(eq(crmRecords.integrationId, zohoId)).orderBy(crmRecords.externalId));
+  const connection = async () => (await withTenant(org, (tx) => tx.select().from(integrations).where(eq(integrations.id, zohoId))))[0]!;
+
+  it("keeps the plan's copy in crm_records, moves the cursor with it, and marks what was deleted", async () => {
+    reset({
+      fields: { Leads: LEAD_FIELDS, Contacts: CONTACT_FIELDS },
+      records: { Leads: [lead(1, { Description: "Pigmentation, on creams. call back after 3 /10/ 26", Treatment: "Hydrafacial" }), lead(2), lead(3, { Mobile: "12" })], Contacts: [contact(1)] },
+    });
+    let r = await syncIntegration(org, zohoId, { pageBudget: 10, fetchImpl: zohoFetch });
+    expect(r).toMatchObject({ ran: true, done: true, error: null });
+    expect(r.modules.map((m) => [m.module, m.read])).toEqual([["Leads", 3], ["Contacts", 1]]);
+
+    let stored = await rows();
+    expect(stored).toHaveLength(4);
+    expect(stored.find((x) => x.externalId === lead(1).id)).toMatchObject({
+      module: "Leads",
+      phoneE164: "+919848000001",
+      name: "Lead 1",
+      status: "Follow-up",
+      treatment: "Hydrafacial",
+      followUpAt: dayIn(2026, 10, 3),
+      createdExt: new Date(minute(1)),
+      deletedAt: null,
+    });
+    // Kept with no number, so the plan can say why it will not call them.
+    expect(stored.find((x) => x.externalId === lead(3).id)!.phoneE164).toBeNull();
+    expect(stored.find((x) => x.module === "Contacts")).toMatchObject({ phoneE164: "+919701000001", name: "Contact 1", status: null });
+    expect(JSON.stringify(stored)).not.toMatch(/pigmentation|creams|call back/i);
+
+    let i = await connection();
+    expect(i.pullCursor).toMatchObject({ Leads: { since: isoAt(3) }, Contacts: { since: isoAt(1) } });
+    expect(i).toMatchObject({ lastPullError: null, pullLeaseUntil: null });
+    expect(i.lastPullAt).toBeInstanceOf(Date);
+
+    // In Zoho, Lead 2 is deleted and Lead 1 booked.
+    crm.records.Leads = [lead(1, { Lead_Status: "Appointment Booked", Modified_Time: minute(10) }), lead(3, { Mobile: "12" })];
+    crm.deleted.Leads = [{ id: lead(2).id, deleted_time: ist(Date.now()) }];
+    asked.length = 0;
+    r = await syncIntegration(org, zohoId, { pageBudget: 10, fetchImpl: zohoFetch });
+    expect(r.modules.find((m) => m.module === "Leads")).toMatchObject({ read: 2, deleted: 1, done: true });
+    expect(listings()[0]!.headers["If-Modified-Since"]).toBe(askedAfter(3));
+    stored = await rows();
+    expect(stored).toHaveLength(4); // Lead 3, read again in the overlap, is not doubled
+    expect(stored.find((x) => x.externalId === lead(1).id)).toMatchObject({ status: "Appointment Booked", modifiedExt: new Date(minute(10)) });
+    expect(stored.find((x) => x.externalId === lead(2).id)!.deletedAt).toBeInstanceOf(Date);
+    i = await connection();
+    expect(i.pullCursor).toMatchObject({ Leads: { since: isoAt(10) }, Contacts: { since: isoAt(1) } });
+  });
+
+  it("shares one page budget across the modules, and leaves a connection another run is reading", async () => {
+    await withTenant(org, (tx) => tx.update(integrations).set({ pullCursor: {} }).where(eq(integrations.id, zohoId)));
+    reset({ fields: { Leads: LEAD_FIELDS, Contacts: CONTACT_FIELDS }, records: { Leads: [lead(1)], Contacts: [contact(1)] } });
+    let r = await syncIntegration(org, zohoId, { pageBudget: 1, fetchImpl: zohoFetch });
+    expect(r).toMatchObject({ ran: true, pages: 1, done: false, error: null });
+    expect(r.modules).toEqual([
+      expect.objectContaining({ module: "Leads", read: 1, done: false }), // its deletions wait for the next run
+      { module: "Contacts", read: 0, deleted: 0, done: false },
+    ]);
+
+    await withTenant(org, (tx) => tx.update(integrations).set({ pullLeaseUntil: new Date(Date.now() + 60_000) }).where(eq(integrations.id, zohoId)));
+    asked.length = 0;
+    r = await syncIntegration(org, zohoId, { fetchImpl: zohoFetch });
+    expect(r).toEqual({ ran: false, modules: [], pages: 0, done: false, error: null });
+    expect(asked).toEqual([]);
+    await withTenant(org, (tx) => tx.update(integrations).set({ pullLeaseUntil: null }).where(eq(integrations.id, zohoId)));
+  });
+
+  it("records a module left out for want of a scope on the connection, and still reads the rest", async () => {
+    const i = await connection();
+    await withTenant(org, (tx) =>
+      tx
+        .update(integrations)
+        .set({ config: { ...i.config, scopes: ["ZohoCRM.modules.contacts.READ", "ZohoCRM.settings.fields.READ"] } })
+        .where(eq(integrations.id, zohoId)),
+    );
+    reset({ fields: { Contacts: CONTACT_FIELDS }, records: { Contacts: [contact(1), contact(2)] } });
+    const r = await syncIntegration(org, zohoId, { fetchImpl: zohoFetch });
+    expect(r.ran).toBe(true);
+    expect(r.modules.find((m) => m.module === "Contacts")).toMatchObject({ read: 2, done: true });
+    expect(r.error).toBe("Leads not read: Zoho was not granted ZohoCRM.modules.leads.READ.");
+    expect((await connection()).lastPullError).toBe("Leads not read: Zoho was not granted ZohoCRM.modules.leads.READ.");
+    expect(asked.some((a) => a.path.startsWith("/crm/v2/Leads"))).toBe(false);
   });
 });

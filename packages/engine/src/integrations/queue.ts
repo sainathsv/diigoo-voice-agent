@@ -157,7 +157,7 @@ export async function releaseHeld(tx: Tx, integrationId: string): Promise<number
 }
 
 /** How a connector persists what it learns (a refreshed token, a refused scope) on its integration. */
-function saver(tx: Tx, tenantId: string, i: Integration): ConnectorContext["save"] {
+export function saver(tx: Tx, tenantId: string, i: Integration): ConnectorContext["save"] {
   return async (patch) => {
     await tx
       .update(integrations)
