@@ -3,6 +3,7 @@
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import {
+  PLAN_NUMBER_SETTINGS,
   PlanSettingError,
   PlanSwitchError,
   STATUS_LISTS,
@@ -135,9 +136,7 @@ export async function savePlanSettings(fd: FormData) {
   const slug = String(fd.get("slug"));
   const ctx = await workspaceAction(slug, "org:manage");
   const patch: Record<string, unknown> = {};
-  for (const key of ["freshDays", "minGapDays", "reminderHour", "consultationWithinDays", "checkInAfterDays", "feedbackWithinDays", "resultCheckWithinDays", "recallWithinDays", "packageEndingWithinDays", "checkinLeadDays", "courseGapDays", "maxCallsPer30Days"]) {
-    if (fd.has(key)) patch[key] = whole(fd.get(key));
-  }
+  for (const { key } of PLAN_NUMBER_SETTINGS) if (fd.has(key)) patch[key] = whole(fd.get(key));
   for (const key of ["centres", "contactOnlyModules"]) if (fd.has(key)) patch[key] = list(fd.get(key));
   if (fd.has("windowStart")) {
     const days = [0, 1, 2, 3, 4, 5, 6].filter((d) => fd.get(`day${d}`) === "on");

@@ -7,17 +7,30 @@ import { PLANNED_CALL_VERDICTS, type PlannedCallVerdict } from "../index";
 
 const HEAD: Record<PlannedCallVerdict, string> = { call_now: "call now", scheduled: "scheduled", waiting: "waiting", kept_out: "kept out" };
 
-/** A table of counts: one line per journey with any rows, in the plan's own order, and a total. */
+/**
+ * A table of counts: one line per journey with any rows, in the plan's own
+ * order, ending with what that kind of call does in the workspace's words
+ * ("Check in and book their next sitting"), and a total.
+ */
 export function planTable(byVerdict: Record<PlannedCallVerdict, number>, byJourney: Partial<Record<PlanJourney, Partial<Record<PlannedCallVerdict, number>>>>): string[] {
   const cell = (n: number | undefined, v: PlannedCallVerdict) => String(n ?? 0).padStart(HEAD[v].length + 2);
   const row = (name: string, counts: Partial<Record<PlannedCallVerdict, number>>) => name.padEnd(22) + PLANNED_CALL_VERDICTS.map((v) => cell(counts[v], v)).join("");
   const lines = [" ".repeat(22) + PLANNED_CALL_VERDICTS.map((v) => `  ${HEAD[v]}`).join("")];
   for (const j of Object.keys(PLAN_JOURNEYS) as PlanJourney[]) {
     const counts = byJourney[j];
-    if (counts && Object.values(counts).some((n) => n)) lines.push(row(j, counts));
+    if (counts && Object.values(counts).some((n) => n)) lines.push(`${row(j, counts)}   ${PLAN_JOURNEYS[j].label}`);
   }
   lines.push(row("total", byVerdict));
   return lines;
+}
+
+/**
+ * One of the next calls, as `plan show` lists it: when, verdict, kind of
+ * call, masked number, where it came from, and for a course check-in where
+ * the course stands. Never a name, a treatment or a reason.
+ */
+export function nextCallLine(c: { journey: PlanJourney; verdict: PlannedCallVerdict; phone: string; origin: string; step: string | null }, time: string, width: number): string {
+  return `${time.padEnd(width)} ${c.verdict.padEnd(10)} ${c.journey.padEnd(22)} ${c.phone.padEnd(18)} ${c.step ? `${c.origin.padEnd(16)} ${c.step}` : c.origin}`;
 }
 
 /** A time as the client reads it, in their own time zone. */

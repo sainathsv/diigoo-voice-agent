@@ -201,6 +201,8 @@ export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
   timezone: "Asia/Kolkata",
 };
 
+/** The plan's settings that are a whole number of days, hours or calls. */
+export type PlanNumberKey = NumberKey;
 type NumberKey =
   | "freshDays"
   | "minGapDays"
@@ -226,7 +228,7 @@ type ListKey =
   | "enquirySources"
   | "centres"
   | "contactOnlyModules";
-const NUMBER_LIMITS: Record<NumberKey, [number, number]> = {
+const NUMBER_LIMITS: Record<NumberKey, readonly [number, number]> = {
   freshDays: [1, 365],
   minGapDays: [0, 60],
   reminderHour: [0, 23],
@@ -253,6 +255,8 @@ const LIST_KEYS: ListKey[] = [
   "centres",
   "contactOnlyModules",
 ];
+/** The smallest and largest value each number setting takes. */
+export const PLAN_NUMBER_LIMITS: Readonly<Record<PlanNumberKey, readonly [number, number]>> = NUMBER_LIMITS;
 /** The status lists, in the order a status is looked for in them. */
 export const STATUS_LISTS = ["doNotCallStatuses", "declinedStatuses", "neverStatuses", "noShowStatuses", "bookedStatuses", "customerStatuses", "openStatuses"] as const;
 export type StatusList = (typeof STATUS_LISTS)[number];
@@ -574,6 +578,8 @@ interface Draft {
   callAt: Date | null;
   priority: number;
   values: Values;
+  /** Said before "Another call to this person comes first" when the call waits, so the clinic still sees what it is about. */
+  lead?: string;
 }
 
 interface Ctx {
@@ -783,7 +789,7 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
   for (const d of active) {
     if (d === first) continue;
     const ahead = reminder && BOOKING_JOURNEYS.has(d.journey) ? reminder : first!;
-    Object.assign(d, { verdict: "waiting" as const, reason: `Another call to this person comes first: ${PLAN_JOURNEYS[ahead.journey].label}` });
+    Object.assign(d, { verdict: "waiting" as const, reason: `${d.lead ? `${d.lead} ` : ""}Another call to this person comes first: ${PLAN_JOURNEYS[ahead.journey].label}` });
   }
 
   const contactId = person.contactId ?? null;
@@ -1250,6 +1256,9 @@ function checkinRow(k: Checkin, c: Ctx): Draft {
   const next = k.every ? addDays(last.day, k.every) : null;
   const sitting = k.nextNo !== null && k.length !== null && k.nextNo <= k.length ? `Sitting ${k.nextNo} of ${k.length} of ${what}` : `The next sitting of ${what}`;
   const values: Values = { ...k.values, sitting_number: k.lastNo ? String(k.lastNo) : null, sessions_left: k.left !== null ? String(k.left) : null, next_due: next };
+  // What the call is about, from what its script is told, so the clinic reads what the call will say.
+  const step = `${courseStepText(values) ?? `The next sitting of ${what}`}.`;
+  const lastText = `The last sitting was on ${dateText(last.day)}`;
   const ends = open?.p.expiresOn ?? null;
   // A week after the sitting at the soonest; when their package ends before then, the day after, so they can still book.
   const soonest = addDays(last.day, ends && ends <= addDays(last.day, CHECKIN_MIN_DAYS) ? 1 : CHECKIN_MIN_DAYS);
@@ -1258,7 +1267,8 @@ function checkinRow(k: Checkin, c: Ctx): Draft {
     // A fixed day, never later than when the package came that close to its end, so the row stays the same from one plan to the next.
     const near = later(addDays(ends, -c.s.packageEndingWithinDays), soonest);
     const day = usual && usual < near ? usual : near;
-    return callable("course_checkin", o, startOf(day, c.tz), `${plural(open.left!, "session")} left, package ends on ${dateText(ends)}: called in time to book before it does. ${sitting} is next; the last was on ${dateText(last.day)}.`, values, c);
+    const why = `${step} ${plural(open.left!, "session")} left, package ends on ${dateText(ends)}: called in time to book before it does. ${lastText}.`;
+    return { ...callable("course_checkin", o, startOf(day, c.tz), why, values, c), lead: step };
   }
   if (!next || !usual)
     return keep(
@@ -1272,7 +1282,44 @@ function checkinRow(k: Checkin, c: Ctx): Draft {
   if (!open && daysBetween(next, c.today) > c.s.recallWithinDays)
     return keep("course_checkin", o, `Lapsed: last had ${what} on ${dateText(last.day)}. A call now would be a win-back offer, which needs a promotional number and consent.`);
   const pkgText = open ? ` ${plural(open.left!, "session")} left on ${theirPackage(open.p)}${ends ? `, which ends on ${dateText(ends)}` : ""}.` : "";
-  return callable("course_checkin", o, startOf(usual, c.tz), `${sitting} is due ${plural(k.every!, "day")} after the last, on ${dateText(last.day)}.${pkgText}${k.note}`, values, c);
+  const why = `${step} ${lastText}, and sittings are ${plural(k.every!, "day")} apart.${pkgText}${k.note}`;
+  return { ...callable("course_checkin", o, startOf(usual, c.tz), why, values, c), lead: step };
+}
+
+/**
+ * Where a course check-in stands, from the variables its script is told:
+ * "Laser Toning, sitting 4 of 6: check in and book sitting 5, due 22 Oct".
+ * The plan's reason leads with it, so the clinic reads what the call will
+ * say. The command line leaves the treatment out (treatment: false), since
+ * terminals are logged. Null for a call with no course in its context: any
+ * other kind of call, or one kept out.
+ */
+export function courseStepText(context: Readonly<Record<string, unknown>> | null | undefined, opts: { treatment?: boolean } = {}): string | null {
+  const text = (k: string) => {
+    const v = context?.[k];
+    return typeof v === "string" && v.trim() ? v.trim() : null;
+  };
+  const count = (k: string) => {
+    const v = Number(text(k) ?? NaN);
+    return Number.isInteger(v) && v >= 0 ? v : null;
+  };
+  const lastVisit = text("last_visit");
+  if (!lastVisit || !/^\d{4}-\d{2}-\d{2}$/.test(lastVisit)) return null;
+  const n = count("sitting_number") || null;
+  const left = count("sessions_left");
+  const due = text("next_due");
+  const where = n ? `sitting ${n}${left !== null ? ` of ${n + left}` : ""}` : left !== null ? plural(left, "sitting") + " left" : null;
+  const treatment = opts.treatment === false ? null : text("treatment");
+  const book = `check in and book ${n ? `sitting ${n + 1}` : "the next sitting"}${due && /^\d{4}-\d{2}-\d{2}$/.test(due) ? `, due ${shortDate(due, lastVisit)}` : ""}`;
+  const out = [[treatment, where].filter(Boolean).join(", "), book].filter(Boolean).join(": ");
+  // A treatment keeps the clinic's own spelling; a sentence of ours starts with a capital.
+  return treatment ? out : out.charAt(0).toUpperCase() + out.slice(1);
+}
+
+/** "22 Oct", with the year when it is not the year of `from`: "10 Jan 2027". */
+function shortDate(day: string, from: string): string {
+  const [y, m, d] = ymd(day);
+  return `${d} ${MONTHS[m - 1]}${day.slice(0, 4) === from.slice(0, 4) ? "" : ` ${y}`}`;
 }
 
 const theirPackage = (p: PlanPackage) => (p.status === "not_started" ? "the package they bought, not started yet" : "their package");

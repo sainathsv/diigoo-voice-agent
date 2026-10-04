@@ -4,26 +4,43 @@
  *   pnpm --filter @jenai/db plan show --tenant zennara
  *   pnpm --filter @jenai/db plan set --tenant zennara --key centres --value '["Main Branch"]'
  *   pnpm --filter @jenai/db plan set --tenant zennara --key freshDays --value null
+ *   pnpm --filter @jenai/db plan set --tenant zennara --key maxCallsPer30Days --value 2
+ *   pnpm --filter @jenai/db plan set --tenant zennara
  *   pnpm --filter @jenai/db plan on --tenant zennara
  *   pnpm --filter @jenai/db plan off --tenant zennara
  *
  * show prints where the plan is read from (each CRM and front desk
  * connection, such as Zenoti, with when it was last read and is next read),
- * the counts per journey and verdict, the settings the client changed, and
- * the next 20 calls JENAI would make, with the number masked; a call already
- * due says "now (due since ...)" inside calling hours, and the next calling
- * hours outside them, as the workspace's call plan page does. set stores one
- * setting (null puts back the default) and plans everyone's calls again. on
- * switches the plan on, so the worker reads the client's CRM and front desk
- * system on a timer; off stops that. Never prints a name, a full number or a
- * reason: a reason can name a treatment or a doctor, and terminals are
- * logged. Nothing is dialled.
+ * the counts per journey and verdict with what each kind of call does, the
+ * settings the client changed, and the next 20 calls JENAI would make, with
+ * the number masked; a call already due says "now (due since ...)" inside
+ * calling hours, and the next calling hours outside them, as the workspace's
+ * call plan page does. A course check-in also says where the course stands
+ * ("Sitting 4 of 6: check in and book sitting 5, due 22 Oct"). set stores one
+ * setting (null puts back the default) and plans everyone's calls again;
+ * without --key it lists the settings, what each means and the value in
+ * force. on switches the plan on, so the worker reads the client's CRM and
+ * front desk system on a timer; off stops that. Never prints a name, a full
+ * number, a treatment or a reason: a reason can name a treatment or a doctor,
+ * and terminals are logged. Nothing is dialled.
  */
 import "./env";
 import { asc, eq, inArray, sql } from "drizzle-orm";
-import { PlanSettingError, PlanSwitchError, SETTABLE_PLAN_KEYS, errorText, planReadKinds, planSummary, setPlanEnabled, setPlanSetting, type ReplanResult } from "@jenai/engine";
+import {
+  PLAN_NUMBER_SETTINGS,
+  PlanSettingError,
+  PlanSwitchError,
+  SETTABLE_PLAN_KEYS,
+  errorText,
+  planReadKinds,
+  planSettingsOf,
+  planSummary,
+  setPlanEnabled,
+  setPlanSetting,
+  type ReplanResult,
+} from "@jenai/engine";
 import { callPlanSettings, integrations, organizations, platformDb, withTenant } from "../index";
-import { callTime, planTable, when } from "./plan-text";
+import { callTime, nextCallLine, planTable, when } from "./plan-text";
 
 const arg = (name: string, fallback = "") => {
   const i = process.argv.indexOf(`--${name}`);
@@ -59,14 +76,14 @@ async function show() {
 
   const changed = Object.entries(own?.settings ?? {});
   console.log(changed.length ? "\n  settings changed from the defaults" : "\n  settings   all at their defaults");
-  for (const [k, v] of changed) console.log(`    ${k.padEnd(24)} ${JSON.stringify(v)}`);
+  for (const [k, v] of changed) console.log(`    ${k.padEnd(24)} ${JSON.stringify(v)}${MEANS[k] ? `   (${MEANS[k]})` : ""}`);
 
   if (s.next.length) {
     const now = new Date();
     console.log(`\n  next ${s.next.length} calls (times in ${org.timezone})`);
     const times = s.next.map((c) => callTime(c, now, org.timezone, s.callingWindow));
     const width = Math.max(24, ...times.map((t) => t.length));
-    s.next.forEach((c, n) => console.log(`    ${times[n]!.padEnd(width)} ${c.verdict.padEnd(10)} ${c.journey.padEnd(22)} ${c.phone.padEnd(18)} ${c.origin}`));
+    s.next.forEach((c, n) => console.log(`    ${nextCallLine(c, times[n]!, width)}`));
   }
   console.log("\n  Nothing is dialled from the plan. It is a preview.\n");
 }
@@ -112,10 +129,29 @@ function printPlan(plan: ReplanResult) {
     console.log(`  ${plan.marketingConsent} ${plan.marketingConsent === 1 ? "person has" : "people have"} agreed to marketing SMS in their front desk system (a count only: no call is planned on it)`);
 }
 
+/** What each number setting means, as the workspace's settings page says it. */
+const MEANS: Record<string, string> = Object.fromEntries(PLAN_NUMBER_SETTINGS.map((n) => [n.key, n.label]));
+
+/** Every setting `set` takes: each number with what it means, the values it takes and the one in force; then the rest by name. */
+async function listSettings(org: { id: string; name: string; timezone: string }) {
+  const [own] = await withTenant(org.id, (tx) => tx.select({ settings: callPlanSettings.settings }).from(callPlanSettings));
+  const raw = (own?.settings ?? {}) as Record<string, unknown>;
+  const s = planSettingsOf(raw, org.timezone);
+  console.log(`\n${org.name}: call plan settings (set one with --key <setting> --value <JSON>, or null for the default)\n`);
+  for (const n of PLAN_NUMBER_SETTINGS) {
+    const now = n.key in raw ? `${s[n.key]}, set by the client` : `${s[n.key]}, JENAI's default`;
+    console.log(`  ${n.key.padEnd(24)} ${now}; ${n.min} to ${n.max}`);
+    console.log(`    ${n.label}.${n.help ? ` ${n.help}` : ""}`);
+  }
+  const rest = SETTABLE_PLAN_KEYS.filter((k) => !MEANS[k]);
+  console.log(`\n  also, as JSON: ${rest.join(", ")}\n`);
+}
+
 async function set() {
   const org = await client();
   const key = arg("key");
   const raw = arg("value");
+  if (!key && !raw) return listSettings(org);
   if (!key || !raw) throw new PlanSettingError(`need --key <setting> --value <JSON>. The settings are: ${SETTABLE_PLAN_KEYS.join(", ")}.`);
   let value: unknown;
   try {
@@ -124,7 +160,7 @@ async function set() {
     throw new PlanSettingError(`--value must be JSON, such as 30, '["Main Branch"]' or null to put back the default.`);
   }
   const r = await setPlanSetting(org.id, key, value, { via: "system" });
-  console.log(`\n${org.name}: ${key} ${value === null ? "put back to its default" : `set to ${JSON.stringify(value)}`}`);
+  console.log(`\n${org.name}: ${key} ${value === null ? "put back to its default" : `set to ${JSON.stringify(value)}`}${MEANS[key] ? ` (${MEANS[key]})` : ""}`);
   console.log(`\n  call plan  ${r.plan.people} people, ${r.plan.rows} rows (${r.plan.removed} no longer apply)`);
   printPlan(r.plan);
   console.log("  Nothing was dialled. This is the plan only.\n");
@@ -146,7 +182,9 @@ try {
   else if (command === "set") await set();
   else if (command === "on" || command === "off") await onOff(command === "on");
   else {
-    console.log("usage: plan show --tenant <address>\n       plan set --tenant <address> --key <setting> --value <JSON, or null for the default>\n       plan on|off --tenant <address>");
+    console.log(
+      "usage: plan show --tenant <address>\n       plan set --tenant <address> --key <setting> --value <JSON, or null for the default>\n       plan set --tenant <address>   (lists the settings and what each means)\n       plan on|off --tenant <address>",
+    );
     process.exit(1);
   }
 } catch (e) {

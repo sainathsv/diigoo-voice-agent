@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PLAN_SETTINGS } from "@jenai/engine";
-import { callTime, when } from "./plan-text";
+import { callTime, nextCallLine, planTable, when } from "./plan-text";
 
 const TZ = "Asia/Kolkata";
 const W = DEFAULT_PLAN_SETTINGS.callingWindow; // Monday to Saturday, 10:00 to 19:00
@@ -37,5 +37,24 @@ describe("when a planned call goes, on the command line", () => {
     // Due, but its calling hours are still to come: the time it can be made.
     expect(callTime({ callAt: later, verdict: "call_now" }, NOW, TZ, W)).toBe(when(later, TZ));
     expect(callTime({ callAt: null, verdict: "call_now" }, NOW, TZ, W)).toBe("no time");
+  });
+});
+
+describe("the plan's counts and next calls, on the command line", () => {
+  it("ends each kind of call's counts with what it does, in the workspace's words", () => {
+    const lines = planTable({ call_now: 1, scheduled: 13, waiting: 2, kept_out: 0 }, { course_checkin: { scheduled: 12, waiting: 2 }, visit_feedback: { call_now: 1, scheduled: 1 } });
+    expect(lines).toHaveLength(4);
+    expect(lines[1]).toMatch(/^course_checkin +0 +12 +2 +0 {3}Check in and book their next sitting$/);
+    // The plan's own order: the check-in comes before feedback.
+    expect(lines[2]).toMatch(/^visit_feedback .* Ask how their visit went$/);
+    expect(lines[3]).toMatch(/^total +1 +13 +2 +0$/);
+  });
+
+  it("says where a course check-in stands, and nothing more for any other call", () => {
+    const c = { journey: "course_checkin" as const, verdict: "scheduled" as const, phone: "+91 ••••• •3210", origin: "Zenoti visit", step: "Sitting 4 of 6: check in and book sitting 5, due 22 Oct" };
+    expect(nextCallLine(c, "19 Oct 2026, 10:00 am", 24)).toBe(
+      "19 Oct 2026, 10:00 am    scheduled  course_checkin         +91 ••••• •3210    Zenoti visit     Sitting 4 of 6: check in and book sitting 5, due 22 Oct",
+    );
+    expect(nextCallLine({ ...c, journey: "visit_feedback", step: null }, "now", 4)).toBe("now  scheduled  visit_feedback         +91 ••••• •3210    Zenoti visit");
   });
 });

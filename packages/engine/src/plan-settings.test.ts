@@ -9,10 +9,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { auditEvents, crmRecords, integrations, organizations, plannedCalls, platformDb, withTenant } from "@jenai/db";
-import { DEFAULT_PLAN_SETTINGS, dropOrphanedPlanRows, planSettingsOf, replanTenant } from "./care-plan";
+import { DEFAULT_PLAN_SETTINGS, PLAN_NUMBER_LIMITS, dropOrphanedPlanRows, planSettingProblem, planSettingsOf, replanTenant } from "./care-plan";
 import { dbErrorCode, errorText } from "./errors";
 import { PlanSettingError, setPlanSettings } from "./plan-refresh";
-import { PlanSwitchError, planSettingsPage, removeTreatmentRule, setPullFieldLabels, setTreatmentRule, statusMoved, treatmentRuleProblem } from "./plan-settings";
+import { PLAN_NUMBER_SETTINGS, PlanSwitchError, planSettingsPage, removeTreatmentRule, setPullFieldLabels, setTreatmentRule, statusMoved, treatmentRuleProblem } from "./plan-settings";
 
 let org = "";
 let zoho = "";
@@ -51,6 +51,27 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await platformDb().delete(organizations).where(eq(organizations.id, org));
+});
+
+describe("what each number means", () => {
+  it("says every number setting in plain words once, with the values it takes and JENAI's default", () => {
+    expect(PLAN_NUMBER_SETTINGS.map((n) => n.key).sort()).toEqual(Object.keys(PLAN_NUMBER_LIMITS).sort());
+    for (const n of PLAN_NUMBER_SETTINGS) {
+      expect(n.label.length, n.key).toBeGreaterThan(10);
+      expect(`${n.label} ${n.help}`, n.key).not.toMatch(/\u2014/);
+      // The range said is the range the plan takes.
+      expect(planSettingProblem(n.key, n.min), n.key).toBeNull();
+      expect(planSettingProblem(n.key, n.max), n.key).toBeNull();
+      expect(planSettingProblem(n.key, n.min - 1), n.key).not.toBeNull();
+      expect(planSettingProblem(n.key, n.max + 1), n.key).not.toBeNull();
+      expect(n.standard).toBe(DEFAULT_PLAN_SETTINGS[n.key]);
+    }
+    const said = Object.fromEntries(PLAN_NUMBER_SETTINGS.map((n) => [n.key, n]));
+    expect(said.checkinLeadDays).toMatchObject({ min: 0, max: 30, standard: 3 });
+    expect(said.courseGapDays).toMatchObject({ min: 14, max: 730, standard: 60 });
+    expect(said.maxCallsPer30Days).toMatchObject({ min: 1, max: 30, standard: 3 });
+    expect(said.checkinLeadDays!.help).toMatch(/whether they see a difference/);
+  });
 });
 
 describe("their CRM's own words", () => {

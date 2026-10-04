@@ -7,7 +7,21 @@
  */
 import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import { audit, callPlanSettings, crmRecords, integrations, organizations, treatmentRules, withTenant, type TreatmentRule } from "@jenai/db";
-import { DEFAULT_HEALTH_RULES, FALLBACK_RULE, STATUS_LISTS, planSettingsOf, replanTenant, statusListOf, type PlanRule, type PlanSettings, type ReplanResult, type StatusList } from "./care-plan";
+import {
+  DEFAULT_HEALTH_RULES,
+  DEFAULT_PLAN_SETTINGS,
+  FALLBACK_RULE,
+  PLAN_NUMBER_LIMITS,
+  STATUS_LISTS,
+  planSettingsOf,
+  replanTenant,
+  statusListOf,
+  type PlanNumberKey,
+  type PlanRule,
+  type PlanSettings,
+  type ReplanResult,
+  type StatusList,
+} from "./care-plan";
 import { planReadKinds, pullKinds } from "./integrations/crm-sync";
 import { ZOHO_PULL_ITEMS, ZOHO_PULL_LABELS } from "./integrations/zoho";
 import { auditedBy, type SetPlanSettingOptions } from "./plan-refresh";
@@ -45,6 +59,62 @@ export async function setPlanEnabled(tenantId: string, enabled: boolean, opts: S
   });
   return { enabled, plan: enabled ? await replanTenant(tenantId, { now: opts.now }) : null };
 }
+
+// ---------------------------------------------------------------- what each number means
+
+export interface PlanNumberSetting {
+  key: PlanNumberKey;
+  /** What it sets, in the clinic's words. */
+  label: string;
+  /** What it changes in the plan, or "" when the label says it all. */
+  help: string;
+  min: number;
+  max: number;
+  /** JENAI's value when the client sets none. */
+  standard: number;
+}
+
+/**
+ * The plan's numbers as a client reads them, in the order the settings page
+ * shows them. The settings page and `plan set` both say these, so the words
+ * are written once; plan-settings.test.ts checks every number has them.
+ */
+export const PLAN_NUMBER_SETTINGS: readonly PlanNumberSetting[] = (
+  [
+    ["freshDays", "Enquiries stay warm for (days)", "Older, a call is a cold call, which needs a promotional number and consent."],
+    ["minGapDays", "Days between calls to one person", "Appointment reminders are not held back by this."],
+    ["reminderHour", "Reminder hour, the evening before", "Kept inside your calling hours."],
+    ["consultationWithinDays", "Check in after a consultation within (days)", ""],
+    ["checkInAfterDays", "Check-in this many days after a consultation", ""],
+    ["feedbackWithinDays", "Ask for feedback while the visit is this recent (days)", ""],
+    ["resultCheckWithinDays", "Result check up to this many days past due", ""],
+    [
+      "recallWithinDays",
+      "Course check-in or maintenance up to this many days past due",
+      "Later, a call is a win-back offer, which needs a promotional number and consent. Sessions left on a package they paid for are always theirs to book.",
+    ],
+    [
+      "packageEndingWithinDays",
+      "Call about a package ending within (days)",
+      "From your front desk system (Zenoti): sessions left on a package that ends this soon are called about in time, so they can use what they paid for.",
+    ],
+    [
+      "checkinLeadDays",
+      "Course check-in this many days before the next sitting is due",
+      "The one call between sittings of a course: how they have been, whether they see a difference, and booking the next sitting. Never sooner than a week after a sitting, and none when the next sitting is already booked.",
+    ],
+    [
+      "courseGapDays",
+      "A break longer than this starts a new course (days)",
+      "Sittings of one treatment closer together than this are one course, with one check-in between each. For a treatment with a long gap between sittings, 2.5 times that gap counts when it is longer.",
+    ],
+    [
+      "maxCallsPer30Days",
+      "Most calls to one person in any 30 days",
+      "A safety net, so nobody is called too often: a later call waits until the 30 days allow it. Appointment reminders are not held back by this.",
+    ],
+  ] as const
+).map(([key, label, help]) => ({ key, label, help, min: PLAN_NUMBER_LIMITS[key][0], max: PLAN_NUMBER_LIMITS[key][1], standard: DEFAULT_PLAN_SETTINGS[key] }));
 
 // ---------------------------------------------------------------- what the settings page shows
 
