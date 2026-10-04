@@ -13,8 +13,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { eq, inArray } from "drizzle-orm";
 import { credentialsOf } from "@jenai/engine";
-import { auditEvents, branches, integrations, organizations, platformDb, visits, withTenant } from "../index";
-import { ZenotiCommandError, connectCommand, readZenotiKeyFile, syncCommand, testCommand, type ZenotiCommandDeps } from "./zenoti-commands";
+import { auditEvents, branches, clinicAppointments, integrations, organizations, platformDb, visits, withTenant } from "../index";
+import { ZenotiCommandError, connectCommand, mapCommand, readZenotiKeyFile, syncCommand, testCommand, type ZenotiCommandDeps } from "./zenoti-commands";
 
 const KEY = "zen-cli-key-0123456789abcdef";
 const NEW_KEY = "zen-cli-key-fedcba9876543210";
@@ -357,5 +357,60 @@ describe("zenoti sync", () => {
       await expect(syncCommand({ tenant: "anyone", ...flags }, terminal(z).deps)).rejects.toThrow(why);
     }
     expect(z.seen).toEqual([]);
+  });
+});
+
+describe("zenoti map", () => {
+  it("matches a centre by name again each test until the clinic chooses its branch, which then stands", async () => {
+    // At first the clinic has only a "Kondapur Main" branch, which the Kondapur centre matches by its name.
+    const slug = `zenoti-map-${randomUUID().slice(0, 8)}`;
+    const [o] = await platformDb().insert(organizations).values({ kind: "client", name: "Zenoti Map Clinic", slug, status: "active", vertical: "derma", languages: ["en"] }).returning();
+    const org = o!.id;
+    orgs.push(org);
+    const [main] = await withTenant(org, (tx) => tx.insert(branches).values({ tenantId: org, name: "Kondapur Main", languages: ["en"] }).returning());
+    const z = fakeZenoti(ALL);
+    await connectCommand({ tenant: slug, file: await keyFile("map.json", JSON.stringify({ api_key: KEY })) }, terminal(z).deps);
+    const [i] = await zenotiOf(org);
+    expect(i!.config.branchMap).toEqual({ [KONDAPUR]: main!.id });
+    await withTenant(org, (tx) =>
+      tx.insert(clinicAppointments).values({ tenantId: org, integrationId: i!.id, externalId: "b-1", guestRef: "g1", service: "Peel", startsAt: NOW, status: "booked", centreRef: KONDAPUR, branchId: main!.id }),
+    );
+
+    // A better branch is made later: the next test matches the centre to it, and moves what is stored.
+    const [kondapur] = await withTenant(org, (tx) => tx.insert(branches).values({ tenantId: org, name: "Kondapur", languages: ["en"] }).returning());
+    let t = terminal(z);
+    await testCommand({ tenant: slug }, t.deps);
+    expect(t.text()).toContain("Kondapur (ZNKD)  is JENAI's Kondapur branch");
+    const booking = async () => (await withTenant(org, (tx) => tx.select().from(clinicAppointments)))[0]!.branchId;
+    expect(await booking()).toBe(kondapur!.id);
+
+    // The clinic says it is the Main branch: no later test undoes that.
+    t = terminal(z);
+    const chose = await mapCommand({ tenant: slug, centre: "znkd", branch: "Kondapur Main" }, t.deps);
+    expect(chose).toMatchObject({ branchId: main!.id, chosen: true, moved: 1 });
+    expect(t.text()).toContain("Zenoti Map Clinic: Zenoti centre Kondapur (ZNKD) is JENAI's Kondapur Main branch, as chosen here, and stays so.");
+    expect(t.text()).toContain("1 booking or visit already stored from it moved with it.");
+    await testCommand({ tenant: slug }, terminal(z).deps);
+    expect((await zenotiOf(org))[0]!.config).toMatchObject({ branchMap: { [KONDAPUR]: main!.id }, branchPins: { [KONDAPUR]: true } });
+    expect(await booking()).toBe(main!.id);
+
+    // No branch at all, then back to matching by name.
+    await mapCommand({ tenant: slug, centre: KONDAPUR, branch: "none" }, terminal(z).deps);
+    expect(await booking()).toBeNull();
+    t = terminal(z);
+    await mapCommand({ tenant: slug, centre: "ZNKD", branch: "match" }, t.deps);
+    expect(t.text()).toContain("is JENAI's Kondapur branch, matched by name, as it will be each time.");
+    expect((await zenotiOf(org))[0]!.config.branchPins).toEqual({});
+    expect(await booking()).toBe(kondapur!.id);
+
+    await expect(mapCommand({ tenant: slug, centre: "ZNXX", branch: "Kondapur" }, terminal(z).deps)).rejects.toThrow(/No centre "ZNXX" on this Zenoti connection/);
+    await expect(mapCommand({ tenant: slug, centre: "ZNKD", branch: "Gachibowli" }, terminal(z).deps)).rejects.toThrow(/No branch called "Gachibowli"/);
+    await expect(mapCommand({ tenant: slug, centre: "ZNKD", branch: "" }, terminal(z).deps)).rejects.toThrow(/need --branch/);
+    const updates = (await auditOf(org)).filter((a) => a.action === "integration.updated");
+    expect(updates.map((a) => a.summary)).toEqual([
+      "Zenoti centre Kondapur, ZNKD is now the Kondapur Main branch, as the clinic chose",
+      "Zenoti centre Kondapur, ZNKD is now no branch, as the clinic chose",
+      "Zenoti centre Kondapur, ZNKD is matched by name again: Kondapur",
+    ]);
   });
 });

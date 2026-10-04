@@ -1,4 +1,4 @@
-import type { ClinicAppointmentStatus, PackageStatus, clinicAppointments, externalPeople, packageBalances } from "@jenai/db";
+import type { ClinicAppointmentStatus, PackageCovers, PackageStatus, clinicAppointments, externalPeople, packageBalances } from "@jenai/db";
 import { toE164 } from "@jenai/voice";
 import { localParts, zoned } from "../dialer/time";
 import type { Connector, ConnectorContext, SendResult } from "./types";
@@ -28,7 +28,8 @@ import type { Connector, ConnectorContext, SendResult } from "./types";
  * used; the app id and secret are kept for Zenoti's token sign-in, should a
  * client's setup need it later. Config: baseUrl (default
  * https://api.zenoti.com), rateLimitPerMinute (default 40), defaultCountryCode
- * (default "91", for a mobile saved without its country).
+ * (for a mobile saved without its country; the centre's own country code is
+ * used when this is not set, and no number at all rather than a guess).
  */
 
 export const ZENOTI_API = "https://api.zenoti.com";
@@ -45,6 +46,10 @@ const MAX_WAIT_MS = 65_000;
 /** When Zenoti says this few calls are left in the organisation's window, the next one waits for the refill. */
 const LOW_REMAINING = 5;
 const CENTRES = "/v1/centers";
+/** Centres asked for a page: list-all-centers pages its answer (its own example has 10 of 386 on a page). */
+const CENTRES_PAGE = 100;
+/** A chain bigger than this many pages of centres is not one any client has; the list stops there rather than looping. */
+const MAX_CENTRE_PAGES = 50;
 /** A guest id nobody has, for checking what the key may read without reading anyone. */
 const NO_GUEST = "00000000-0000-0000-0000-000000000000";
 
@@ -73,7 +78,7 @@ export class ZenotiPermissionError extends ZenotiError {
   override name = "ZenotiPermissionError";
 }
 
-/** The key itself is missing, wrong or revoked: Zenoti refuses even the list of centres. */
+/** The key itself is missing, wrong or revoked: Zenoti refuses the list of centres and a look for a guest alike. */
 export class ZenotiKeyError extends ZenotiError {
   override name = "ZenotiKeyError";
   constructor(message: string, status: number, what: string) {
@@ -84,7 +89,13 @@ export class ZenotiKeyError extends ZenotiError {
 /** Zenoti's rate limit, still hit after waiting as long as it asked. */
 export class ZenotiBusyError extends ZenotiError {
   override name = "ZenotiBusyError";
-  constructor(message: string, status: number, what: string) {
+  constructor(
+    message: string,
+    status: number,
+    what: string,
+    /** When Zenoti asked to be left alone until, if longer than JENAI waits within a run (ms on the client's clock). */
+    readonly notBefore: number | null = null,
+  ) {
     super(message, status, what, false, true);
   }
 }
@@ -100,8 +111,20 @@ export class ZenotiUnavailableError extends ZenotiError {
 /** This run has made every call it was given. Nothing is wrong: the rest is read next time. */
 export class ZenotiBudgetSpent extends ZenotiError {
   override name = "ZenotiBudgetSpent";
+  constructor(what: string, message = `JENAI made every call to Zenoti this run was given before reading ${what}; the rest is read next time.`) {
+    super(message, 0, what, false, true);
+  }
+}
+
+/**
+ * This run has used the time it was given: waiting on a busy Zenoti made it
+ * slow. It stops, as when out of calls, before its hold on the connection
+ * runs out, so no second run can read the same connection at the same time.
+ */
+export class ZenotiTimeSpent extends ZenotiBudgetSpent {
+  override name = "ZenotiTimeSpent";
   constructor(what: string) {
-    super(`JENAI made every call to Zenoti this run was given before reading ${what}; the rest is read next time.`, 0, what, false, true);
+    super(what, `JENAI stopped reading Zenoti before ${what} because this run was out of time, Zenoti being slow to let it in; the rest is read next time.`);
   }
 }
 
@@ -112,6 +135,8 @@ export class ZenotiBudgetSpent extends ZenotiError {
 export interface ZenotiCallBudget {
   left: number;
   used: number;
+  /** No call is started at or after this time on the client's clock (ms). */
+  until?: number;
 }
 
 // ---------------------------------------------------------------- pacing
@@ -249,7 +274,8 @@ function checkRange(from: string, to: string, least: number, most: number, what:
  * requests, so what the Test says can be read is what the sync reads.
  */
 const REQ = {
-  centres: (): Req => ({ method: "GET", path: CENTRES, what: "the list of centres" }),
+  /** list-all-centers: paged by Page and Size, page_info {total, page, size} saying how many there are. */
+  centres: (page = 1): Req => ({ method: "GET", path: CENTRES, what: "the list of centres", query: { Page: page, Size: CENTRES_PAGE } }),
   /**
    * retrieve-the-list-of-appointments-of-a-center: end_date is exclusive and
    * at most seven days after start_date. No-shows and cancellations only
@@ -273,7 +299,9 @@ const REQ = {
   /**
    * sales-accrual-report: a POST that only reads. Dates are centre time,
    * "YYYY-MM-DD HH:MM:SS", at most a year apart; -1 means every item type
-   * and invoice status, as Zenoti's own example sends.
+   * and invoice status, as Zenoti's own example sends. Asking for services
+   * only would save pages, but the reference does not say which number
+   * ReportItemType gives them, so every type is read and only service lines kept.
    */
   salesAccrual: (centreIds: string[], from: string, to: string, page: number, size: number): Req => ({
     method: "POST",
@@ -302,6 +330,8 @@ interface Answer {
   status: number;
   json: unknown;
   headers: Headers;
+  /** A 429 that asked for a longer wait than JENAI makes within a run: no call before this (ms on the client's clock). */
+  notBefore?: number;
 }
 
 export interface ZenotiCentre {
@@ -310,6 +340,100 @@ export interface ZenotiCentre {
   code: string | null;
   /** The phone code of the centre's country ("91"), when Zenoti gives it. */
   phoneCode: string | null;
+  /** The centre's own time zone ("Asia/Kolkata"), when Zenoti names one JENAI knows. */
+  timeZone?: string | null;
+}
+
+/**
+ * Zenoti names a centre's time zone the way Windows does
+ * (location.time_zone.standard_name, "India Standard Time" in its own
+ * list-all-centers example). These are the IANA zones those names stand for
+ * (Unicode CLDR's windowsZones, the zone for the whole region). A name not
+ * here gives no zone, and the branch's or the client's is used instead.
+ */
+const WINDOWS_ZONES: Record<string, string> = {
+  "india standard time": "Asia/Kolkata",
+  "sri lanka standard time": "Asia/Colombo",
+  "nepal standard time": "Asia/Kathmandu",
+  "bangladesh standard time": "Asia/Dhaka",
+  "pakistan standard time": "Asia/Karachi",
+  "arabian standard time": "Asia/Dubai",
+  "arab standard time": "Asia/Riyadh",
+  "arabic standard time": "Asia/Baghdad",
+  "se asia standard time": "Asia/Bangkok",
+  "singapore standard time": "Asia/Singapore",
+  "china standard time": "Asia/Shanghai",
+  "tokyo standard time": "Asia/Tokyo",
+  "gmt standard time": "Europe/London",
+  "w. europe standard time": "Europe/Berlin",
+  "romance standard time": "Europe/Paris",
+  "central europe standard time": "Europe/Budapest",
+  "south africa standard time": "Africa/Johannesburg",
+  "e. africa standard time": "Africa/Nairobi",
+  "eastern standard time": "America/New_York",
+  "central standard time": "America/Chicago",
+  "mountain standard time": "America/Denver",
+  "us mountain standard time": "America/Phoenix",
+  "pacific standard time": "America/Los_Angeles",
+  "alaskan standard time": "America/Anchorage",
+  "hawaiian standard time": "Pacific/Honolulu",
+  "atlantic standard time": "America/Halifax",
+  "canada central standard time": "America/Regina",
+  "aus eastern standard time": "Australia/Sydney",
+  "e. australia standard time": "Australia/Brisbane",
+  "cen. australia standard time": "Australia/Adelaide",
+  "w. australia standard time": "Australia/Perth",
+  "new zealand standard time": "Pacific/Auckland",
+};
+
+/** A centre's time zone as Zenoti names it, as an IANA zone, or null. */
+export function zenotiTimeZone(timeZone: unknown): string | null {
+  const z = obj(timeZone);
+  for (const v of [z.standard_name, z.symbol]) {
+    const name = text(v, 80)?.toLowerCase();
+    if (name && Object.hasOwn(WINDOWS_ZONES, name)) return WINDOWS_ZONES[name]!;
+  }
+  return null;
+}
+
+/**
+ * The calling code of the one country a time zone is in, for a mobile saved
+ * without its country when nothing nearer says: the centre's zone, then the
+ * client's. Only zones that stand for a single calling code are here; any
+ * other gives none, and such a mobile then gives no number rather than a guess.
+ */
+const ZONE_PHONE_CODES: Record<string, string> = {
+  "Asia/Kolkata": "91",
+  "Asia/Calcutta": "91",
+  "Asia/Colombo": "94",
+  "Asia/Kathmandu": "977",
+  "Asia/Dhaka": "880",
+  "Asia/Karachi": "92",
+  "Asia/Dubai": "971",
+  "Asia/Riyadh": "966",
+  "Asia/Singapore": "65",
+  "Asia/Tokyo": "81",
+  "Europe/London": "44",
+  "Africa/Johannesburg": "27",
+  "Africa/Nairobi": "254",
+  "America/New_York": "1",
+  "America/Chicago": "1",
+  "America/Denver": "1",
+  "America/Phoenix": "1",
+  "America/Los_Angeles": "1",
+  "America/Anchorage": "1",
+  "Pacific/Honolulu": "1",
+  "Australia/Sydney": "61",
+  "Australia/Melbourne": "61",
+  "Australia/Brisbane": "61",
+  "Australia/Adelaide": "61",
+  "Australia/Perth": "61",
+  "Pacific/Auckland": "64",
+};
+
+/** The calling code of a time zone's country, or null when the zone does not name one. */
+export function phoneCodeForZone(timeZone: string | null | undefined): string | null {
+  return timeZone && Object.hasOwn(ZONE_PHONE_CODES, timeZone) ? ZONE_PHONE_CODES[timeZone]! : null;
 }
 
 /** Country phone codes by Zenoti country id, read once a day for everyone: the list is Zenoti's, not a clinic's. */
@@ -325,8 +449,8 @@ export class ZenotiClient {
   private readonly key: string;
   private readonly gate: string;
   private readonly perMinute: number;
-  /** Whether the key opens the list of centres, asked at most once per client. */
-  private keyWorks: Promise<boolean> | null = null;
+  /** Whether Zenoti accepts the key at all, asked at most once per client. */
+  private keyOk: Promise<boolean> | null = null;
   private readonly guests = new Map<string, Promise<Record<string, unknown> | null>>();
 
   constructor(
@@ -355,12 +479,15 @@ export class ZenotiClient {
     if (req.body !== undefined) headers["Content-Type"] = "application/json";
     let last: Answer = { status: 0, json: null, headers: new Headers() };
     for (let attempt = 0; attempt < MAX_TRIES; attempt++) {
+      if (this.budget && this.budget.left <= 0) throw new ZenotiBudgetSpent(req.what);
+      this.inTime(req);
+      await take(this.gate, this.perMinute, this.clock);
+      // Waiting for a slot can take a minute when Zenoti is busy: checked again, so no call starts late.
+      this.inTime(req);
       if (this.budget) {
-        if (this.budget.left <= 0) throw new ZenotiBudgetSpent(req.what);
         this.budget.left--;
         this.budget.used++;
       }
-      await take(this.gate, this.perMinute, this.clock);
       let res: Response;
       try {
         res = await this.ctx.fetch(url.toString(), {
@@ -379,7 +506,7 @@ export class ZenotiClient {
       heed(this.gate, res.headers, this.clock);
       if (res.status === 429) {
         const wait = waitAfter429(res.headers, attempt, this.clock.now());
-        if (wait > MAX_WAIT_MS) return last;
+        if (wait > MAX_WAIT_MS) return { ...last, notBefore: this.clock.now() + wait };
         hold(this.gate, wait, this.clock);
         continue;
       }
@@ -392,6 +519,10 @@ export class ZenotiClient {
     return last;
   }
 
+  private inTime(req: Req): void {
+    if (this.budget?.until !== undefined && this.clock.now() >= this.budget.until) throw new ZenotiTimeSpent(req.what);
+  }
+
   /** The answer's body when Zenoti gave it, else the error that says what went wrong. */
   private async read(req: Req): Promise<unknown> {
     const a = await this.send(req);
@@ -400,35 +531,72 @@ export class ZenotiClient {
   }
 
   private async failure(a: Answer, req: Req): Promise<ZenotiError> {
+    // The accrual report says a refused permission this way: 400, {"code": 918, "message": "cannot access"}.
+    if (cannotAccess(a)) return new ZenotiPermissionError(`Zenoti does not let this key read ${req.what}.`, a.status, req.what);
     if (a.status === 401 || a.status === 403) {
       // Zenoti refuses a request outside the key's API key groups the same
-      // way it refuses a revoked key. The list of centres tells them apart.
-      if (req.path === CENTRES || !(await this.keyOpensCentres())) {
+      // way it refuses a revoked key. Another read tells them apart.
+      if (!(await this.keyWorks(req))) {
         return new ZenotiKeyError("Zenoti did not accept this API key. It may be mistyped, or no longer valid in Zenoti.", a.status, req.what);
       }
       return new ZenotiPermissionError(`Zenoti does not let this key read ${req.what}.`, a.status, req.what);
     }
-    if (a.status === 429) return new ZenotiBusyError(`Zenoti asked JENAI to slow down while reading ${req.what}.`, a.status, req.what);
+    if (a.status === 429) return new ZenotiBusyError(`Zenoti asked JENAI to slow down while reading ${req.what}.`, a.status, req.what, a.notBefore ?? null);
     if (a.status === 0 || a.status >= 500) {
       return new ZenotiUnavailableError(`Zenoti did not answer a request for ${req.what}${a.status ? ` (HTTP ${a.status})` : ""}.`, a.status, req.what);
     }
     return new ZenotiError(`Zenoti refused a request for ${req.what} (HTTP ${a.status}).`, a.status, req.what);
   }
 
-  private keyOpensCentres(): Promise<boolean> {
-    this.keyWorks ??= this.send(REQ.centres()).then((a) => a.status !== 401 && a.status !== 403);
-    return this.keyWorks;
+  /**
+   * Whether Zenoti accepts the key at all: it opens the list of centres, or,
+   * for a backend app given no access to centres, a guest nobody has is
+   * looked for (not found means the key got in). Only when both are refused
+   * is the key itself wrong.
+   */
+  private keyWorks(refused: Req): Promise<boolean> {
+    this.keyOk ??= (async () => {
+      for (const probe of [REQ.centres(), REQ.guest(NO_GUEST)]) {
+        if (probe.path === refused.path) continue;
+        const a = await this.send(probe);
+        if (a.status !== 401 && a.status !== 403 && !cannotAccess(a)) return true;
+      }
+      return false;
+    })();
+    return this.keyOk;
   }
 
-  /** The centres this key sees. A refusal here is the key itself. */
+  /**
+   * The centres this key sees, every page of them. A refusal here is the key
+   * itself, unless the key opens something else: then it is only the
+   * centres it may not read (ZenotiPermissionError).
+   */
   async centres(): Promise<ZenotiCentre[]> {
-    const j = await this.read(REQ.centres());
-    this.keyWorks = Promise.resolve(true);
-    return listOf(j, "centers").flatMap((c) => {
-      const o = obj(c);
-      const id = text(o.id, 64);
-      return id ? [{ id, name: text(o.name, 200), code: text(o.code, 40), phoneCode: digitsOf(obj(o.country).phone_code) }] : [];
-    });
+    const by = new Map<string, ZenotiCentre>();
+    for (let page = 1; page <= MAX_CENTRE_PAGES; page++) {
+      const j = await this.read(REQ.centres(page));
+      this.keyOk = Promise.resolve(true);
+      const list = listOf(j, "centers");
+      const before = by.size;
+      for (const c of list) {
+        const o = obj(c);
+        const id = text(o.id, 64);
+        const country = obj(o.country);
+        const countryId = int(country.id);
+        if (id)
+          by.set(id, {
+            id,
+            name: text(o.name, 200),
+            code: text(o.code, 40),
+            phoneCode: phoneCodeOf(country.phone_code) ?? (countryId !== null ? (ZENOTI_PHONE_CODES[String(countryId)] ?? null) : null),
+            timeZone: zenotiTimeZone(obj(o.location).time_zone),
+          });
+      }
+      const total = int(obj(obj(j).page_info).total);
+      // The last page: all there are, a short page, or one that brought nobody new (a Zenoti that does not page).
+      if ((total !== null ? by.size >= total : list.length < CENTRES_PAGE) || by.size === before) break;
+    }
+    return [...by.values()];
   }
 
   /** One centre's bookings from `from` up to, not including, `to` (at most seven days), no-shows and cancellations too. */
@@ -437,13 +605,18 @@ export class ZenotiClient {
     return listOf(await this.read(REQ.appointments(centreId, from, to)), "appointments").map(obj);
   }
 
-  /** One guest's profile, null when Zenoti has no such guest. Asked once per guest per client. */
+  /**
+   * One guest's profile, null when Zenoti cannot give it: no such guest, one
+   * merged into another, or any other refusal about this guest alone (a 4xx
+   * other than 401, 403 and 429; Zenoti documents no other answer). Asked
+   * once per guest per client.
+   */
   guest(id: string): Promise<Record<string, unknown> | null> {
     let g = this.guests.get(id);
     if (!g) {
       g = this.send(REQ.guest(id)).then(async (a) => {
         if (a.status >= 200 && a.status < 300) return obj(a.json);
-        if (a.status === 404) return null;
+        if (noSuchGuest(a)) return null;
         throw await this.failure(a, REQ.guest(id));
       });
       // A failure is not remembered, so the next ask tries again.
@@ -453,9 +626,13 @@ export class ZenotiClient {
     return g;
   }
 
-  /** One guest's series packages, at one centre when given. */
-  async guestPackages(id: string, centreId?: string): Promise<Record<string, unknown>[]> {
-    return listOf(await this.read(REQ.guestPackages(id, centreId)), "packages", "guest_packages").map(obj);
+  /** One guest's series packages, at one centre when given; null when Zenoti cannot give them for this guest (as for guest()). */
+  async guestPackages(id: string, centreId?: string): Promise<Record<string, unknown>[] | null> {
+    const req = REQ.guestPackages(id, centreId);
+    const a = await this.send(req);
+    if (a.status >= 200 && a.status < 300) return listOf(a.json, "packages", "guest_packages").map(obj);
+    if (noSuchGuest(a)) return null;
+    throw await this.failure(a, req);
   }
 
   /** One page of the sales accrual report, whole days in centre time, a year at most (the last day runs to 23:59:59). */
@@ -482,12 +659,27 @@ export class ZenotiClient {
     const codes: Record<string, string> = { ...ZENOTI_PHONE_CODES };
     for (const c of listOf(a.json, "countries")) {
       const id = int(obj(c).id);
-      const code = digitsOf(obj(c).phone_code);
+      const code = phoneCodeOf(obj(c).phone_code);
       if (id !== null && code) codes[String(id)] = code;
     }
     countryCodes = { at: this.clock.now(), codes };
     return codes;
   }
+}
+
+/** Zenoti's "you may not see this" in the body of a 400: {"code": 918, "message": "cannot access"} (sales-accrual-report). */
+function cannotAccess(a: Answer): boolean {
+  if (a.status !== 400 && a.status !== 403) return false;
+  const j = obj(a.json);
+  const err = obj(j.error);
+  const code = int(j.code ?? err.code);
+  const message = String(j.message ?? j.Message ?? err.message ?? "").toLowerCase();
+  return code === 918 || message.includes("cannot access");
+}
+
+/** An answer about this guest alone: not found, merged away, or refused for a reason that is not the key's or Zenoti's load. */
+function noSuchGuest(a: Answer): boolean {
+  return a.status >= 400 && a.status < 500 && a.status !== 401 && a.status !== 403 && a.status !== 429 && !cannotAccess(a);
 }
 
 // ---------------------------------------------------------------- what a key may read
@@ -528,12 +720,14 @@ type Probe = { verdict: "allowed" | "denied" | "refused" | "unanswered"; status:
 
 /**
  * What one check found. A guest nobody has is refused (404, 400) only after
- * the key's permission was checked, so for those that means allowed.
+ * the key's permission was checked, so for those that means allowed. A 400
+ * saying "cannot access" (code 918) is the accrual report's own way of
+ * refusing a permission (sales-accrual-report), so it is a denial.
  */
 function probeVerdict(a: Answer, madeUpGuest: boolean): Probe {
   const s = a.status;
   if (s >= 200 && s < 300) return { verdict: "allowed", status: s };
-  if (s === 401 || s === 403) return { verdict: "denied", status: s };
+  if (s === 401 || s === 403 || cannotAccess(a)) return { verdict: "denied", status: s };
   if (s === 0 || s === 429 || s >= 500) return { verdict: "unanswered", status: s };
   if (madeUpGuest && (s === 404 || s === 400)) return { verdict: "allowed", status: s };
   return { verdict: "refused", status: s };
@@ -544,6 +738,15 @@ const capability = (p: Probe): boolean | null => (p.verdict === "allowed" ? true
 /** Where their admin changes what the key may read, as Zenoti's own setup guide names it. */
 const WHERE = "in the API key groups of the backend app that issued this key (in Zenoti: Configuration, then Apps under Integrations)";
 const ask = (what: string) => `Ask your Zenoti admin to add read access to ${what} ${WHERE}.`;
+/** What to ask their Zenoti admin for, for anything the key may not read. */
+export const zenotiAsk = ask;
+/**
+ * Zenoti checks the security role of the user behind the backend app before
+ * its API key groups (docs.zenoti.com/docs/zenoti-api-groups-1), and a report
+ * refused with "cannot access" may be either.
+ */
+const askReport = (what: string) =>
+  `Ask your Zenoti admin to add read access to ${what} ${WHERE}, and to make sure the security role of the Zenoti user that app runs as may see reports.`;
 
 const listed = (xs: string[]) => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}` : (xs[0] ?? ""));
 
@@ -554,31 +757,45 @@ function centresLine(centres: ZenotiCentre[]): string {
 }
 
 /**
- * Checks this connection: the key must open the list of centres; then one
- * small request each finds whether it may read appointments (one day at the
- * first centre), guest details and guests' packages (a guest nobody has),
- * the sales accrual report (one day, one row) and the older sales report
- * (one day). Nothing is written to Zenoti and nobody's details are read.
- * What was found is kept on the connection (config.access, config.centres)
- * for the sync.
+ * Checks this connection: the key must open the list of centres, every page
+ * of it, or, for a key Zenoti accepts but may not list them, the centre ids
+ * named on the connection (config.onlyCentres) stand in. Then one small
+ * request each finds whether it may read appointments (one day at the first
+ * centre), guest details and guests' packages (a guest nobody has), the
+ * sales accrual report (one day, one row) and the older sales report (one
+ * day). Nothing is written to Zenoti and nobody's details are read. What was
+ * found is kept on the connection (config.access, config.centres) for the sync.
  */
 export async function testZenoti(ctx: ConnectorContext, clock: ZenotiClock = realClock, budget?: ZenotiCallBudget): Promise<ZenotiTestResult> {
   const none: ZenotiCapabilities = { appointments: null, guestDetails: null, guestPackages: null, salesAccrual: null, salesReport: null };
   const fail = (message: string, advice: string[] = []): ZenotiTestResult => ({ ok: false, message: [message, ...advice].join(" "), centres: [], capabilities: none, path: null, advice });
 
+  const keyAdvice = "Ask your Zenoti admin for the API key of the backend app made for JENAI (in Zenoti: Configuration, then Apps under Integrations) and save it here again.";
   let client: ZenotiClient;
-  let centres: ZenotiCentre[];
   try {
     client = new ZenotiClient(ctx, clock, budget);
+  } catch (e) {
+    if (e instanceof ZenotiKeyError) return fail(e.message, [keyAdvice]);
+    if (e instanceof ZenotiError) return fail(e.message);
+    throw e;
+  }
+  let centres: ZenotiCentre[];
+  /** The key may not list the centres, so the ones named on the connection stand in. */
+  let named = false;
+  try {
     centres = await client.centres();
   } catch (e) {
     // Out of calls is the caller's to handle, not something wrong with the key.
     if (e instanceof ZenotiBudgetSpent) throw e;
-    if (e instanceof ZenotiKeyError) {
-      return fail(e.message, ["Ask your Zenoti admin for the API key of the backend app made for JENAI (in Zenoti: Configuration, then Apps under Integrations) and save it here again."]);
-    }
-    if (e instanceof ZenotiError) return fail(e.message, e.retryLater ? ["Test again in a few minutes."] : []);
-    return fail(`Zenoti could not be reached: ${(e as Error).message}`.slice(0, 200));
+    if (e instanceof ZenotiKeyError) return fail(e.message, [keyAdvice]);
+    if (e instanceof ZenotiPermissionError) {
+      centres = namedCentres(ctx.integration.config);
+      named = true;
+      if (!centres.length) {
+        return fail("Zenoti accepted the key, but does not let it read the list of centres, so JENAI cannot tell which centres to read.", [ask("centres")]);
+      }
+    } else if (e instanceof ZenotiError) return fail(e.message, e.retryLater ? ["Test again in a few minutes."] : []);
+    else return fail(`Zenoti could not be reached: ${(e as Error).message}`.slice(0, 200));
   }
   if (!centres.length) return fail("Zenoti accepted the key, but it sees no centres, so there is nothing to read.", ["Ask your Zenoti admin which centres this key's backend app can see."]);
 
@@ -602,7 +819,11 @@ export async function testZenoti(ctx: ConnectorContext, clock: ZenotiClock = rea
   const path = zenotiPath(capabilities);
   const fromReport = path === "sales_accrual" || path === "sales_report";
 
-  const said: string[] = [centresLine(centres)];
+  const said: string[] = [
+    named
+      ? `Connected to Zenoti, which does not let this key read the list of centres: JENAI reads the ${centres.length === 1 ? "centre" : `${centres.length} centres`} named on this connection.`
+      : centresLine(centres),
+  ];
   if (path === "appointments") said.push("Services done, bookings and no-shows are read from appointments, with each patient's mobile.");
   else if (path) {
     const report = path === "sales_accrual" ? "the sales accrual report" : "Zenoti's older sales report";
@@ -614,11 +835,12 @@ export async function testZenoti(ctx: ConnectorContext, clock: ZenotiClock = rea
 
   const advice: string[] = [];
   const denied = (k: keyof typeof probes) => probes[k].verdict === "denied";
+  if (named) advice.push(`Zenoti does not let this key read the list of centres. ${ask("centres")} JENAI then reads every centre the key sees, by name.`);
   if (denied("appointments")) {
     advice.push(`Zenoti does not let this key read appointments. ${ask("appointments")} JENAI then sees bookings, no-shows and completed visits with the patient's mobile.`);
   }
   if (path === "sales_report" && denied("salesAccrual")) {
-    advice.push(`JENAI is reading Zenoti's older sales report, which Zenoti has deprecated. ${ask("the sales accrual report")} JENAI then keeps working if Zenoti retires the older one.`);
+    advice.push(`JENAI is reading Zenoti's older sales report, which Zenoti has deprecated. ${askReport("the sales accrual report")} JENAI then keeps working if Zenoti retires the older one.`);
   }
   if (denied("guestDetails")) {
     advice.push(
@@ -647,6 +869,23 @@ export async function testZenoti(ctx: ConnectorContext, clock: ZenotiClock = rea
   await ctx.save({ config: { centres, access: { capabilities, path, checkedAt: new Date(clock.now()).toISOString() } } });
   return { ok: path !== null, message: [...said, ...advice].join(" "), centres, capabilities, path, advice };
 }
+
+/**
+ * Centres named on the connection by their Zenoti id (config.onlyCentres),
+ * for a key that may not read the list of centres. Names and codes a test
+ * read earlier are kept with them.
+ */
+function namedCentres(config: Record<string, unknown>): ZenotiCentre[] {
+  const only = Array.isArray(config.onlyCentres) ? config.onlyCentres.map((x) => String(x).trim()).filter((x) => ZENOTI_ID.test(x)) : [];
+  const known = Array.isArray(config.centres) ? config.centres.map(obj) : [];
+  return [...new Set(only.map((x) => x.toLowerCase()))].map((id) => {
+    const k = known.find((c) => String(c.id ?? "").toLowerCase() === id);
+    return { id, name: text(k?.name), code: text(k?.code, 40), phoneCode: phoneCodeOf(k?.phoneCode), timeZone: typeof k?.timeZone === "string" ? k.timeZone : null };
+  });
+}
+
+/** A Zenoti id: a GUID, as their centres, guests and invoices have. */
+const ZENOTI_ID = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
 
 export const zenotiConnector: Connector = {
   kind: "zenoti",
@@ -695,6 +934,12 @@ function int(v: unknown): number | null {
 function digitsOf(v: unknown): string | null {
   const d = text(v, 10)?.replace(/\D/g, "");
   return d || null;
+}
+
+/** A country's calling code ("91"): one to four digits, never starting with 0, which Zenoti writes for none. */
+function phoneCodeOf(v: unknown): string | null {
+  const d = digitsOf(v);
+  return d && /^[1-9]\d{0,3}$/.test(d) ? d : null;
 }
 
 function personName(first: unknown, last: unknown): string | null {
@@ -748,7 +993,7 @@ function startOf(local: unknown, utc: unknown, tz: string): Date | null {
 export const ZENOTI_PHONE_CODES: Record<string, string> = { "95": "91", "225": "1" };
 
 export interface ZenotiPhoneOptions {
-  /** For a mobile saved without a country. India's 91 unless the connection says otherwise. */
+  /** For a mobile saved without a country: the connection's setting, else the centre's country. None, and such a mobile gives no number. */
   defaultCountryCode?: string;
   /** Phone codes by Zenoti country id, from ZenotiClient.phoneCodes(), for countries the built-in list lacks. */
   phoneCodes?: Record<string, string>;
@@ -756,14 +1001,16 @@ export interface ZenotiPhoneOptions {
 
 /**
  * A Zenoti mobile as E.164: an appointment's {country_id, number,
- * display_number} or a guest's {country_code, number}. A number written with
- * its "+" is read as it stands; otherwise the country id gives the code, and
- * no country at all means the connection's default. A country id we cannot
- * place gives no number rather than a guess.
+ * display_number} or a guest's {country_code, phone_code, number}. A number
+ * written with its "+" is read as it stands; otherwise the country id gives
+ * the code (or the phone code beside it), and no country at all means the
+ * default the caller gives: the connection's, else the centre's country. A
+ * country we cannot place, or no default, gives no number rather than a
+ * guess: a wrong country code dials a stranger.
  */
 export function zenotiPhone(mobile: unknown, opts: ZenotiPhoneOptions = {}): string | null {
   const m = obj(mobile);
-  const fallback = digitsOf(opts.defaultCountryCode) ?? "91";
+  const fallback = phoneCodeOf(opts.defaultCountryCode);
   const display = text(m.display_number, 40);
   const number = text(m.number, 40);
   if (display?.startsWith("+")) {
@@ -774,7 +1021,9 @@ export function zenotiPhone(mobile: unknown, opts: ZenotiPhoneOptions = {}): str
   const raw = number ?? display;
   if (!raw) return null;
   const id = int(m.country_code ?? m.country_id);
-  const code = id ? (opts.phoneCodes?.[String(id)] ?? ZENOTI_PHONE_CODES[String(id)]) : fallback;
+  // Zenoti writes 0 here for none (retrieve-guest-details' own example).
+  const own = phoneCodeOf(m.phone_code);
+  const code = id ? (opts.phoneCodes?.[String(id)] ?? ZENOTI_PHONE_CODES[String(id)] ?? own) : (own ?? fallback);
   return code ? dial(raw, code) : null;
 }
 
@@ -861,10 +1110,15 @@ function therapistName(t: unknown): string | null {
   return text(o.display_name) ?? personName(o.first_name, o.last_name);
 }
 
-/** "Laser / Hair Reduction": the category and sub-category, without repeating one. */
+/** The category and sub-category, without repeating one. */
+function categoriesOf(...names: unknown[]): string[] {
+  const parts = names.map((n) => text(n)).filter((x): x is string => !!x);
+  return parts.filter((p, i) => parts.findIndex((q) => q.toLowerCase() === p.toLowerCase()) === i);
+}
+
+/** "Laser / Hair Reduction": the category and sub-category, for the clinic to read. */
 function categoryOf(service: Record<string, unknown>): string | null {
-  const parts = [text(obj(service.category).name), text(obj(service.sub_category).name)].filter((x): x is string => !!x);
-  return parts.filter((p, i) => parts.findIndex((q) => q.toLowerCase() === p.toLowerCase()) === i).join(" / ") || null;
+  return categoriesOf(obj(service.category).name, obj(service.sub_category).name).join(" / ") || null;
 }
 
 export interface ZenotiReadOptions extends ZenotiPhoneOptions {
@@ -876,7 +1130,7 @@ export interface ZenotiReadOptions extends ZenotiPhoneOptions {
 
 export type ZenotiAppointmentRow = Pick<
   typeof clinicAppointments.$inferInsert,
-  "externalId" | "guestRef" | "phoneE164" | "name" | "service" | "category" | "startsAt" | "status" | "doctor" | "centreRef"
+  "externalId" | "guestRef" | "phoneE164" | "name" | "service" | "category" | "startsAt" | "localDay" | "status" | "doctor" | "centreRef"
 >;
 
 /**
@@ -890,7 +1144,8 @@ export function zenotiAppointmentRow(a: unknown, opts: ZenotiReadOptions = {}): 
   const externalId = text(r.appointment_id, 64);
   const guestRef = text(guest.id, 64);
   const serviceName = text(service.name, 300);
-  const startsAt = startOf(r.start_time, r.start_time_utc, opts.timeZone ?? "Asia/Kolkata");
+  const tz = opts.timeZone ?? "Asia/Kolkata";
+  const startsAt = startOf(r.start_time, r.start_time_utc, tz);
   if (!externalId || !guestRef || !serviceName || !startsAt) return null;
   return {
     externalId,
@@ -900,6 +1155,8 @@ export function zenotiAppointmentRow(a: unknown, opts: ZenotiReadOptions = {}): 
     service: serviceName,
     category: categoryOf(service),
     startsAt,
+    // The day Zenoti lists it under: its centre-time start, as written.
+    localDay: centreDay(r.start_time, r.start_time_utc, tz),
     status: zenotiAppointmentStatus(r.status),
     doctor: therapistName(r.therapist),
     centreRef: opts.centreRef ?? null,
@@ -916,8 +1173,16 @@ export interface ZenotiVisit {
   name: string | null;
   service: string;
   category: string | null;
+  /** The service's category and sub-category, each as Zenoti names it, for a package that covers a category. */
+  categories: string[];
   /** The day it was done, in centre time, "YYYY-MM-DD". */
   visitDate: string;
+  /**
+   * The day the source lists it under, in centre time: its sale for a report
+   * line (which may be a day after the service), the visit day otherwise.
+   * Re-reading those days can then tell a line the source dropped.
+   */
+  listedOn: string;
   doctor: string | null;
   centreRef: string | null;
   /** The package it was taken under, when the source says. */
@@ -953,7 +1218,9 @@ export function zenotiAppointmentVisit(a: unknown, opts: ZenotiReadOptions = {})
     name: row.name ?? null,
     service: row.service,
     category: row.category ?? null,
+    categories: categoriesOf(obj(obj(r.service).category).name, obj(obj(r.service).sub_category).name),
     visitDate,
+    listedOn: visitDate,
     doctor: row.doctor ?? null,
     centreRef: row.centreRef ?? null,
     packageName: null,
@@ -989,7 +1256,8 @@ export function zenotiSalesReportVisit(row: unknown, opts: ZenotiReadOptions = {
   const externalId = text(r.invoice_item_id, 64);
   const guestRef = text(guest.guest_id, 64);
   const service = text(item.name, 300);
-  const visitDate = centreDay(r.serviced_on, null, "UTC") ?? centreDay(r.sold_on, null, "UTC");
+  const sold = centreDay(r.sold_on, null, "UTC");
+  const visitDate = centreDay(r.serviced_on, null, "UTC") ?? sold;
   if (!externalId || !guestRef || !service || !visitDate) return null;
   const packageName = text(r.package, 300);
   return {
@@ -999,7 +1267,9 @@ export function zenotiSalesReportVisit(row: unknown, opts: ZenotiReadOptions = {
     name: text(guest.guest_name),
     service,
     category: null,
+    categories: [],
     visitDate,
+    listedOn: sold ?? visitDate,
     doctor: text(obj(r.employee).name),
     centreRef: opts.centreRef ?? null,
     packageName,
@@ -1024,15 +1294,17 @@ export function zenotiSalesAccrualVisit(row: unknown, opts: ZenotiReadOptions = 
   const service = text(r.item_name, 300);
   const visitDate = centreDay(r.sale_date, null, "UTC");
   if (!invoice || !item || !guestRef || !service || !visitDate) return null;
-  const parts = [text(r.item_category), text(r.item_sub_category)].filter((x): x is string => !!x);
+  const categories = categoriesOf(r.item_category, r.item_sub_category);
   return {
     externalId: `${invoice}:${item}`,
     guestRef,
     phoneE164: null,
     name: text(r.guest_name),
     service,
-    category: parts.filter((p, i) => parts.findIndex((q) => q.toLowerCase() === p.toLowerCase()) === i).join(" / ") || null,
+    category: categories.join(" / ") || null,
+    categories,
     visitDate,
+    listedOn: visitDate,
     doctor: text(r.provider),
     centreRef: text(r.center_id, 64) ?? opts.centreRef ?? null,
     packageName: null,
@@ -1067,13 +1339,27 @@ export function zenotiPackageStatus(v: unknown): PackageStatus {
 
 export type ZenotiPackageRow = Pick<
   typeof packageBalances.$inferInsert,
-  "guestRef" | "packageRef" | "packageName" | "service" | "total" | "used" | "balance" | "status" | "expiresOn"
+  "guestRef" | "packageRef" | "packageName" | "service" | "covers" | "total" | "used" | "balance" | "status" | "expiresOn"
 >;
 
 /** Which purchase speaks for a package bought twice: the one in use first. */
 const IN_USE: Record<PackageStatus, number> = { active: 5, not_started: 4, frozen: 3, unknown: 2, expired: 1, cancelled: 0 };
 
+/** Sessions left on a package line, when Zenoti says. */
+export function sessionsLeft(p: { balance?: number | null; total?: number | null; used?: number | null }): number | null {
+  return p.balance ?? (p.total != null && p.used != null ? p.total - p.used : null);
+}
+
+/**
+ * A purchase with sessions left before one used up: Zenoti has no
+ * "completed" status, so a series bought again at checkout sits beside the
+ * used-up one, still Active, and the new one is what they will book.
+ */
 function better(a: ZenotiPackageRow, b: ZenotiPackageRow): boolean {
+  // A service and a category of the same name in one package share a row: the service is the one named.
+  if (a.covers !== b.covers) return a.covers === "service";
+  const open = (p: ZenotiPackageRow) => (sessionsLeft(p) ?? 1) > 0 && p.status !== "expired" && p.status !== "cancelled";
+  if (open(a) !== open(b)) return open(a);
   const rank = IN_USE[a.status] - IN_USE[b.status];
   if (rank) return rank > 0;
   if ((a.expiresOn ?? "") !== (b.expiresOn ?? "")) return (a.expiresOn ?? "") > (b.expiresOn ?? "");
@@ -1081,12 +1367,25 @@ function better(a: ZenotiPackageRow, b: ZenotiPackageRow): boolean {
 }
 
 /**
+ * What a package line covers, by service_type_info.service_category_type:
+ * Default -1, Category 1, Service 2, Tag 3 (list-the-series-packages-of-a-
+ * guest). Only a category or a tag is read as one; a Service line, a Default
+ * one and an answer without the field name a service.
+ */
+function coversOf(v: unknown): PackageCovers {
+  const n = int(v);
+  return n === 1 ? "category" : n === 3 ? "tag" : "service";
+}
+
+/**
  * A guest's series packages as package_balances rows, one per package and
- * service in it, with sessions bought, used and left, its status and the
- * day it ends. package_balances holds one row per package name and service,
- * so a package bought twice is the purchase in use (active, then not yet
- * started, then frozen), else the one ending later. Products in a package
- * are not sessions and are left out.
+ * service (or category, or tag) in it, with sessions bought, used and left,
+ * its status and the last day a session can be taken from it: the end of its
+ * grace period when it has one (date.end_date_with_grace), else its end.
+ * package_balances holds one row per package name and service, so a package
+ * bought twice is the purchase with sessions left, then the one in use
+ * (active, then not yet started, then frozen), else the one ending later.
+ * Products in a package are not sessions and are left out.
  */
 export function zenotiPackageBalances(guestRef: string, packages: unknown): ZenotiPackageRow[] {
   const by = new Map<string, ZenotiPackageRow>();
@@ -1096,17 +1395,20 @@ export function zenotiPackageBalances(guestRef: string, packages: unknown): Zeno
     const packageName = text(def.name, 300);
     if (!packageName) continue;
     const status = zenotiPackageStatus(pk.status);
-    const expiresOn = centreDay(obj(pk.date).end, null, "UTC");
+    const date = obj(pk.date);
+    const expiresOn = centreDay(date.end_date_with_grace, null, "UTC") ?? centreDay(date.end, null, "UTC");
     for (const s of listOf(pk.services)) {
       const sv = obj(s);
+      const info = obj(sv.service_type_info);
       // Documented under service_type_info; the other two are kept for answers shaped otherwise.
-      const service = text(obj(sv.service_type_info).name, 300) ?? text(sv.name, 300) ?? text(obj(sv.service).name, 300);
+      const service = text(info.name, 300) ?? text(sv.name, 300) ?? text(obj(sv.service).name, 300);
       if (!service) continue;
       const row: ZenotiPackageRow = {
         guestRef,
         packageRef: text(pk.user_package_id, 64) ?? text(def.id, 64),
         packageName,
         service,
+        covers: coversOf(info.service_category_type),
         total: int(sv.total),
         used: int(sv.used),
         balance: int(sv.balance),

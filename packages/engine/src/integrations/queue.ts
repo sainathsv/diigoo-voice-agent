@@ -158,14 +158,18 @@ export async function releaseHeld(tx: Tx, integrationId: string): Promise<number
   return rows.length;
 }
 
-/** How a connector persists what it learns (a refreshed token, a refused scope) on its integration. */
+/**
+ * How a connector persists what it learns (a refreshed token, a refused
+ * scope) on its integration. Config is merged into what is stored at that
+ * moment, so a setting saved meanwhile (by a sync, by the clinic) is kept.
+ */
 export function saver(tx: Tx, tenantId: string, i: Integration): ConnectorContext["save"] {
   return async (patch) => {
     await tx
       .update(integrations)
       .set({
         ...(patch.credentials ? { credentials: sealCredentials(tenantId, patch.credentials) } : {}),
-        ...(patch.config ? { config: { ...i.config, ...patch.config } } : {}),
+        ...(patch.config ? { config: sql`${integrations.config} || ${JSON.stringify(patch.config)}::jsonb` } : {}),
         updatedAt: new Date(),
       })
       .where(eq(integrations.id, i.id));
@@ -174,18 +178,30 @@ export function saver(tx: Tx, tenantId: string, i: Integration): ConnectorContex
 
 /**
  * Asks their system whether this connection works, and records the answer on
- * it: connected, or error with the reason. Events held while it was not
- * working go with the worker's next round.
+ * it: connected, or error with the reason. A paused connection stays paused:
+ * a test only says whether it would work, and pausing is the client's way to
+ * stop JENAI reading or sending, which only they undo. Events held while it
+ * was not working go with the worker's next round.
+ *
+ * Zenoti is tested with checkZenotiConnection instead, which asks Zenoti with
+ * no transaction open (its waits can be long) and keeps its branch map.
  */
 export async function testConnection(tx: Tx, tenantId: string, i: Integration, fetchImpl: typeof fetch = fetch): Promise<{ ok: boolean; message: string }> {
   const connector = CONNECTORS[i.kind];
   if (!connector) return { ok: false, message: "That kind of system is not ready yet." };
   const res = await connector.test({ integration: i, credentials: credentialsOf(i), fetch: fetchImpl, save: saver(tx, tenantId, i) });
+  const paused = i.status === "paused";
   await tx
     .update(integrations)
-    .set({ status: res.ok ? "connected" : "error", lastOkAt: res.ok ? new Date() : i.lastOkAt, lastError: res.ok ? null : res.message, lastErrorAt: res.ok ? i.lastErrorAt : new Date(), updatedAt: new Date() })
+    .set({
+      status: paused ? "paused" : res.ok ? "connected" : "error",
+      lastOkAt: res.ok ? new Date() : i.lastOkAt,
+      lastError: res.ok ? null : res.message,
+      lastErrorAt: res.ok ? i.lastErrorAt : new Date(),
+      updatedAt: new Date(),
+    })
     .where(eq(integrations.id, i.id));
-  if (res.ok) await releaseHeld(tx, i.id);
+  if (res.ok && !paused) await releaseHeld(tx, i.id);
   return res;
 }
 

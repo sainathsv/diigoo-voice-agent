@@ -322,7 +322,8 @@ describe("importing a visit list", () => {
     expect(feedback.reason).toMatch(/^Visited on Wed 30 Sep 2026 for Hydrafacial\./);
     // One call at a time: the overdue feedback call first, the others wait for it.
     const ravi = (j: string) => rows.find((r) => r.originId === ids.get(RAVI) && r.journey === j)!;
-    expect(ravi("visit_feedback")).toMatchObject({ verdict: "call_now", context: { visit_date: "2026-09-20", doctor: "Dr Rao", branch: "KDP" } });
+    // The branch the row named ("KDP") is matched to a JENAI branch, which the call names as the clinic does.
+    expect(ravi("visit_feedback")).toMatchObject({ verdict: "call_now", context: { visit_date: "2026-09-20", doctor: "Dr Rao", branch: "Kondapur" } });
     expect(ravi("result_check")).toMatchObject({ verdict: "waiting", callAt: new Date("2026-10-05T10:00:00+05:30") });
     expect(ravi("next_session").verdict).toBe("waiting");
   });

@@ -1338,6 +1338,13 @@ export const visits = pgTable(
     integrationId: uuid("integration_id"),
     externalId: text("external_id"),
     guestRef: text("guest_ref"),
+    /** Their centre id it was read at, and when the connection last listed it (migration 0033). */
+    centreRef: text("centre_ref"),
+    seenAt: ts("seen_at"),
+    /** The day their system lists it under: a sales line's sale, which can be a day after the service (migration 0034). */
+    listedOn: date("listed_on", { mode: "string" }),
+    /** The service's category and sub-category in their system, for a package that covers a category (migration 0033). */
+    categories: text("categories").array(),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
@@ -1428,6 +1435,8 @@ export const externalPeople = pgTable(
     fetchedAt: ts("fetched_at"),
     /** When their packages were last read, whether or not they have any (migration 0031). */
     packagesFetchedAt: ts("packages_fetched_at"),
+    /** Profile reads in a row that gave no number JENAI can dial, or found no such person (migration 0033). */
+    profileMisses: integer("profile_misses").notNull().default(0),
     /** Also touched whenever they are seen again on a booking or a sales line. */
     updatedAt: ts("updated_at").notNull().defaultNow(),
   },
@@ -1458,6 +1467,8 @@ export const clinicAppointments = pgTable(
     /** Their centre id. */
     centreRef: text("centre_ref"),
     branchId: uuid("branch_id"),
+    /** The day it falls on in the centre's own time, "2026-10-03" (migration 0033). */
+    localDay: date("local_day", { mode: "string" }),
     updatedAt: ts("updated_at").notNull().defaultNow(),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
@@ -1466,6 +1477,8 @@ export type ClinicAppointment = typeof clinicAppointments.$inferSelect;
 
 export const PACKAGE_STATUSES = ["active", "frozen", "expired", "cancelled", "not_started", "unknown"] as const;
 export type PackageStatus = (typeof PACKAGE_STATUSES)[number];
+/** What one line of a package pays for: one service, any service in a category, or any with a tag. */
+export type PackageCovers = "service" | "category" | "tag";
 
 /** Sessions bought, used and left on one package, per service in it, as last read. Counts are as their system gives them. */
 export const packageBalances = pgTable(
@@ -1479,7 +1492,9 @@ export const packageBalances = pgTable(
     /** Their package id. */
     packageRef: text("package_ref"),
     packageName: text("package_name").notNull(),
+    /** A service's name, or a category's or a tag's, as `covers` says (migration 0033). */
     service: text("service").notNull(),
+    covers: text("covers").$type<PackageCovers>().notNull().default("service"),
     total: integer("total"),
     used: integer("used"),
     balance: integer("balance"),

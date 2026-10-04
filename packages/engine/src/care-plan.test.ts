@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import {
   branches,
+  callPlanSettings,
   campaignTargets,
   calls,
   clientPrograms,
@@ -593,14 +594,38 @@ describe("packages at the front desk", () => {
     expect(next(pack({ status: "expired", expiresOn: null, total: null, used: null, balance: null })).reason).toBe("Their package for LHR Full Legs has expired in Zenoti, so there is no next session to call about.");
   });
 
-  it("ignores a package that ended before their last visit, or has not started, and prefers one with sessions left", () => {
+  it("ignores a package that ended before their last visit, or gives no count of sessions, and prefers one with sessions left", () => {
     const after = journey(plan({ visits: [laser("2026-09-10")], packages: [pack({ status: "expired", expiresOn: "2026-09-01" })] }), "next_session");
     expect(after.verdict).toBe("waiting");
     expect(after.callAt).toEqual(ist("2026-10-15 10:00"));
-    expect(only(plan({ visits: [laser("2026-08-01")], packages: [pack({ status: "not_started" })] })).reason).toMatch(/^Session 2 of 6/);
+    expect(only(plan({ visits: [laser("2026-08-01")], packages: [pack({ status: "not_started", total: null, used: null, balance: null })] })).reason).toMatch(/^Session 2 of 6/);
     const both = only(plan({ visits: [laser("2026-08-01")], packages: [pack({ status: "expired", expiresOn: "2026-09-15" }), pack({ total: 6, used: 1, balance: 5 })] }));
     expect(both).toMatchObject({ journey: "next_session", verdict: "call_now" });
     expect(both.reason).toMatch(/^Session 2 of 6 of LHR Full Legs/);
+  });
+
+  it("books the first session of a course bought again, not maintenance for the one it replaces", () => {
+    // Zenoti has no "completed": the used-up package stays Active beside the one bought again, not started yet.
+    const usedUp = pack({ used: 5, balance: 0 });
+    const again = pack({ status: "not_started", used: 0, balance: 5, expiresOn: "2027-06-01" });
+    for (const packages of [[usedUp, again], [again, usedUp]]) {
+      const r = only(plan({ visits: [laser("2026-08-01")], packages }));
+      expect(r).toMatchObject({ journey: "next_session", verdict: "call_now" });
+      expect(r.reason).toBe(`Session 1 of 5 of LHR Full Legs is due 35 days after the last, on Sat 1 Aug 2026. 5 sessions left on the package they bought, not started yet, which ends on Tue 1 Jun 2027.${DEFAULT_NOTE}`);
+    }
+    // One being used still speaks before one not started.
+    expect(only(plan({ visits: [laser("2026-08-01")], packages: [again, pack()] })).reason).toMatch(/^Session 4 of 5 .* 2 sessions left on their package, which ends on Mon 1 Mar 2027\./);
+    // Alone, used up, it is maintenance as before.
+    expect(only(plan({ visits: [laser("2026-06-01")], packages: [usedUp] })).journey).toBe("maintenance");
+  });
+
+  it("matches a package for a whole category by the visit's category, and one for a tag never", () => {
+    const v = visit({ service: "LHR Full Legs", visitDate: "2026-08-01", categories: ["Laser", "Hair Reduction"] });
+    expect(only(plan({ visits: [v], packages: [pack({ service: "hair reduction", covers: "category" })] })).reason).toMatch(/^Session 4 of 5 of LHR Full Legs/);
+    // A tag, a category the visit is not in, or a category named like the service: the rule and the visits decide.
+    for (const p of [pack({ service: "Hair Reduction", covers: "tag" }), pack({ service: "Facials", covers: "category" }), pack({ covers: "category" })]) {
+      expect(only(plan({ visits: [v], packages: [p] })).reason, JSON.stringify(p)).toMatch(/^Session 2 of 6/);
+    }
   });
 
   it("says when a service with sessions left has no gap set between sessions", () => {
@@ -744,6 +769,7 @@ describe("replanning a client", () => {
 describe("replanning a client with a front desk system", () => {
   let org = "";
   let zenoti = "";
+  let kondapur = "";
   const ids: Record<string, string> = {};
   const phone = (k: number) => `+91980000${String(k).padStart(4, "0")}`;
 
@@ -755,6 +781,7 @@ describe("replanning a client with a front desk system", () => {
     org = o!.id;
     await withTenant(org, async (tx) => {
       const [b] = await tx.insert(branches).values({ tenantId: org, name: "Kondapur", languages: ["en"] }).returning();
+      kondapur = b!.id;
       const [zoho] = await tx.insert(integrations).values({ tenantId: org, kind: "zoho_crm", name: "Zoho" }).returning();
       const [desk] = await tx.insert(integrations).values({ tenantId: org, kind: "zenoti", name: "Zenoti", direction: "in" }).returning();
       zenoti = desk!.id;
@@ -879,8 +906,8 @@ describe("replanning a client with a front desk system", () => {
       await tx.update(packageBalances).set({ used: 5, balance: 0 }).where(eq(packageBalances.integrationId, zenoti));
     });
     const r = await replanTenant(org, { now: NOW });
-    // Gone: 2's no-show call, 1's reminder from the booking now cancelled, and 5's next session.
-    expect(r.removed).toBe(3);
+    // Gone: 1's reminder from the booking now cancelled, and 5's next session. 2's no-show call went with the booking, when it was deleted.
+    expect(r.removed).toBe(2);
     const rows = await stored();
     expect(of(rows, "a3", "cancelled_rebook")).toMatchObject({ verdict: "kept_out", reason: "Cancelled their appointment for Consultation booked for Mon 28 Sep 2026, but is booked again for Tue 6 Oct 2026." });
     expect(of(rows, "a9", "appointment_reminder")?.verdict).toBe("scheduled");
@@ -890,5 +917,50 @@ describe("replanning a client with a front desk system", () => {
     expect(of(rows, "v5", "next_session")).toBeUndefined();
     // Maintenance, six months on, waiting behind the feedback call on the visit.
     expect(of(rows, "v5", "maintenance")).toMatchObject({ verdict: "waiting", callAt: ist("2027-03-29 10:00") });
+  });
+
+  it("plans a visit read before its number by its guest's number once known, unless it copies a visit they have", async () => {
+    await withTenant(org, async (tx) => {
+      await tx.insert(externalPeople).values({ tenantId: org, integrationId: zenoti, externalId: "g12", phoneE164: phone(12) });
+      const line = (externalId: string, service: string, visitDate: string) => ({ tenantId: org, integrationId: zenoti, externalId, guestRef: "g12", service, visitDate, source: "api" });
+      for (const v of await tx.insert(visits).values([line("v12", "Peel", "2026-09-29"), line("v13", "Hydrafacial", "2026-09-27")]).returning()) ids[v.externalId!] = v.id;
+      // Their uploaded visit list already has the Hydrafacial that day.
+      const [up] = await tx.insert(visits).values({ tenantId: org, phoneE164: phone(12), service: "hydrafacial", visitDate: "2026-09-27", source: "upload" }).returning();
+      ids.up12 = up!.id;
+    });
+    const r = await replanTenant(org, { now: NOW });
+    expect(r.waitingForPhone).toBe(0);
+    const rows = await stored();
+    expect(of(rows, "v12", "visit_feedback")).toMatchObject({ phoneE164: phone(12) });
+    expect(rows.some((x) => x.originId === ids.v13)).toBe(false);
+    expect(rows.some((x) => x.originId === ids.up12)).toBe(true);
+  });
+
+  it("names a centre alike for bookings and visits: the JENAI branch, else as Zenoti does", async () => {
+    await withTenant(org, async (tx) => {
+      await tx
+        .update(integrations)
+        .set({ config: { centres: [{ id: "zenoti-centre", name: "Zennara Clinics - Kondapur", code: "ZNKD" }, { id: "gachibowli", name: "Zennara Clinics - Gachibowli", code: "ZNGB" }] } })
+        .where(eq(integrations.id, zenoti));
+      // Stored under Zenoti's name for the centre, which is JENAI's Kondapur branch.
+      const [v] = await tx
+        .insert(visits)
+        .values({ tenantId: org, integrationId: zenoti, externalId: "v14", guestRef: "g14", phoneE164: phone(14), service: "Hydrafacial", visitDate: "2026-09-30", branch: "Zennara Clinics - Kondapur", branchId: kondapur, centreRef: "zenoti-centre", source: "api" })
+        .returning();
+      ids.v14 = v!.id;
+      // At a centre that is no JENAI branch.
+      const [a] = await tx
+        .insert(clinicAppointments)
+        .values({ tenantId: org, integrationId: zenoti, externalId: "a15", guestRef: "g15", phoneE164: phone(15), service: "Peel", startsAt: ist("2026-10-05 11:00"), status: "booked", centreRef: "gachibowli" })
+        .returning();
+      ids.a15 = a!.id;
+      await tx.insert(callPlanSettings).values({ tenantId: org, settings: { centres: ["Kondapur"] } });
+    });
+    await replanTenant(org, { now: NOW });
+    const rows = await stored();
+    expect(of(rows, "v14", "visit_feedback")).toMatchObject({ verdict: "scheduled", context: { branch: "Kondapur" } });
+    expect(of(rows, "a1", "appointment_reminder")?.verdict).not.toBe("kept_out");
+    expect(of(rows, "a15", "appointment_reminder")).toMatchObject({ verdict: "kept_out", reason: "For the Zennara Clinics - Gachibowli centre, which this plan does not cover." });
+    await withTenant(org, (tx) => tx.delete(callPlanSettings));
   });
 });

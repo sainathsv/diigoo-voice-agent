@@ -221,7 +221,7 @@ describe("handing results back to the client's own system", () => {
   });
 
   /** A webhook of its own, so its deliveries can be counted. */
-  async function ownHook(name: string, status: "connected" | "error" | "draft" = "connected", lastOkAt: Date | null = null) {
+  async function ownHook(name: string, status: "connected" | "error" | "draft" | "paused" = "connected", lastOkAt: Date | null = null) {
     const [row] = await withTenant(tenant, (tx) =>
       tx.insert(integrations).values({ tenantId: tenant, kind: "webhook_out", name, status, lastOkAt, config: { url: `${base}/${name}` }, events: ["appointment.booked"] }).returning(),
     );
@@ -284,6 +284,16 @@ describe("handing results back to the client's own system", () => {
     const claimed = (await claimDeliveries(platformDb(), 50)).filter((c) => c.id === ev!.id);
     expect(claimed).toHaveLength(1);
     expect((await deliver(claimed[0]!)).status).toBe("done");
+  });
+
+  it("leaves a paused connection paused when it is tested, and what waits for it held", async () => {
+    // Pausing is the client's switch; a Test only says whether the connection would work.
+    const hook = await ownHook("on-hold", "paused");
+    const ev = await eventFor(hook, { status: "queued", attempts: 0, nextAttemptAt: new Date(Date.now() + 365 * 86_400_000) });
+    const [conn] = await withTenant(tenant, (tx) => tx.select().from(integrations).where(eq(integrations.id, hook)));
+    expect((await withTenant(tenant, (tx) => testConnection(tx, tenant, conn!))).ok).toBe(true);
+    expect(await integrationStatus(hook)).toBe("paused");
+    expect((await eventRow(ev.id)).nextAttemptAt.getTime()).toBeGreaterThan(Date.now() + 300 * 86_400_000);
   });
 
   it("gives up on one event after a day without switching off a connection that delivers everything else", async () => {

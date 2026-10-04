@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { platformDb, withTenant } from "./client";
-import { clinicAppointments, externalPeople, integrations, organizations, packageBalances, visits } from "./schema";
+import { clinicAppointments, externalPeople, integrations, organizations, packageBalances, plannedCalls, visits } from "./schema";
 
 let a = "";
 let b = "";
@@ -112,15 +112,38 @@ describe("front desk tables", () => {
     expect(await pgError(noOne)).toMatch(/visits_phone_or_guest/);
   });
 
-  it("leaves uploaded visits free of the connection's ids, and drops the connection's copy when it is removed", async () => {
+  it("leaves uploaded visits free of the connection's ids, and drops the connection's copy, its planned calls included, when it is removed", async () => {
     // Two uploads carry no external id, so the connection's uniqueness does not touch them.
-    await withTenant(a, (tx) =>
-      tx.insert(visits).values([
-        { tenantId: a, phoneE164: "+919876543211", service: "Hydrafacial", visitDate: "2026-09-29" },
-        { tenantId: a, phoneE164: "+919876543212", service: "Hydrafacial", visitDate: "2026-09-29" },
-      ]),
+    const uploaded = await withTenant(a, (tx) =>
+      tx
+        .insert(visits)
+        .values([
+          { tenantId: a, phoneE164: "+919876543211", service: "Hydrafacial", visitDate: "2026-09-29" },
+          { tenantId: a, phoneE164: "+919876543212", service: "Hydrafacial", visitDate: "2026-09-29" },
+        ])
+        .returning(),
     );
+    // The plan made from what the connection read names people, numbers and treatments.
+    await withTenant(a, async (tx) => {
+      const [booking] = await tx.select().from(clinicAppointments);
+      const [line] = await tx.select().from(visits).where(eq(visits.integrationId, zenotiA));
+      const row = (originType: "visit" | "clinic_appointment", originId: string) => ({
+        tenantId: a,
+        journey: "next_session",
+        programKey: "clinic.revisit_recall",
+        verdict: "scheduled" as const,
+        reason: "Session 4 of 5 of LHR Full Legs is next",
+        originType,
+        originId,
+        originLabel: "Zenoti",
+        phoneE164: "+919876543210",
+        name: "Guest",
+      });
+      await tx.insert(plannedCalls).values([row("clinic_appointment", booking!.id), row("visit", line!.id), row("visit", uploaded[0]!.id)]);
+    });
     await withTenant(a, (tx) => tx.delete(integrations).where(eq(integrations.id, zenotiA)));
     expect(await counts(a)).toEqual({ people: 0, bookings: 0, packages: 0, visits: 2 });
+    // Only the uploaded visit's planned call is left.
+    expect((await withTenant(a, (tx) => tx.select().from(plannedCalls))).map((p) => p.originId)).toEqual([uploaded[0]!.id]);
   });
 });

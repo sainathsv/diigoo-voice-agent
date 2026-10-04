@@ -14,14 +14,17 @@ import {
   PLAN_JOURNEYS,
   ZENOTI_MAX_BACKFILL_DAYS,
   ZENOTI_SYNC_CALLS,
+  ZenotiBranchError,
   ZenotiCredentialsError,
   checkZenotiConnection,
+  chooseZenotiBranch,
   credentialsOf,
   saveZenotiConnection,
   syncZenoti,
   zenotiBackfillDays,
   zenotiCredentials,
   type PlanJourney,
+  type ZenotiBranchChoice,
   type ZenotiCapabilities,
   type ZenotiClock,
   type ZenotiConnectionCheck,
@@ -50,7 +53,11 @@ export class ZenotiCommandError extends Error {
 /** A key file holds three short values; anything this big is the wrong file. */
 const KEY_FILE_MAX_BYTES = 16 * 1024;
 const SHAPE = 'It should hold {"api_key": "..."}, with "app_id" and "app_secret" too if you have them.';
-/** About ten minutes of Zenoti at 40 calls a minute, well inside the 15 minute pull lease. */
+/**
+ * About ten minutes of Zenoti at 40 calls a minute. A run whose calls are
+ * slowed by a busy Zenoti stops anyway before its 15 minute hold on the
+ * connection runs out, leaving the rest for the next run.
+ */
 export const ZENOTI_COMMAND_MAX_BUDGET = 400;
 
 /**
@@ -202,6 +209,34 @@ export async function syncCommand(input: { tenant: string; days?: string; budget
   say("  Nothing was dialled, and nothing was written to Zenoti.");
   say("");
   return r;
+}
+
+/**
+ * Sets which JENAI branch one Zenoti centre is, as the clinic says: a branch
+ * by name or code, "none", or "match" to go back to matching by name. Kept
+ * so no later test or sync undoes it, put on what is already stored from
+ * that centre, and audited.
+ */
+export async function mapCommand(input: { tenant: string; centre: string; branch: string }, deps: ZenotiCommandDeps = {}): Promise<ZenotiBranchChoice> {
+  if (!input.centre) throw new ZenotiCommandError("need --centre <the centre's code or id in Zenoti>");
+  if (!input.branch) throw new ZenotiCommandError('need --branch <a branch name or code>, or --branch none, or --branch match');
+  const org = await clientOf(input.tenant);
+  const i = await connectionOf(org);
+  const say = printer(deps, openedCredentials(i));
+  const word = input.branch.trim().toLowerCase();
+  let choice: ZenotiBranchChoice;
+  try {
+    choice = await withTenant(org.id, (tx) => chooseZenotiBranch(tx, org.id, i.id, { centre: input.centre, branch: word === "none" ? null : word === "match" ? "match" : input.branch }));
+  } catch (e) {
+    if (e instanceof ZenotiBranchError) throw new ZenotiCommandError(e.message);
+    throw e;
+  }
+  const centre = centreName(choice.centre.name, choice.centre.code);
+  say("");
+  say(`${org.name}: Zenoti centre ${centre} ${choice.branchName ? `is JENAI's ${choice.branchName} branch` : "is no JENAI branch: what is read there is kept without one"}${choice.chosen ? ", as chosen here, and stays so" : ", matched by name, as it will be each time"}.`);
+  say(`  ${count(choice.moved, "booking or visit", "bookings and visits")} already stored from it moved with it.`);
+  say("");
+  return choice;
 }
 
 // ---------------------------------------------------------------- showing a test

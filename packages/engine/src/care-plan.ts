@@ -313,6 +313,8 @@ export interface PlanVisit {
   sessionsDone?: number | null;
   sessionsTotal?: number | null;
   source?: string;
+  /** The service's category and sub-category in their system, for a package that covers a whole category. */
+  categories?: string[] | null;
 }
 
 /** A booking in the clinic's front desk system (a clinic_appointments row). */
@@ -333,7 +335,10 @@ export interface PlanBooking {
 export interface PlanPackage {
   /** The system it came from, as the clinic knows it: "Zenoti". */
   system?: string;
+  /** A service's name, or a category's or a tag's, as `covers` says. */
   service: string;
+  /** What the line pays for: one service (the default), any service in a category, or any with a tag. */
+  covers?: "service" | "category" | "tag";
   total?: number | null;
   used?: number | null;
   balance?: number | null;
@@ -432,6 +437,7 @@ interface VisitIn {
   branch: string | null;
   sessionsDone: number | null;
   sessionsTotal: number | null;
+  categories: string[];
 }
 
 /**
@@ -512,7 +518,8 @@ export function planPerson(person: PlanPerson, settings: PlanSettings, rules: re
         else if (appt) {
           // Their visit, unless the visit list already has that day.
           const day = dayOf(appt, tz);
-          if (!uploadedDays.has(day)) derived.push({ origin: o, service: r.treatment ?? "", day, doctor: r.consultant ?? null, branch: r.centre ?? null, sessionsDone: null, sessionsTotal: null });
+          if (!uploadedDays.has(day))
+            derived.push({ origin: o, service: r.treatment ?? "", day, doctor: r.consultant ?? null, branch: r.centre ?? null, sessionsDone: null, sessionsTotal: null, categories: [] });
         } else if (!uploaded.length) {
           drafts.push(keep("no_call", o, `${crm} has no visit date for this patient. Upload the visit list so JENAI knows what they had and when.`));
         }
@@ -827,7 +834,7 @@ function visitRows(all: VisitIn[], c: Ctx): Draft[] {
         );
     }
 
-    const pkg = packageFor(key, last.day, c);
+    const pkg = packageFor(key, last, c);
     if (pkg?.kind === "open") rows.push(openPackageRow(pkg, last, every, what, values, note, c));
     else if (pkg?.kind === "complete") maintenance(`Finished the course of ${what}`);
     else if (pkg?.kind === "frozen")
@@ -856,18 +863,28 @@ function visitRows(all: VisitIn[], c: Ctx): Draft[] {
 const serviceKey = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
 
 interface PackageState {
-  /** open: sessions left to book; complete: none left; frozen: on hold; ended: expired or cancelled with sessions unused. */
+  /**
+   * open: sessions left to book, on one in use or one bought and not yet
+   * started; complete: none left; frozen: on hold; ended: expired or
+   * cancelled with sessions unused.
+   */
   kind: "open" | "complete" | "frozen" | "ended";
   p: PlanPackage;
   left: number | null;
 }
-const PACKAGE_ORDER: Record<PackageState["kind"], number> = { open: 0, frozen: 1, complete: 2, ended: 3 };
 
 /**
- * What one package says about a course. One not started yet, in a state
- * JENAI does not know, or active with no count of sessions left says
- * nothing: the treatment rule and the visit's own counts decide. One that
- * ended before their last visit says nothing either: that visit was not from it.
+ * Which package speaks for a course when there are several: one being used,
+ * then one bought and not yet started (a course bought again outranks the
+ * one it replaces, used up), then one on hold, used up, ended.
+ */
+const packageRank = (st: PackageState) => (st.kind === "open" ? (st.p.status === "active" ? 0 : 1) : { frozen: 2, complete: 3, ended: 4 }[st.kind]);
+
+/**
+ * What one package says about a course. One in a state JENAI does not know,
+ * or with no count of sessions left, says nothing: the treatment rule and
+ * the visit's own counts decide. One that ended before their last visit
+ * says nothing either: that visit was not from it.
  */
 function packageState(p: PlanPackage, lastDay: string, today: string): PackageState | null {
   const left = p.balance ?? (p.total != null && p.used != null ? p.total - p.used : null);
@@ -876,19 +893,30 @@ function packageState(p: PlanPackage, lastDay: string, today: string): PackageSt
   if (left !== null && left <= 0 && p.status !== "cancelled") return { kind: "complete", p, left: 0 };
   if (ended) return p.expiresOn && p.expiresOn < lastDay ? null : { kind: "ended", p, left };
   if (p.status === "frozen") return { kind: "frozen", p, left };
-  if (p.status === "active" && left !== null) return { kind: "open", p, left };
+  if ((p.status === "active" || p.status === "not_started") && left !== null) return { kind: "open", p, left };
   return null;
 }
 
-/** Of their packages for a service, the one that speaks for the course: sessions to book first, ending soonest. */
-function packageFor(key: string, lastDay: string, c: Ctx): PackageState | null {
+/**
+ * Whether a package line pays for this visit's service: a service line by
+ * its name, a category line by the service's category or sub-category. A
+ * tag line never matches: JENAI does not know which services carry a tag.
+ */
+function covers(p: PlanPackage, key: string, v: VisitIn): boolean {
+  const k = serviceKey(p.service);
+  if (p.covers === "category") return v.categories.some((x) => serviceKey(x) === k);
+  return p.covers !== "tag" && k === key;
+}
+
+/** Of their packages for a service, the one that speaks for the course: as packageRank says, then ending soonest. */
+function packageFor(key: string, last: VisitIn, c: Ctx): PackageState | null {
   let best: PackageState | null = null;
   for (const p of c.packages) {
-    if (serviceKey(p.service) !== key) continue;
-    const st = packageState(p, lastDay, c.today);
+    if (!covers(p, key, last)) continue;
+    const st = packageState(p, last.day, c.today);
     if (!st) continue;
     const ends = (x: PackageState) => x.p.expiresOn ?? "9999-12-31";
-    if (!best || PACKAGE_ORDER[st.kind] < PACKAGE_ORDER[best.kind] || (st.kind === best.kind && ends(st) < ends(best))) best = st;
+    if (!best || packageRank(st) < packageRank(best) || (packageRank(st) === packageRank(best) && ends(st) < ends(best))) best = st;
   }
   return best;
 }
@@ -905,6 +933,7 @@ function openPackageRow(pkg: PackageState, last: VisitIn, every: number | null, 
   const done = p.used ?? (total !== null ? total - left : null);
   const session = total !== null && done !== null && done >= 0 && done < total ? `Session ${done + 1} of ${total} of ${what}` : `The next session of ${what}`;
   const ends = p.expiresOn ?? null;
+  const theirs = p.status === "not_started" ? "the package they bought, not started yet" : "their package";
   if (ends && daysBetween(c.today, ends) <= c.s.packageEndingWithinDays)
     return callable("next_session", last.origin, c.now, `${plural(left, "session")} left, package ends on ${dateText(ends)}: called now so they can book before it does. ${session} is next; the last was on ${dateText(last.day)}.`, values, c);
   if (every)
@@ -912,11 +941,11 @@ function openPackageRow(pkg: PackageState, last: VisitIn, every: number | null, 
       "next_session",
       last.origin,
       startOf(addDays(last.day, every), c.tz),
-      `${session} is due ${plural(every, "day")} after the last, on ${dateText(last.day)}. ${plural(left, "session")} left on their package${ends ? `, which ends on ${dateText(ends)}` : ""}.${note}`,
+      `${session} is due ${plural(every, "day")} after the last, on ${dateText(last.day)}. ${plural(left, "session")} left on ${theirs}${ends ? `, which ends on ${dateText(ends)}` : ""}.${note}`,
       values,
       c,
     );
-  return keep("next_session", last.origin, `${plural(left, "session")} of ${what} left on their package, but no gap between sessions is set for it, so JENAI cannot tell when the next is due. Add one in the treatment rules.`);
+  return keep("next_session", last.origin, `${plural(left, "session")} of ${what} left on ${theirs}, but no gap between sessions is set for it, so JENAI cannot tell when the next is due. Add one in the treatment rules.`);
 }
 
 /**
@@ -975,6 +1004,7 @@ function visitIn(v: PlanVisit): VisitIn {
     branch: v.branch ?? null,
     sessionsDone: v.sessionsDone ?? null,
     sessionsTotal: v.sessionsTotal ?? null,
+    categories: v.categories ?? [],
   };
 }
 
@@ -1088,8 +1118,22 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
     const [own] = await tx.select({ settings: callPlanSettings.settings }).from(callPlanSettings).where(eq(callPlanSettings.tenantId, tenantId));
     const settings = planSettingsOf(own?.settings, org?.timezone ?? DEFAULT_PLAN_SETTINGS.timezone);
     const rules = treatmentRulesFor(await tx.select().from(treatmentRules), org?.vertical);
-    const kindOf = new Map((await tx.select({ id: integrations.id, kind: integrations.kind }).from(integrations)).map((i) => [i.id, i.kind as string]));
+    const connections = await tx.select({ id: integrations.id, kind: integrations.kind, config: integrations.config }).from(integrations);
+    const kindOf = new Map(connections.map((i) => [i.id, i.kind as string]));
     const systemNamed = (integrationId: string) => CRM_NAMES[kindOf.get(integrationId) ?? ""];
+    // A centre is named as its JENAI branch, else as their system names it (config.centres), so the plan's centres treat bookings and visits alike.
+    const branchName = new Map((await tx.select({ id: branches.id, name: branches.name }).from(branches)).map((b) => [b.id, b.name]));
+    const centreName = new Map(
+      connections.flatMap((i) =>
+        (Array.isArray(i.config.centres) ? i.config.centres : []).flatMap((x) => {
+          const c = (x && typeof x === "object" ? x : {}) as Record<string, unknown>;
+          const name = typeof c.name === "string" && c.name.trim() ? c.name.trim() : typeof c.code === "string" && c.code.trim() ? c.code.trim() : null;
+          return typeof c.id === "string" && name ? [[`${i.id}:${c.id}`, name] as const] : [];
+        }),
+      ),
+    );
+    const placeOf = (integrationId: string | null, branchId: string | null, centreRef: string | null, own: string | null) =>
+      (branchId ? branchName.get(branchId) : undefined) ?? (integrationId && centreRef ? centreName.get(`${integrationId}:${centreRef}`) : undefined) ?? own;
     const records = await tx.select().from(crmRecords).where(isNull(crmRecords.deletedAt));
     const taken = await tx.select().from(visits);
     const guests = await tx
@@ -1106,10 +1150,10 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
         startsAt: clinicAppointments.startsAt,
         status: clinicAppointments.status,
         doctor: clinicAppointments.doctor,
-        centre: branches.name,
+        branchId: clinicAppointments.branchId,
+        centreRef: clinicAppointments.centreRef,
       })
-      .from(clinicAppointments)
-      .leftJoin(branches, and(eq(branches.tenantId, clinicAppointments.tenantId), eq(branches.id, clinicAppointments.branchId)));
+      .from(clinicAppointments);
     const held = await tx.select().from(packageBalances);
     const blocked = await tx
       .select({ phone: suppressions.phoneE164, reason: suppressions.reason, expiresAt: suppressions.expiresAt })
@@ -1131,25 +1175,35 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
       return p;
     };
     for (const r of records) personFor(r.phoneE164 ?? `record:${r.id}`, r.phoneE164).records.push({ ...r, crm: systemNamed(r.integrationId) ?? "their CRM" });
-    // A visit read from their system before its number: counted, and planned once the number arrives.
+    // A booking, package or visit carries the number known when it was read; their guest record may know it since.
+    const guestPhone = new Map(guests.filter((g) => g.phone).map((g) => [`${g.integrationId}:${g.ref}`, g.phone!]));
+    const phoneOf = (x: { integrationId: string | null; guestRef: string | null; phone?: string | null; phoneE164?: string | null }) =>
+      x.phone ?? x.phoneE164 ?? (x.integrationId && x.guestRef ? guestPhone.get(`${x.integrationId}:${x.guestRef}`) : undefined) ?? null;
+    const visitOf = (v: (typeof taken)[number], phone: string): PlanVisit => ({ ...v, phoneE164: phone, branch: placeOf(v.integrationId, v.branchId, v.centreRef, v.branch) });
+    for (const v of taken) {
+      if (!v.phoneE164) continue;
+      const p = personFor(v.phoneE164, v.phoneE164);
+      p.visits.push(visitOf(v, v.phoneE164));
+      p.contactId ??= v.contactId;
+    }
+    // A visit read from their system before its number takes their guest's
+    // number once that is known, unless it is a copy of a visit they already
+    // have that day; with none known it is counted, and planned once one arrives.
     let waitingForPhone = 0;
     for (const v of taken) {
-      const phone = v.phoneE164;
+      if (v.phoneE164) continue;
+      const phone = phoneOf(v);
       if (!phone) {
         waitingForPhone++;
         continue;
       }
       const p = personFor(phone, phone);
-      p.visits.push({ ...v, phoneE164: phone });
-      p.contactId ??= v.contactId;
+      if (p.visits.some((x) => x.visitDate === v.visitDate && serviceKey(x.service) === serviceKey(v.service))) continue;
+      p.visits.push(visitOf(v, phone));
     }
-    // A booking or package carries the number known when it was read; their guest record may know it since.
-    const guestPhone = new Map(guests.filter((g) => g.phone).map((g) => [`${g.integrationId}:${g.ref}`, g.phone!]));
-    const phoneOf = (x: { integrationId: string; guestRef: string; phone?: string | null; phoneE164?: string | null }) =>
-      x.phone ?? x.phoneE164 ?? guestPhone.get(`${x.integrationId}:${x.guestRef}`) ?? null;
     for (const b of booked) {
       const phone = phoneOf(b);
-      if (phone) personFor(phone, phone).bookings!.push({ ...b, system: systemNamed(b.integrationId) });
+      if (phone) personFor(phone, phone).bookings!.push({ ...b, centre: placeOf(b.integrationId, b.branchId, b.centreRef, null), system: systemNamed(b.integrationId) });
     }
     // A package alone prompts no call: it only tells the calls about visits and bookings how the course stands.
     for (const k of held) {

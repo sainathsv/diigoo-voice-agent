@@ -5,7 +5,7 @@ import { redirect } from "next/navigation";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { apiKeys, audit, integrationEvents, integrations, withTenant } from "@jenai/db";
-import { credentialsOf, releaseHeld, saveZohoConnection, sealCredentials, testConnection } from "@jenai/engine";
+import { checkZenotiConnection, credentialsOf, releaseHeld, saveZohoConnection, sealCredentials, testConnection } from "@jenai/engine";
 import { actorFields, requireWorkspace, workspaceAction } from "../access";
 import { requestMeta } from "../session";
 import { SCOPES, newApiKey } from "../api/key";
@@ -97,6 +97,15 @@ export async function testSystem(fd: FormData) {
   const slug = String(fd.get("slug"));
   const id = String(fd.get("id"));
   const ctx = await workspaceAction(slug, "integrations:manage");
+  const [kind] = await withTenant(ctx.org.id, (tx) => tx.select({ kind: integrations.kind }).from(integrations).where(eq(integrations.id, id)));
+  if (!kind) go(slug, { error: "That connection is gone." });
+  if (kind!.kind === "zenoti") {
+    // Zenoti is asked with no transaction open, since its waits can take minutes; a paused connection
+    // stays paused, the branch map is kept current, and the test is audited.
+    const { tenantId: _, ...actor } = await meta(ctx);
+    const check = await checkZenotiConnection(ctx.org.id, id, { actor });
+    go(slug, check.ok ? { ok: check.test.message } : { error: check.test.message });
+  }
   const r = await withTenant(ctx.org.id, async (tx) => {
     const [i] = await tx.select().from(integrations).where(eq(integrations.id, id));
     if (!i) return { error: "That connection is gone." };

@@ -4,6 +4,7 @@
  *   pnpm --filter @jenai/db zenoti connect --tenant zennara --file ~/zenoti-key.json
  *   pnpm --filter @jenai/db zenoti test --tenant zennara
  *   pnpm --filter @jenai/db zenoti sync --tenant zennara [--days 180] [--budget 30]
+ *   pnpm --filter @jenai/db zenoti map --tenant zennara --centre ZNKD --branch Kondapur
  *
  * The key file is JSON: {"api_key": "...", "app_id": "...", "app_secret": "..."},
  * as Zenoti showed them when the clinic's admin made a backend app for JENAI
@@ -17,12 +18,14 @@
  * test does the test again. sync reads Zenoti once, at most --budget calls
  * (30 unless said), after widening how many days back it reads to --days,
  * and prints counts per table and the call plan per journey and verdict.
+ * map sets which JENAI branch a centre is (or "none", or "match" to go back
+ * to matching by name), and no later test or sync undoes it.
  *
  * JENAI only reads Zenoti. Nothing here writes to it, dials anyone or makes
  * campaign targets, and nothing printed is a key, a guest's name or a number.
  */
 import "./env";
-import { ZenotiCommandError, connectCommand, syncCommand, testCommand } from "./zenoti-commands";
+import { ZenotiCommandError, connectCommand, mapCommand, syncCommand, testCommand } from "./zenoti-commands";
 
 const arg = (name: string): string | undefined => {
   const i = process.argv.indexOf(`--${name}`);
@@ -33,6 +36,7 @@ const USAGE = [
   "usage: zenoti connect --tenant <address> --file <path to the key file>",
   "       zenoti test    --tenant <address>",
   "       zenoti sync    --tenant <address> [--days N] [--budget N]",
+  "       zenoti map     --tenant <address> --centre <code or id> --branch <name or code | none | match>",
   '  the key file holds {"api_key": "...", "app_id": "...", "app_secret": "..."}; only api_key is needed',
 ].join("\n");
 
@@ -42,6 +46,7 @@ try {
   if (command === "connect") await connectCommand({ tenant, file: arg("file") ?? "" });
   else if (command === "test") await testCommand({ tenant });
   else if (command === "sync") await syncCommand({ tenant, days: arg("days"), budget: arg("budget") });
+  else if (command === "map") await mapCommand({ tenant, centre: arg("centre") ?? "", branch: arg("branch") ?? "" });
   else {
     console.log(USAGE);
     process.exit(1);

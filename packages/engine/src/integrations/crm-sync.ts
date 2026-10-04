@@ -17,7 +17,7 @@ import type { ConnectorContext, PullResult, PulledRecord } from "./types";
 /** Requests for records one run makes when the caller does not say: up to 2,000 changed records. */
 const DEFAULT_PAGE_BUDGET = 10;
 /** Long enough for a run's requests. A worker that dies lets go of the connection after this. */
-const LEASE_MINUTES = 15;
+export const PULL_LEASE_MINUTES = 15;
 /** Rows per insert statement. */
 const CHUNK = 200;
 
@@ -58,7 +58,7 @@ export interface CrmSyncResult {
 export async function syncIntegration(tenantId: string, integrationId: string, opts: { pageBudget?: number; fetchImpl?: typeof fetch } = {}): Promise<CrmSyncResult> {
   const taken = await takePullLease(tenantId, integrationId);
   if (!taken) return { ran: false, modules: [], pages: 0, done: false, error: null };
-  const { i, timeZone } = taken;
+  const { i, timeZone, lease } = taken;
 
   const result: CrmSyncResult = { ran: true, modules: [], pages: 0, done: false, error: null };
   const problems: string[] = [];
@@ -105,20 +105,23 @@ export async function syncIntegration(tenantId: string, integrationId: string, o
     problems.push(`Reading stopped: ${(e as Error).message}`.slice(0, 300));
   } finally {
     result.error = problems.length ? problems.join(" ").slice(0, 1000) : null;
-    await endPull(tenantId, i.id, result.error);
+    await endPull(tenantId, i.id, result.error, lease);
   }
   return result;
 }
 
 /**
  * Takes a connection's pull lease, so one run reads it at a time: null when
- * another run holds it. Throws when the client has no such connection.
+ * another run holds it. Throws when the client has no such connection. The
+ * lease's end, to the millisecond, is this run's own: endPull lets go of it
+ * only while it is still this run's.
  */
-export async function takePullLease(tenantId: string, integrationId: string): Promise<{ i: Integration; timeZone: string } | null> {
+export async function takePullLease(tenantId: string, integrationId: string): Promise<{ i: Integration; timeZone: string; lease: Date } | null> {
   return withTenant(tenantId, async (tx) => {
     const [i] = await tx
       .update(integrations)
-      .set({ pullLeaseUntil: sql`now() + make_interval(mins => ${LEASE_MINUTES})` })
+      // To the millisecond, so the value read back is the one stored and can say whose lease it is.
+      .set({ pullLeaseUntil: sql`date_trunc('milliseconds', now() + make_interval(mins => ${PULL_LEASE_MINUTES}))` })
       .where(and(eq(integrations.id, integrationId), or(isNull(integrations.pullLeaseUntil), lt(integrations.pullLeaseUntil, sql`now()`))))
       .returning();
     if (!i) {
@@ -127,13 +130,18 @@ export async function takePullLease(tenantId: string, integrationId: string): Pr
       return null;
     }
     const [org] = await tx.select({ timezone: organizations.timezone }).from(organizations).where(eq(organizations.id, tenantId));
-    return { i, timeZone: org?.timezone ?? "Asia/Kolkata" };
+    return { i, timeZone: org?.timezone ?? "Asia/Kolkata", lease: i.pullLeaseUntil! };
   });
 }
 
-/** Lets go of the pull lease and records when the run ended and what went wrong, in plain words. */
-export async function endPull(tenantId: string, integrationId: string, error: string | null): Promise<void> {
-  await withTenant(tenantId, (tx) => tx.update(integrations).set({ lastPullAt: new Date(), lastPullError: error, pullLeaseUntil: null }).where(eq(integrations.id, integrationId)));
+/**
+ * Records when the run ended and what went wrong, in plain words, and lets
+ * go of its pull lease. Given the lease it took, it lets go only of that one:
+ * a run that outlived it must not free a lease another run has taken since.
+ */
+export async function endPull(tenantId: string, integrationId: string, error: string | null, lease?: Date | null): Promise<void> {
+  const free = lease ? sql`case when ${integrations.pullLeaseUntil} = ${lease.toISOString()}::timestamptz then null else ${integrations.pullLeaseUntil} end` : null;
+  await withTenant(tenantId, (tx) => tx.update(integrations).set({ lastPullAt: new Date(), lastPullError: error, pullLeaseUntil: free }).where(eq(integrations.id, integrationId)));
 }
 
 function modulesOf(i: Integration, fallback: string[] | undefined): string[] {

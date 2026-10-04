@@ -14,8 +14,10 @@ import {
   ZenotiClient,
   ZenotiKeyError,
   ZenotiPermissionError,
+  ZenotiTimeSpent,
   ZenotiUnavailableError,
   packageSessions,
+  phoneCodeForZone,
   testZenoti,
   zenotiAppointmentRow,
   zenotiAppointmentStatus,
@@ -28,6 +30,7 @@ import {
   zenotiPhone,
   zenotiSalesAccrualVisit,
   zenotiSalesReportVisit,
+  zenotiTimeZone,
   type ZenotiCapabilities,
 } from "./zenoti";
 
@@ -151,7 +154,7 @@ describe("zenoti: what a key may read", () => {
       const path = can("appointments") ? "appointments" : can("salesAccrual") ? "sales_accrual" : can("salesReport") ? "sales_report" : null;
       expect(r.path, label).toBe(path);
       expect(r.ok, label).toBe(path !== null);
-      expect(r.centres, label).toEqual([{ id: KONDAPUR, name: "Kondapur", code: "ZNKD", phoneCode: null }]);
+      expect(r.centres, label).toEqual([{ id: KONDAPUR, name: "Kondapur", code: "ZNKD", phoneCode: null, timeZone: null }]);
 
       // Advice for exactly what is missing and worth having.
       const said = (re: RegExp) => r.advice.some((a) => re.test(a));
@@ -195,7 +198,7 @@ describe("zenoti: what a key may read", () => {
     expect(r.message).toBe(
       "Connected to Zenoti: 1 centre (Kondapur, ZNKD). Services done are read from Zenoti's older sales report, with each guest's mobile from their Zenoti profile. Sessions left on each guest's packages are read too. " +
         "Zenoti does not let this key read appointments. Ask your Zenoti admin to add read access to appointments in the API key groups of the backend app that issued this key (in Zenoti: Configuration, then Apps under Integrations). JENAI then sees bookings, no-shows and completed visits with the patient's mobile. " +
-        "JENAI is reading Zenoti's older sales report, which Zenoti has deprecated. Ask your Zenoti admin to add read access to the sales accrual report in the API key groups of the backend app that issued this key (in Zenoti: Configuration, then Apps under Integrations). JENAI then keeps working if Zenoti retires the older one.",
+        "JENAI is reading Zenoti's older sales report, which Zenoti has deprecated. Ask your Zenoti admin to add read access to the sales accrual report in the API key groups of the backend app that issued this key (in Zenoti: Configuration, then Apps under Integrations), and to make sure the security role of the Zenoti user that app runs as may see reports. JENAI then keeps working if Zenoti retires the older one.",
     );
   });
 
@@ -245,7 +248,8 @@ describe("zenoti: what a key may read", () => {
     expect(r.message).toBe(
       "Zenoti did not accept this API key. It may be mistyped, or no longer valid in Zenoti. Ask your Zenoti admin for the API key of the backend app made for JENAI (in Zenoti: Configuration, then Apps under Integrations) and save it here again.",
     );
-    expect(seen).toHaveLength(1);
+    // The centres, then a guest nobody has: refused too, so it is the key, not a missing permission.
+    expect(seen.map((s) => s.path)).toEqual(["/v1/centers", "/v1/guests/00000000-0000-0000-0000-000000000000"]);
     expect(saved).toEqual([]);
     expect(r.message).not.toContain(KEY);
   });
@@ -287,6 +291,95 @@ describe("zenoti: what a key may read", () => {
     const r = await zenotiConnector.send(connection(fetchImpl).ctx, { id: "e", kind: "call.completed", idempotencyKey: "k", externalId: null, payload: {} });
     expect(r).toEqual({ ok: false, retry: false, response: "JENAI only reads from Zenoti and never writes to it." });
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe("zenoti: keys that may not read everything", () => {
+  it("reads every page of the centres, as list-all-centers pages them", async () => {
+    const all = Array.from({ length: 250 }, (_, n) => ({ id: `c-${n}`, name: `Centre ${n}`, code: `C${n}`, country: { id: 95, phone_code: 0 }, location: { time_zone: { standard_name: "India Standard Time" } } }));
+    const z = fakeZenoti((r) => {
+      if (r.path !== "/v1/centers") return { status: 404 };
+      const [page, size] = [Number(r.query.get("Page")), Number(r.query.get("Size"))];
+      return { status: 200, body: { centers: all.slice((page - 1) * size, page * size), page_info: { total: all.length, page, size } } };
+    });
+    const centres = await new ZenotiClient(connection(z.fetchImpl).ctx, fakeClock()).centres();
+    expect(centres).toHaveLength(250);
+    expect(z.seen.map((s) => [s.query.get("Page"), s.query.get("Size")])).toEqual([
+      ["1", "100"],
+      ["2", "100"],
+      ["3", "100"],
+    ]);
+    // phone_code 0 is none, so the country id (95, India) gives it; the time zone is the centre's own.
+    expect(centres[0]).toEqual({ id: "c-0", name: "Centre 0", code: "C0", phoneCode: "91", timeZone: "Asia/Kolkata" });
+    // A Zenoti that does not page hands the same list back: read once, not looped over.
+    const flat = fakeZenoti(() => ({ status: 200, body: { centers: all.slice(0, 120) } }));
+    expect(await new ZenotiClient(connection(flat.fetchImpl).ctx, fakeClock()).centres()).toHaveLength(120);
+    expect(flat.seen).toHaveLength(2);
+  });
+
+  it("tells a key that may not list the centres from a wrong one, and reads the centres named on the connection", async () => {
+    const z = fakeZenoti((r) => {
+      const e = endpointOf(r);
+      if (e === "centres") return { status: 401, body: DENIED };
+      return e ? ALLOWED[e] : { status: 404 };
+    });
+    const bare = await testZenoti(connection(z.fetchImpl).ctx, fakeClock());
+    expect(bare).toMatchObject({ ok: false, path: null });
+    expect(bare.message).toBe(
+      "Zenoti accepted the key, but does not let it read the list of centres, so JENAI cannot tell which centres to read. Ask your Zenoti admin to add read access to centres in the API key groups of the backend app that issued this key (in Zenoti: Configuration, then Apps under Integrations).",
+    );
+
+    // The centre ids the clinic named stand in for the list; a code alone cannot.
+    const named = connection(z.fetchImpl, { onlyCentres: [KONDAPUR, "ZNKD"] });
+    const r = await testZenoti(named.ctx, fakeClock());
+    expect(r).toMatchObject({ ok: true, path: "appointments" });
+    expect(r.centres).toEqual([{ id: KONDAPUR, name: null, code: null, phoneCode: null, timeZone: null }]);
+    expect(r.message).toMatch(/^Connected to Zenoti, which does not let this key read the list of centres: JENAI reads the centre named on this connection\./);
+    expect(r.advice[0]).toBe(
+      "Zenoti does not let this key read the list of centres. Ask your Zenoti admin to add read access to centres in the API key groups of the backend app that issued this key (in Zenoti: Configuration, then Apps under Integrations). JENAI then reads every centre the key sees, by name.",
+    );
+    expect(named.saved[0]).toMatchObject({ centres: r.centres, access: { path: "appointments" } });
+  });
+
+  it("takes the accrual report's 'cannot access' for a permission the key lacks, and asks for reports", async () => {
+    const cannot: Reply = { status: 400, body: { code: 918, message: "cannot access" } };
+    const { fetchImpl } = zenotiAllowing(new Set(["salesReport", "guestDetails"]), { salesAccrual: cannot });
+    const r = await testZenoti(connection(fetchImpl).ctx, fakeClock());
+    expect(r.capabilities.salesAccrual).toBe(false);
+    expect(r.path).toBe("sales_report");
+    expect(r.advice.some((a) => /add read access to the sales accrual report .+ security role of the Zenoti user that app runs as may see reports/.test(a))).toBe(true);
+    expect(r.advice.join(" ")).not.toMatch(/JENAI support/);
+
+    // Met while reading, it is a missing permission too, so the sync tries another way.
+    const z = fakeZenoti((req) => (endpointOf(req) === "centres" ? { status: 200, body: CENTRES } : cannot));
+    const err = await new ZenotiClient(connection(z.fetchImpl).ctx, fakeClock()).salesAccrual({ centreIds: [KONDAPUR], from: "2026-10-01", to: "2026-10-02", page: 1, size: 10 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ZenotiPermissionError);
+    expect(err).toMatchObject({ status: 400, what: "the sales accrual report" });
+  });
+
+  it("reads a guest Zenoti no longer has, merged or deleted, as none, and only a refused permission as a refusal", async () => {
+    const z = fakeZenoti((r) => {
+      if (r.path === "/v1/centers") return { status: 200, body: CENTRES };
+      if (r.path.startsWith("/v1/guests/g-merged")) return { status: 400, body: {} };
+      if (r.path.startsWith("/v1/guests/g-gone")) return { status: 404, body: { message: "Guest not found" } };
+      if (r.path.startsWith("/v1/guests/g-odd")) return { status: 422, body: {} };
+      return { status: 401, body: DENIED };
+    });
+    const client = new ZenotiClient(connection(z.fetchImpl).ctx, fakeClock());
+    for (const id of ["g-merged", "g-gone", "g-odd"]) {
+      expect(await client.guest(id), id).toBeNull();
+      expect(await client.guestPackages(id), id).toBeNull();
+    }
+    await expect(client.guest("g-1")).rejects.toBeInstanceOf(ZenotiPermissionError);
+    await expect(client.guestPackages("g-1")).rejects.toBeInstanceOf(ZenotiPermissionError);
+  });
+
+  it("knows a centre's time zone by Zenoti's name for it, and a zone's calling code only where it names one country", () => {
+    expect(zenotiTimeZone({ id: 68, name: "(UTC+05:30) Chennai, Kolkata, Mumbai, New Delhi", standard_name: "India Standard Time", symbol: "India Standard Time" })).toBe("Asia/Kolkata");
+    expect(zenotiTimeZone({ standard_name: "Arabian Standard Time" })).toBe("Asia/Dubai");
+    expect(zenotiTimeZone({ standard_name: "Somewhere Standard Time" })).toBeNull();
+    expect(zenotiTimeZone(null)).toBeNull();
+    expect(["Asia/Kolkata", "Asia/Dubai", "America/New_York", "Europe/Berlin", "Asia/Hong_Kong", null].map(phoneCodeForZone)).toEqual(["91", "971", "1", null, null, null]);
   });
 });
 
@@ -370,6 +463,22 @@ describe("zenoti: pace and retries", () => {
     expect(clock.now()).toBeGreaterThanOrEqual(Date.parse("2026-10-04T06:01:00Z"));
   });
 
+  it("starts no call after the time a run was given, however long Zenoti makes it wait", async () => {
+    // The organisation's minute is spent every time: each call waits a minute for the refill.
+    const { fetchImpl, seen } = fakeZenoti(() => ({ status: 200, body: CENTRES, headers: { "ratelimit-remaining": "0", "ratelimit-reset": "60" } }));
+    const clock = fakeClock();
+    const budget = { left: 100, used: 0, until: clock.now() + 3 * 60_000 };
+    const client = new ZenotiClient(connection(fetchImpl).ctx, clock, budget);
+    const err = await (async () => {
+      for (;;) await client.centres();
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ZenotiTimeSpent);
+    // Handled as a run out of calls: the rest is read next time, and the key is not blamed.
+    expect(err).toBeInstanceOf(ZenotiBudgetSpent);
+    expect(seen).toHaveLength(3);
+    expect(budget.used).toBe(3);
+  });
+
   it("retries a server error or no answer at 1, 2 and 4 seconds, then says Zenoti is unavailable", async () => {
     let n = 0;
     const flaky = fakeZenoti(() => (n++ === 0 ? { status: 502 } : ok));
@@ -421,10 +530,11 @@ describe("zenoti: refusals", () => {
     err = await client.appointments(KONDAPUR, "2026-10-01", "2026-10-08").catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ZenotiKeyError);
     expect(err).toMatchObject({ connectionBroken: true });
-    expect(z.seen.map((s) => s.path)).toEqual(["/v1/appointments", "/v1/centers"]);
-    // The centres are asked once per client, not once per refusal.
+    const nobody = "/v1/guests/00000000-0000-0000-0000-000000000000";
+    expect(z.seen.map((s) => s.path)).toEqual(["/v1/appointments", "/v1/centers", nobody]);
+    // The key is checked once per client, not once per refusal.
     await client.salesReport(KONDAPUR, "2026-10-01", "2026-10-07").catch(() => null);
-    expect(z.seen.map((s) => s.path)).toEqual(["/v1/appointments", "/v1/centers", "/v1/sales/salesreport"]);
+    expect(z.seen.map((s) => s.path)).toEqual(["/v1/appointments", "/v1/centers", nobody, "/v1/sales/salesreport"]);
 
     z = fakeZenoti(() => ({ status: 401, body: DENIED }));
     await expect(new ZenotiClient(connection(z.fetchImpl).ctx, fakeClock()).centres()).rejects.toBeInstanceOf(ZenotiKeyError);
@@ -499,6 +609,8 @@ describe("zenoti: mappers", () => {
       service: "Laser Hair Reduction Full Legs",
       category: "Laser / Hair Reduction",
       startsAt: new Date("2026-09-30T19:00:00Z"),
+      // The day Zenoti lists it under: the centre's, though it is still the day before in UTC.
+      localDay: "2026-10-01",
       status: "completed",
       doctor: "Dr. Asha",
       centreRef: KONDAPUR,
@@ -524,7 +636,9 @@ describe("zenoti: mappers", () => {
       name: "Test Guest",
       service: "Laser Hair Reduction Full Legs",
       category: "Laser / Hair Reduction",
+      categories: ["Laser", "Hair Reduction"],
       visitDate: "2026-10-01",
+      listedOn: "2026-10-01",
       doctor: "Dr. Asha",
       centreRef: KONDAPUR,
       packageName: null,
@@ -564,13 +678,17 @@ describe("zenoti: mappers", () => {
       name: "Test Guest",
       service: "LHR Full Legs",
       category: null,
+      categories: [],
       visitDate: "2026-09-30",
+      listedOn: "2026-09-30",
       doctor: "Dr. Asha",
       centreRef: KONDAPUR,
       packageName: "LHR 5 Body Parts 5 Sessions",
       sessionsTotal: 5,
     });
     expect(zenotiSalesReportVisit({ ...reportLine, serviced_on: null })?.visitDate).toBe("2026-09-30");
+    // Invoiced the day after the service: done on its day, listed under the sale's.
+    expect(zenotiSalesReportVisit({ ...reportLine, sold_on: "2026-10-01T10:15:00" })).toMatchObject({ visitDate: "2026-09-30", listedOn: "2026-10-01" });
     expect(zenotiSalesReportVisit({ ...reportLine, item: { ...reportLine.item, type: 2 } })).toBeNull();
     expect(zenotiSalesReportVisit({ ...reportLine, quantity: -1 })).toBeNull();
     expect(zenotiSalesReportVisit({ ...reportLine, invoice_item_id: null })).toBeNull();
@@ -602,7 +720,9 @@ describe("zenoti: mappers", () => {
       name: "Test Guest",
       service: "Hydrafacial",
       category: "Facials",
+      categories: ["Facials"],
       visitDate: "2026-09-30",
+      listedOn: "2026-09-30",
       doctor: "Dr. Asha",
       centreRef: KONDAPUR,
       packageName: null,
@@ -631,9 +751,16 @@ describe("zenoti: mappers", () => {
     expect(zenotiPhone({ country_code: 95, number: "09876543210" })).toBe("+919876543210");
     expect(zenotiPhone({ country_code: 225, number: "2025550123" })).toBe("+12025550123");
     expect(zenotiPhone({ country_code: 95, number: "+44 7700 900123" })).toBe("+447700900123");
-    // No country: the connection's default, India's by default.
-    expect(zenotiPhone({ country_code: 0, number: "9876543210" })).toBe("+919876543210");
+    // No country: the default the caller gives (the connection's, the centre's country, the client's), never a guess.
+    expect(zenotiPhone({ country_code: 0, number: "9876543210" })).toBeNull();
+    expect(zenotiPhone({ country_code: 0, number: "9876543210" }, { defaultCountryCode: "91" })).toBe("+919876543210");
+    expect(zenotiPhone({ number: "2125551234" }, { defaultCountryCode: "1" })).toBe("+12125551234");
     expect(zenotiPhone({ number: "0501234567" }, { defaultCountryCode: "971" })).toBe("+971501234567");
+    // retrieve-guest-details writes phone_code 0 for none: not a country code.
+    expect(zenotiPhone({ country_code: 0, phone_code: 0, number: "9876543210" })).toBeNull();
+    expect(zenotiPhone({ country_code: 0, phone_code: 0, number: "9876543210" }, { defaultCountryCode: "91" })).toBe("+919876543210");
+    expect(zenotiPhone({ country_code: 0, phone_code: 971, number: "501234567" })).toBe("+971501234567");
+    expect(zenotiPhone({ number: "9876543210" }, { defaultCountryCode: "0" })).toBeNull();
     expect(zenotiPhone({ number: "971501234567" }, { defaultCountryCode: "971" })).toBe("+971501234567");
     // A country we cannot place: no number, unless Zenoti's country list names it.
     expect(zenotiPhone({ country_code: 999, number: "7700900123" })).toBeNull();
@@ -684,9 +811,9 @@ describe("zenoti: mappers", () => {
     ];
     const rows = zenotiPackageBalances("g-1", packages);
     expect(rows).toEqual([
-      { guestRef: "g-1", packageRef: "up-new", packageName: "LHR 5 Body Parts 5 Sessions", service: "LHR Full Legs", total: 5, used: 2, balance: 3, status: "active", expiresOn: "2027-03-01" },
-      { guestRef: "g-1", packageRef: "up-new", packageName: "LHR 5 Body Parts 5 Sessions", service: "LHR Underarms", total: 5, used: 2, balance: 3, status: "active", expiresOn: "2027-03-01" },
-      { guestRef: "g-1", packageRef: "up-x", packageName: "Hydrafacial 6 sittings", service: "Hydrafacial", total: 6, used: 1, balance: 5, status: "unknown", expiresOn: null },
+      { guestRef: "g-1", packageRef: "up-new", packageName: "LHR 5 Body Parts 5 Sessions", service: "LHR Full Legs", covers: "service", total: 5, used: 2, balance: 3, status: "active", expiresOn: "2027-03-01" },
+      { guestRef: "g-1", packageRef: "up-new", packageName: "LHR 5 Body Parts 5 Sessions", service: "LHR Underarms", covers: "service", total: 5, used: 2, balance: 3, status: "active", expiresOn: "2027-03-01" },
+      { guestRef: "g-1", packageRef: "up-x", packageName: "Hydrafacial 6 sittings", service: "Hydrafacial", covers: "service", total: 6, used: 1, balance: 5, status: "unknown", expiresOn: null },
     ]);
     // The same whichever order Zenoti lists them in.
     expect(zenotiPackageBalances("g-1", [...packages].reverse()).find((r) => r.service === "LHR Full Legs")?.packageRef).toBe("up-new");
@@ -701,9 +828,32 @@ describe("zenoti: mappers", () => {
       products: [{ product_type_info: { product_category_type: 1, name: "Mask", id: "29893bd5" }, total: 4, used: 1, balance: 3 }],
       services: [{ service_type_info: { service_category_type: 1, id: "21077983", name: "Feet Massage", duration: 0 }, exists_in_current_center: true, total: 1, used: 0, balance: 1, balance_amount: 205.25 }],
     };
+    // Its line is a Category (service_category_type 1), and its sessions can be taken until the grace period ends.
     expect(zenotiPackageBalances("g-2", [documented])).toEqual([
-      { guestRef: "g-2", packageRef: "c3122758", packageName: "Luxury Series Package", service: "Feet Massage", total: 1, used: 0, balance: 1, status: "active", expiresOn: "2020-04-29" },
+      { guestRef: "g-2", packageRef: "c3122758", packageName: "Luxury Series Package", service: "Feet Massage", covers: "category", total: 1, used: 0, balance: 1, status: "active", expiresOn: "2020-05-14" },
     ]);
+    const line = (service_category_type: number) => zenotiPackageBalances("g-2", [{ ...documented, services: [{ ...documented.services[0], service_type_info: { service_category_type, name: "Feet Massage" } }] }])[0]!.covers;
+    expect([-1, 1, 2, 3].map(line)).toEqual(["service", "category", "service", "tag"]);
+    expect(zenotiPackageBalances("g-2", [{ ...documented, date: { end: "2020-04-29T00:00:00" } }])[0]!.expiresOn).toBe("2020-04-29");
     expect(zenotiPackageBalances("g-1", null)).toEqual([]);
+  });
+
+  it("keeps a series bought again over the used-up one, whatever their statuses", () => {
+    const lhr = (id: string, status: number, used: number, balance: number, end: string) => ({
+      user_package_id: id,
+      status,
+      package: { name: "LHR 5 Body Parts 5 Sessions" },
+      date: { end },
+      services: [{ service_type_info: { service_category_type: 2, name: "LHR Full Legs" }, total: 5, used, balance }],
+    });
+    // Zenoti has no "completed": the used-up one stays Active beside the one bought again at checkout, not started yet.
+    const usedUp = lhr("up-old", 1, 5, 0, "2027-01-01T00:00:00");
+    const again = lhr("up-again", 7, 0, 5, "2027-06-01T00:00:00");
+    for (const order of [[usedUp, again], [again, usedUp]]) expect(zenotiPackageBalances("g-1", order).map((r) => [r.packageRef, r.status, r.balance])).toEqual([["up-again", "not_started", 5]]);
+    // Two being used: the one in use speaks, as before.
+    expect(zenotiPackageBalances("g-1", [lhr("a", 7, 0, 5, "2027-06-01T00:00:00"), lhr("b", 1, 2, 3, "2027-01-01T00:00:00")])[0]!.packageRef).toBe("b");
+    // A service and a category of the same name in one package: the service.
+    const both = { ...again, services: [{ service_type_info: { service_category_type: 1, name: "LHR Full Legs" }, total: 9, used: 0, balance: 9 }, ...again.services] };
+    expect(zenotiPackageBalances("g-1", [both]).map((r) => [r.covers, r.total])).toEqual([["service", 5]]);
   });
 });

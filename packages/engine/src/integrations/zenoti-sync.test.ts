@@ -11,6 +11,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { auditEvents, branches, clinicAppointments, externalPeople, integrations, organizations, packageBalances, plannedCalls, platformDb, visits, withTenant } from "@jenai/db";
+import { endPull, takePullLease } from "./crm-sync";
 import { sealCredentials } from "./queue";
 import { errorWithoutValues, syncZenoti } from "./zenoti-sync";
 
@@ -48,10 +49,21 @@ function endpointOf(r: Seen): Endpoint | "centres" | null {
 
 const dayOf = (v: unknown) => String(v ?? "").slice(0, 10);
 
+interface Reply {
+  status: number;
+  body?: unknown;
+  headers?: Record<string, string>;
+}
+
 /** A Zenoti holding what each test puts in it, whose key may read `allowed`. */
 function fakeZenoti(allowed: Endpoint[]) {
   const z = {
     allowed: new Set<Endpoint>(allowed),
+    centres: [...CENTRES.centers] as Array<Record<string, unknown>>,
+    /** Asked first: an answer of a test's own for any request, or nothing for the usual one. */
+    answer: null as ((r: Seen, e: Endpoint | "centres" | null) => Reply | undefined) | null,
+    /** Sent with every answer, as Zenoti sends its rate limit headers. */
+    headers: {} as Record<string, string>,
     appointments: [] as Array<Record<string, unknown>>,
     accrual: [] as Array<Record<string, unknown>>,
     report: [] as Array<Record<string, unknown>>,
@@ -75,9 +87,12 @@ function fakeZenoti(allowed: Endpoint[]) {
     };
     z.seen.push(r);
     everything.push(r);
-    const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+    const reply = (status: number, body: unknown, headers: Record<string, string> = {}) =>
+      new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...z.headers, ...headers } });
     const e = endpointOf(r);
-    if (e === "centres") return reply(200, CENTRES);
+    const own = z.answer?.(r, e);
+    if (own) return reply(own.status, own.body ?? {}, own.headers);
+    if (e === "centres") return reply(200, { centers: z.centres });
     if (!e) return reply(404, { message: "Not found" });
     if (!z.allowed.has(e)) return reply(401, DENIED);
     if (z.failNext > 0) {
@@ -89,7 +104,7 @@ function fakeZenoti(allowed: Endpoint[]) {
     switch (e) {
       case "appointments": {
         const [from, to] = [q.get("start_date")!, q.get("end_date")!];
-        return reply(200, q.get("center_id") === KONDAPUR ? z.appointments.filter((a) => dayOf(a.start_time) >= from && dayOf(a.start_time) < to) : []);
+        return reply(200, z.appointments.filter((a) => (a.center_id ?? KONDAPUR) === q.get("center_id") && dayOf(a.start_time) >= from && dayOf(a.start_time) < to));
       }
       case "guestDetails": {
         const g = z.guests.get(guestId());
@@ -99,7 +114,8 @@ function fakeZenoti(allowed: Endpoint[]) {
         return reply(200, z.packages.get(guestId()) ?? []);
       case "salesAccrual": {
         const [from, to] = [dayOf(r.body!.start_date), dayOf(r.body!.end_date)];
-        const rows = z.accrual.filter((x) => dayOf(x.sale_date) >= from && dayOf(x.sale_date) <= to);
+        const centres = r.body!.center_ids as string[];
+        const rows = z.accrual.filter((x) => centres.includes(String(x.center_id)) && dayOf(x.sale_date) >= from && dayOf(x.sale_date) <= to);
         const [page, size] = [Number(q.get("Page")), Number(q.get("Size"))];
         return reply(200, { sales: rows.slice((page - 1) * size, page * size), page_info: { total: rows.length, page, size } });
       }
@@ -139,6 +155,34 @@ function appointment(id: string, guest: number, day: string, time: string, statu
   };
 }
 
+/** A line of the sales accrual report. */
+const sale = (invoice: string, day: string, guest: number, item: string, name: string, status = "Closed", centre = KONDAPUR) => ({
+  sale_date: `${day}T00:00:00`,
+  invoice_id: invoice,
+  guest_id: `g${guest}`,
+  guest_name: `Guest Number ${guest}`,
+  center_id: centre,
+  item_id: item,
+  item_name: name,
+  item_type: "Service",
+  qty: 1,
+  status,
+  provider: "Dr. Asha",
+  item_category: "Skin",
+});
+
+/** A line of the older sales report, serviced and sold on the days given. */
+const sold = (id: string, guest: number, serviced: string, soldOn: string, name: string) => ({
+  invoice_no: `ZNKD-${id}`,
+  invoice_item_id: id,
+  guest: { guest_id: `g${guest}`, guest_name: `Guest Number ${guest}`, guest_code: `ZN${guest}` },
+  sold_on: `${soldOn}T18:00:00`,
+  serviced_on: `${serviced}T14:45:00`,
+  item: { type: 0, name, code: "X" },
+  quantity: 1,
+  employee: { name: "Dr. Asha", code: "E1", job_code: "TH" },
+});
+
 const profile = (guest: number, marketing: boolean, transactional: boolean) => ({
   id: `g${guest}`,
   code: `ZN${guest}`,
@@ -164,9 +208,16 @@ async function clinic(config: Record<string, unknown>) {
 }
 
 /** What a check made at NOW found, so a test can start without one. */
-const checked = (capabilities: Record<Endpoint, boolean>, path: string) => ({
-  centres: [{ id: KONDAPUR, name: "Kondapur", code: "ZNKD", phoneCode: "91" }],
+const checked = (capabilities: Record<Endpoint, boolean>, path: string, centres: Array<Record<string, unknown>> = [{ id: KONDAPUR, name: "Kondapur", code: "ZNKD", phoneCode: "91" }]) => ({
+  centres,
   access: { capabilities, path, checkedAt: NOW.toISOString() },
+});
+const may = (...allowed: Endpoint[]): Record<Endpoint, boolean> => ({
+  appointments: allowed.includes("appointments"),
+  guestDetails: allowed.includes("guestDetails"),
+  guestPackages: allowed.includes("guestPackages"),
+  salesAccrual: allowed.includes("salesAccrual"),
+  salesReport: allowed.includes("salesReport"),
 });
 
 const stored = (org: string) =>
@@ -180,8 +231,18 @@ const stored = (org: string) =>
     audit: await tx.select().from(auditEvents).where(eq(auditEvents.action, "zenoti.synced")).orderBy(auditEvents.createdAt),
   }));
 
-const cursorOf = (i: { pullCursor: Record<string, unknown> }) => (i.pullCursor.zenoti as Record<string, string> | undefined)?.[KONDAPUR];
+const cursorOf = (i: { pullCursor: Record<string, unknown> }, centre = KONDAPUR) => (i.pullCursor.zenoti as Record<string, string> | undefined)?.[centre];
 const spansAsked = (z: ReturnType<typeof fakeZenoti>) => z.asked("appointments").map((r) => [r.query.get("start_date"), r.query.get("end_date")]);
+/** Bookings 15 to 60 days after 4 October, read once a day, after everything else. */
+const FAR = [
+  ["2026-10-19", "2026-10-26"],
+  ["2026-10-26", "2026-11-02"],
+  ["2026-11-02", "2026-11-09"],
+  ["2026-11-09", "2026-11-16"],
+  ["2026-11-16", "2026-11-23"],
+  ["2026-11-23", "2026-11-30"],
+  ["2026-11-30", "2026-12-04"],
+];
 
 afterAll(async () => {
   if (orgs.length) await platformDb().delete(organizations).where(inArray(organizations.id, orgs));
@@ -204,6 +265,8 @@ describe("reading Zenoti through appointments", () => {
       appointment("a6", 3, "2026-10-12", "10:00", 4, "Consultation"),
       // A slot Zenoti calls Voided: neither booked nor done.
       appointment("a7", 2, "2026-10-01", "09:00", 21, "Peel"),
+      // The no-show on 20 Sep, already rebooked four weeks out.
+      appointment("a8", 2, "2026-10-30", "11:00", 0, "PRP - Hair"),
     );
     z.guests.set("g1", profile(1, false, true));
     z.guests.set("g2", profile(2, true, true));
@@ -224,8 +287,8 @@ describe("reading Zenoti through appointments", () => {
 
     const r = await run(c.org, c.id, z, NOW);
     expect(r).toMatchObject({ ran: true, tested: true, path: "appointments", done: true, error: null, left: [] });
-    // The check (centres and five probes), 4 weeks of history, 3 spans of recent and coming days, 3 profiles, 1 guest's packages.
-    expect(r.calls).toBe(6 + 4 + 3 + 3 + 1);
+    // The check (centres and five probes), 4 weeks of history, 3 spans of recent and coming days, 3 profiles, 1 guest's packages, then 7 weeks of bookings further ahead.
+    expect(r.calls).toBe(6 + 4 + 3 + 3 + 1 + 7);
     expect(spansAsked(z).slice(1)).toEqual([
       ["2026-09-04", "2026-09-11"],
       ["2026-09-11", "2026-09-18"],
@@ -234,6 +297,7 @@ describe("reading Zenoti through appointments", () => {
       ["2026-10-01", "2026-10-08"],
       ["2026-10-08", "2026-10-15"],
       ["2026-10-15", "2026-10-19"],
+      ...FAR,
     ]);
     expect(z.asked("appointments").every((q) => q.query.get("include_no_show_cancel") === "true")).toBe(true);
 
@@ -250,8 +314,9 @@ describe("reading Zenoti through appointments", () => {
       ["a5", "booked"],
       ["a6", "confirmed"],
       ["a7", "unknown"],
+      ["a8", "booked"],
     ]);
-    expect(s.bookings.find((b) => b.externalId === "a4")).toMatchObject({ guestRef: "g3", phoneE164: e164(3), startsAt: new Date("2026-10-10T04:30:00Z"), branchId: c.branchId, centreRef: KONDAPUR, doctor: "Dr. Asha" });
+    expect(s.bookings.find((b) => b.externalId === "a4")).toMatchObject({ guestRef: "g3", phoneE164: e164(3), startsAt: new Date("2026-10-10T04:30:00Z"), localDay: "2026-10-10", branchId: c.branchId, centreRef: KONDAPUR, doctor: "Dr. Asha" });
 
     // Completed bookings are the services done, with the number from the booking.
     expect(s.visits).toHaveLength(2);
@@ -275,10 +340,13 @@ describe("reading Zenoti through appointments", () => {
     // The plan has the laser course's next session, and nobody waits for a number.
     expect(r.plan?.waitingForPhone).toBe(0);
     expect(s.plan.some((p) => p.originId === s.visits[1]!.id && p.journey === "next_session")).toBe(true);
+    // The no-show is not called to rebook: the booking a month out was read too.
+    const a2 = s.bookings.find((b) => b.externalId === "a2")!;
+    expect(s.plan.find((p) => p.originId === a2.id)).toMatchObject({ journey: "no_show_rebook", verdict: "kept_out", reason: "Missed their appointment on Sun 20 Sep 2026 for PRP - Hair, but is booked again for Fri 30 Oct 2026." });
 
     // What the clinic and the logs see carries counts and centre names, never a guest's name or number.
-    expect(r.summary).toBe("Read 7 bookings (7 new or changed) and 2 services done (2 new) from appointments. Read 3 guest profiles. Read the packages of 1 guest. Up to date. 17 of 30 calls to Zenoti used.");
-    expect(s.integration.config.lastSync).toMatchObject({ path: "appointments", calls: 17, done: true, summary: r.summary });
+    expect(r.summary).toBe("Read 8 bookings (8 new or changed) and 2 services done (2 new) from appointments. Read 3 guest profiles. Read the packages of 1 guest. Up to date. 24 of 30 calls to Zenoti used.");
+    expect(s.integration.config.lastSync).toMatchObject({ path: "appointments", calls: 24, done: true, summary: r.summary });
     expect(JSON.stringify(r)).not.toMatch(/Number \d|9848/);
     expect(s.audit.map((a) => [a.action, a.via, a.targetId, a.summary])).toEqual([["zenoti.synced", "system", c.id, `Zenoti read: ${r.summary}`]]);
   });
@@ -315,6 +383,7 @@ describe("reading Zenoti through appointments", () => {
       ["a4", "cancelled"],
       ["a5", "completed"],
       ["a7", "unknown"],
+      ["a8", "booked"],
     ]);
     expect(s.visits.map((v) => [v.externalId, v.phoneE164, v.visitDate])).toEqual([
       ["a1", e164(1), "2026-09-06"],
@@ -345,22 +414,23 @@ describe("a run's call budget", () => {
     const c = await clinic({ backfillDays: 30, ...checked({ appointments: true, guestDetails: false, guestPackages: false, salesAccrual: false, salesReport: false }, "appointments") });
     z.appointments.push(appointment("b1", 4, "2026-09-12", "10:00", 1, "Hydrafacial"), appointment("b2", 4, "2026-09-26", "10:00", 1, "Hydrafacial"));
 
+    // 13 days of history, 18 recent and coming, and 46 further ahead are left.
     let r = await run(c.org, c.id, z, NOW, 2);
-    expect(r).toMatchObject({ calls: 2, done: false, error: null, left: ["31 days at Kondapur"] });
-    expect(r.summary).toMatch(/Left for next time: 31 days at Kondapur\. 2 of 2 calls to Zenoti used\.$/);
+    expect(r).toMatchObject({ calls: 2, done: false, error: null, left: ["77 days at Kondapur"] });
+    expect(r.summary).toMatch(/Left for next time: 77 days at Kondapur\. 2 of 2 calls to Zenoti used\.$/);
     expect(cursorOf((await stored(c.org)).integration)).toBe("2026-09-17");
 
     // A server error, and its retry, count against the budget too.
     z.failNext = 1;
     r = await run(c.org, c.id, z, later(1), 3);
-    expect(r).toMatchObject({ calls: 3, done: false, error: null, left: ["18 days at Kondapur"] });
+    expect(r).toMatchObject({ calls: 3, done: false, error: null, left: ["64 days at Kondapur"] });
     expect(cursorOf((await stored(c.org)).integration)).toBe("2026-09-30");
 
     r = await run(c.org, c.id, z, later(2));
-    expect(r).toMatchObject({ calls: 3, done: true, error: null, left: [] });
+    expect(r).toMatchObject({ calls: 3 + 7, done: true, error: null, left: [] });
     expect(cursorOf((await stored(c.org)).integration)).toBe("2026-10-03");
 
-    expect(spansAsked(z).map(([from]) => from)).toEqual(["2026-09-04", "2026-09-11", "2026-09-18", "2026-09-18", "2026-09-25", "2026-10-01", "2026-10-08", "2026-10-15"]);
+    expect(spansAsked(z).map(([from]) => from)).toEqual(["2026-09-04", "2026-09-11", "2026-09-18", "2026-09-18", "2026-09-25", "2026-10-01", "2026-10-08", "2026-10-15", ...FAR.map(([from]) => from)]);
     expect((await stored(c.org)).visits.map((v) => v.externalId)).toEqual(["b1", "b2"]);
   });
 
@@ -375,7 +445,7 @@ describe("a run's call budget", () => {
     };
 
     let r = await run(c.org, c.id, z, NOW);
-    expect(r).toMatchObject({ calls: 5, done: true });
+    expect(r).toMatchObject({ calls: 5 + 7, done: true });
     expect(await marks()).toEqual(["2026-10-03", "2026-09-20"]);
 
     await withTenant(c.org, (tx) => tx.update(integrations).set({ config: { ...access, backfillDays: 30 } }).where(eq(integrations.id, c.id)));
@@ -394,6 +464,7 @@ describe("a run's call budget", () => {
       ["2026-10-01", "2026-10-08"],
       ["2026-10-08", "2026-10-15"],
       ["2026-10-15", "2026-10-19"],
+      ...FAR,
       ["2026-09-13", "2026-09-20"],
       ["2026-09-06", "2026-09-13"],
       ["2026-09-04", "2026-09-06"],
@@ -546,6 +617,373 @@ describe("reading Zenoti through a sales report", () => {
     expect(s.integration.config.access).toMatchObject({ path: "sales_report", capabilities: { appointments: false, salesReport: true } });
     expect(s.bookings.map((b) => b.externalId)).toEqual(["old"]);
     expect(s.visits.map((v) => [v.externalId, v.guestRef, v.phoneE164, v.service, v.visitDate, v.sessionsTotal, v.doctor])).toEqual([["ii-1", "g5", null, "LHR Full Legs", "2026-09-30", 5, "Dr. Asha"]]);
+  });
+});
+
+
+describe("guests Zenoti no longer has, or no longer gives a number for", () => {
+  it("reads on past a guest merged away or deleted, and asks for them again only much later", async () => {
+    const z = fakeZenoti(["salesAccrual", "guestDetails", "guestPackages"]);
+    const c = await clinic({ backfillDays: 7, ...checked(may("salesAccrual", "guestDetails", "guestPackages"), "sales_accrual") });
+    z.accrual.push(sale("i1", "2026-10-02", 1, "s1", "Peel"), sale("i2", "2026-10-02", 2, "s1", "Peel"), sale("i3", "2026-10-02", 3, "s1", "Peel"), sale("i4", "2026-10-02", 4, "s1", "Peel"));
+    // g1 was merged into another guest (400, as the fixture's "Invalid guest"); g2 was deleted (404); g4's profile has no mobile.
+    z.answer = (r) => {
+      if (r.path.startsWith("/v1/guests/g1")) return { status: 400, body: {} };
+      if (r.path.startsWith("/v1/guests/g2")) return { status: 404, body: { message: "Guest not found" } };
+      return undefined;
+    };
+    z.guests.set("g3", profile(3, true, true));
+    z.guests.set("g4", { id: "g4", personal_info: { first_name: "Guest", last_name: "Number 4", mobile_phone: { country_code: 0, phone_code: 0, number: "" } } });
+    z.packages.set("g3", [{ user_package_id: "up-3", status: 1, package: { name: "Peel 4 Sessions" }, date: { end: "2027-01-01T00:00:00" }, services: [{ service_type_info: { service_category_type: 2, name: "Peel" }, total: 4, used: 1, balance: 3 }] }]);
+
+    const r = await run(c.org, c.id, z, NOW);
+    expect(r).toMatchObject({ error: null, done: true, guests: { read: 4, left: 0 }, packages: { guests: 4, rows: 1, left: 0 } });
+    const s = await stored(c.org);
+    expect(s.people.map((p) => [p.externalId, p.phoneE164, p.fetchedAt?.toISOString(), p.profileMisses, p.packagesFetchedAt?.toISOString()])).toEqual([
+      ["g1", null, NOW.toISOString(), 3, NOW.toISOString()],
+      ["g2", null, NOW.toISOString(), 3, NOW.toISOString()],
+      ["g3", e164(3), NOW.toISOString(), 0, NOW.toISOString()],
+      ["g4", null, NOW.toISOString(), 1, NOW.toISOString()],
+    ]);
+    expect(s.packages.map((p) => [p.guestRef, p.service])).toEqual([["g3", "Peel"]]);
+
+    // The next day only the guest with no number is asked for again; the ones Zenoti does not have wait a month.
+    z.seen.length = 0;
+    await run(c.org, c.id, z, later(25));
+    expect(z.asked("guestDetails").map((q) => q.path).filter((p) => !p.includes("00000000"))).toEqual(["/v1/guests/g4"]);
+    // Then a week, then a month.
+    z.seen.length = 0;
+    const r3 = await run(c.org, c.id, z, later(25 + 4 * 24));
+    expect(z.asked("guestDetails").map((q) => q.path).filter((p) => !p.includes("00000000"))).toEqual([]);
+    expect(r3.guests.left).toBe(0);
+    expect((await stored(c.org)).people.find((p) => p.externalId === "g4")?.profileMisses).toBe(2);
+  });
+
+  it("moves a guest's visits and bookings to the number they change to, and off one they remove", async () => {
+    const z = fakeZenoti(["appointments", "guestDetails"]);
+    const c = await clinic({ backfillDays: 30, ...checked(may("appointments", "guestDetails"), "appointments") });
+    z.appointments.push(appointment("m1", 5, "2026-09-20", "11:00", 1, "LHR Full Legs"));
+    z.guests.set("g5", profile(5, false, true));
+    await run(c.org, c.id, z, NOW);
+    let s = await stored(c.org);
+    expect(s.visits.map((v) => [v.externalId, v.phoneE164])).toEqual([["m1", e164(5)]]);
+
+    // A month on, their profile has a new number; their June visit is not read again, but moves with them.
+    z.guests.set("g5", { ...profile(5, false, true), personal_info: { first_name: "Guest", last_name: "Number 5", mobile_phone: { country_code: 95, number: mobile(6) } } });
+    let r = await run(c.org, c.id, z, later(24 * 31));
+    expect(r.visits.numbered).toBe(1);
+    s = await stored(c.org);
+    expect(s.people[0]!.phoneE164).toBe(e164(6));
+    expect(s.visits.map((v) => [v.externalId, v.phoneE164])).toEqual([["m1", e164(6)]]);
+    expect(s.bookings.map((b) => [b.externalId, b.phoneE164])).toEqual([["m1", e164(6)]]);
+    expect(s.plan.filter((p) => p.originId === s.visits[0]!.id).every((p) => p.phoneE164 === e164(6))).toBe(true);
+
+    // Then the front desk removes the number: nothing is planned on the old one.
+    z.guests.set("g5", { ...profile(5, false, true), personal_info: { first_name: "Guest", last_name: "Number 5", mobile_phone: { country_code: 95, number: "" } } });
+    r = await run(c.org, c.id, z, later(24 * 62));
+    s = await stored(c.org);
+    expect(s.people[0]!.phoneE164).toBeNull();
+    expect(s.visits.map((v) => [v.externalId, v.phoneE164])).toEqual([["m1", null]]);
+    expect(s.bookings.map((b) => b.phoneE164)).toEqual([null]);
+    expect(r.plan?.waitingForPhone).toBe(1);
+    expect(s.plan.filter((p) => p.originId === s.visits[0]!.id)).toEqual([]);
+  });
+});
+
+describe("visits read before their guest's number", () => {
+  it("are given the mobile a booking brings once appointments may be read, and fold into its visit", async () => {
+    const z = fakeZenoti(["salesReport"]);
+    const c = await clinic({ backfillDays: 7, ...checked(may("salesReport"), "sales_report") });
+    z.report.push(sold("r1", 1, "2026-09-30", "2026-09-30", "Hydrafacial"), sold("r2", 2, "2026-10-02", "2026-10-02", "Peel"));
+    let r = await run(c.org, c.id, z, NOW);
+    expect(r.plan?.waitingForPhone).toBe(2);
+
+    // Their Zenoti admin adds appointments; guest details stay refused. The next day's check moves to appointments.
+    z.allowed.add("appointments");
+    z.appointments.push(appointment("b1", 1, "2026-10-06", "11:00", 0, "Peel"), appointment("b2", 2, "2026-10-02", "15:00", 1, "Peel"));
+    r = await run(c.org, c.id, z, later(25));
+    expect(r).toMatchObject({ tested: true, path: "appointments" });
+    expect(r.visits).toMatchObject({ numbered: 2, merged: 1 });
+    expect(r.plan?.waitingForPhone).toBe(0);
+    const s = await stored(c.org);
+    // Guest 1's report visit has the number from their booking; guest 2's booking was the same visit as the report's.
+    expect(s.visits.map((v) => [v.externalId, v.phoneE164, v.service, v.visitDate])).toEqual([
+      ["r1", e164(1), "Hydrafacial", "2026-09-30"],
+      ["r2", e164(2), "Peel", "2026-10-02"],
+    ]);
+    expect(s.plan.some((p) => p.originId === s.visits[0]!.id && p.phoneE164 === e164(1))).toBe(true);
+  });
+
+  it("still have their guest's packages read when they folded into an uploaded visit", async () => {
+    const z = fakeZenoti(["appointments", "guestPackages"]);
+    const c = await clinic({ backfillDays: 7, ...checked(may("appointments", "guestPackages"), "appointments") });
+    // The clinic uploaded the day's visits before the sync ran.
+    const [up] = await withTenant(c.org, (tx) => tx.insert(visits).values({ tenantId: c.org, phoneE164: e164(4), service: "Hydrafacial", visitDate: "2026-10-02", source: "upload" }).returning());
+    z.appointments.push(appointment("u1", 4, "2026-10-02", "11:00", 1, "Hydrafacial"));
+    z.packages.set("g4", [{ user_package_id: "up-4", status: 1, package: { name: "Hydrafacial 6 sittings" }, date: { end: "2027-01-01T00:00:00" }, services: [{ service_type_info: { service_category_type: 2, name: "Hydrafacial" }, total: 6, used: 2, balance: 4 }] }]);
+
+    const r = await run(c.org, c.id, z, NOW);
+    expect(r.visits).toMatchObject({ added: 0, merged: 1 });
+    expect(z.asked("guestPackages").map((q) => q.path)).toEqual(["/v1/guests/g4/Packages"]);
+    const s = await stored(c.org);
+    expect(s.packages.map((p) => [p.guestRef, p.service, p.balance, p.phoneE164])).toEqual([["g4", "Hydrafacial", 4, e164(4)]]);
+    expect(s.visits).toHaveLength(1);
+    expect(s.visits[0]).toMatchObject({ id: up!.id, sessionsTotal: 6, sessionsDone: 2 });
+    expect(s.plan.some((p) => p.originId === up!.id && p.journey === "next_session")).toBe(true);
+  });
+
+  it("reads a package for a whole category against the visits' categories", async () => {
+    const z = fakeZenoti(["appointments", "guestPackages"]);
+    const c = await clinic({ backfillDays: 7, ...checked(may("appointments", "guestPackages"), "appointments") });
+    const a = appointment("k1", 3, "2026-10-02", "11:00", 1, "LHR Full Legs");
+    z.appointments.push({ ...a, service: { ...a.service, category: { name: "Laser" }, sub_category: { name: "Hair Reduction" } } });
+    z.packages.set("g3", [
+      {
+        user_package_id: "up-3",
+        status: 1,
+        package: { name: "Any Hair Reduction, 6 Sessions" },
+        date: { end: "2027-01-01T00:00:00" },
+        services: [{ service_type_info: { service_category_type: 1, name: "Hair Reduction" }, total: 6, used: 2, balance: 4 }],
+      },
+    ]);
+    await run(c.org, c.id, z, NOW);
+    const s = await stored(c.org);
+    expect(s.packages.map((p) => [p.service, p.covers, p.balance])).toEqual([["Hair Reduction", "category", 4]]);
+    expect(s.visits[0]).toMatchObject({ categories: ["Laser", "Hair Reduction"], sessionsTotal: 6, sessionsDone: 2 });
+    // Planned from the package, behind the feedback call on the visit.
+    expect(s.plan.find((p) => p.originId === s.visits[0]!.id && p.journey === "next_session")?.verdict).toBe("waiting");
+  });
+});
+
+describe("clinics with several centres", () => {
+  const GACHIBOWLI = "5b0c8a1e-2f43-4d7a-9a1b-6c3e2d1f0a99";
+  const JUBILEE = "9e7d6c5b-4a39-4281-8f0e-1d2c3b4a5e6f";
+  const HITEC = "1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d";
+  const centre = (id: string, name: string, code: string) => ({ id, name, code, phoneCode: "91" });
+  const named = (z: ReturnType<typeof fakeZenoti>) => z.asked("appointments").map((r) => r.query.get("center_id"));
+
+  it("sets aside a centre Zenoti keeps refusing, names it, and reads the others, their guests and their visits under the branch's name", async () => {
+    const z = fakeZenoti(["appointments", "guestDetails"]);
+    const centres = [centre(KONDAPUR, "Zennara Clinics - Kondapur", "ZNKD"), centre(GACHIBOWLI, "Zennara Gachibowli", "ZNGB"), centre(JUBILEE, "Zennara Jubilee Hills", "ZNJH")];
+    const c = await clinic({ backfillDays: 0, ...checked(may("appointments", "guestDetails"), "appointments", centres) });
+    z.answer = (r, e) => (e === "appointments" && r.query.get("center_id") === GACHIBOWLI ? { status: 400, body: {} } : undefined);
+    z.appointments.push(appointment("k1", 1, "2026-10-02", "11:00", 1, "Peel"), { ...appointment("j1", 2, "2026-10-02", "12:00", 1, "Peel"), center_id: JUBILEE });
+    z.guests.set("g1", profile(1, false, true));
+    z.guests.set("g2", profile(2, false, true));
+
+    let r = await run(c.org, c.id, z, NOW);
+    expect(r.error).toBe(
+      "At Zennara Gachibowli (ZNGB): Zenoti refused a request for appointments (HTTP 400). JENAI tries Zennara Gachibowli (ZNGB) again after 4 Oct 2026 at 12:30, and reads the other centres meanwhile.",
+    );
+    expect(r.guests.read).toBe(2);
+    expect(r.centres.map((x) => [x.name, x.spans, x.problem !== null])).toEqual([
+      ["Zennara Clinics - Kondapur", 3 + 7, false],
+      ["Zennara Gachibowli", 0, true],
+      ["Zennara Jubilee Hills", 3 + 7, false],
+    ]);
+    let s = await stored(c.org);
+    // Kondapur is the JENAI branch the centre is: its visits carry that name, as its bookings do in the plan.
+    expect(s.visits.map((v) => [v.externalId, v.branch, v.centreRef])).toEqual([
+      ["j1", "Zennara Jubilee Hills", JUBILEE],
+      ["k1", "Kondapur", KONDAPUR],
+    ]);
+
+    // Within the hour it is not asked again, and still named.
+    z.seen.length = 0;
+    r = await run(c.org, c.id, z, later(0.5));
+    expect(named(z)).toEqual([]);
+    expect(r.error).toMatch(/^At Zennara Gachibowli \(ZNGB\): .* JENAI tries Zennara Gachibowli \(ZNGB\) again after 4 Oct 2026 at 12:30\.$/);
+
+    // After it, it is; once Zenoti reads it again, it is no longer set aside.
+    z.answer = null;
+    z.seen.length = 0;
+    r = await run(c.org, c.id, z, later(2));
+    expect(named(z).filter((id) => id === GACHIBOWLI)).toHaveLength(3 + 7);
+    expect(r.error).toBeNull();
+    s = await stored(c.org);
+    expect((s.integration.pullCursor.zenotiErrors as Record<string, unknown> | undefined) ?? {}).toEqual({});
+  });
+
+  it("takes a permission refused at one centre for that centre's, without checking the key again every run", async () => {
+    const z = fakeZenoti(["appointments"]);
+    const centres = [centre(KONDAPUR, "Kondapur", "ZNKD"), centre(GACHIBOWLI, "Zennara Gachibowli", "ZNGB")];
+    const c = await clinic({ backfillDays: 0, ...checked(may("appointments"), "appointments", centres) });
+    z.answer = (r, e) => (e === "appointments" && r.query.get("center_id") === GACHIBOWLI ? { status: 401, body: DENIED } : undefined);
+    let r = await run(c.org, c.id, z, NOW);
+    expect(r.tested).toBe(false);
+    expect(r.error).toBe(
+      "Zenoti does not let this key read appointments at Zennara Gachibowli (ZNGB), though it may at other centres. Ask your Zenoti admin to give the backend app made for JENAI access to that centre (in Zenoti: Configuration, then Apps under Integrations). JENAI tries Zennara Gachibowli (ZNGB) again after 5 Oct 2026 at 11:30, and reads the other centres meanwhile.",
+    );
+    expect(r.centres.find((x) => x.centreId === KONDAPUR)?.spans).toBe(3 + 7);
+    // Within the day it is not asked again.
+    z.seen.length = 0;
+    r = await run(c.org, c.id, z, later(2));
+    expect(named(z)).toEqual([KONDAPUR, KONDAPUR, KONDAPUR]);
+    expect(r.tested).toBe(false);
+  });
+
+  it("takes the centres in turns, least recently read first, and leaves guests a share of the calls", async () => {
+    const z = fakeZenoti(["appointments", "guestDetails"]);
+    const centres = [centre(KONDAPUR, "Kondapur", "ZNKD"), centre(GACHIBOWLI, "Gachibowli", "ZNGB"), centre(JUBILEE, "Jubilee Hills", "ZNJH"), centre(HITEC, "Hitec City", "ZNHC")];
+    const c = await clinic({ backfillDays: 0, ...checked(may("appointments", "guestDetails"), "appointments", centres) });
+    for (const n of [1, 2, 3, 4]) {
+      z.appointments.push(appointment(`k${n}`, n, "2026-10-02", "11:00", 0, "Peel"));
+      z.guests.set(`g${n}`, profile(n, false, true));
+    }
+    // 10 calls: services take 6, two centres' recent days; the other 4 read the guests' profiles.
+    let r = await run(c.org, c.id, z, NOW, 10);
+    expect(new Set(named(z))).toEqual(new Set([KONDAPUR, GACHIBOWLI]));
+    expect(r).toMatchObject({ calls: 10, guests: { read: 4 } });
+    expect(r.left).toEqual(expect.arrayContaining(["64 days at Jubilee Hills", "64 days at Hitec City"]));
+
+    // The centres not read go first next time.
+    z.seen.length = 0;
+    r = await run(c.org, c.id, z, later(2), 6);
+    expect(named(z)).toEqual([JUBILEE, JUBILEE, JUBILEE, HITEC, HITEC, HITEC]);
+    z.seen.length = 0;
+    await run(c.org, c.id, z, later(4), 6);
+    expect(named(z)).toEqual([KONDAPUR, KONDAPUR, KONDAPUR, GACHIBOWLI, GACHIBOWLI, GACHIBOWLI]);
+  });
+
+  it("goes by the centre's own time zone and country, so a late booking on a span's edge stays and a mobile gets its code", async () => {
+    const DUBAI = "d0bad0ba-1111-4222-8333-944455556666";
+    const z = fakeZenoti(["appointments"]);
+    const c = await clinic({ backfillDays: 0, ...checked(may("appointments"), "appointments", [{ id: DUBAI, name: "Dubai Marina", code: "DXB", phoneCode: "971", timeZone: "Asia/Dubai" }]) });
+    // 23:00 in Dubai on 7 October is already 8 October in India, where the client is.
+    z.appointments.push({
+      ...appointment("x1", 1, "2026-10-07", "23:00", 0, "Peel"),
+      center_id: DUBAI,
+      start_time_utc: "2026-10-07T19:00:00",
+      guest: { id: "g-dxb", first_name: "Guest", last_name: "Dubai", mobile: { country_id: 0, number: "501234567" } },
+    });
+    await run(c.org, c.id, z, NOW);
+    const s = await stored(c.org);
+    expect(s.bookings.map((b) => [b.externalId, b.localDay, b.startsAt.toISOString(), b.phoneE164, b.branchId])).toEqual([["x1", "2026-10-07", "2026-10-07T19:00:00.000Z", "+971501234567", null]]);
+  });
+});
+
+describe("sales lines Zenoti no longer lists", () => {
+  it("removes a line voided or opened again when its days are read again, and keeps older days as they were", async () => {
+    const z = fakeZenoti(["salesAccrual"]);
+    const c = await clinic({ backfillDays: 10, ...checked(may("salesAccrual"), "sales_accrual") });
+    z.accrual.push(sale("v1", "2026-10-02", 1, "s1", "Peel"), sale("v2", "2026-10-01", 2, "s1", "Hydrafacial"), sale("v3", "2026-09-28", 3, "s1", "Peel"));
+    await run(c.org, c.id, z, NOW);
+    expect((await stored(c.org)).visits.map((v) => v.externalId)).toEqual(["v1:s1", "v2:s1", "v3:s1"]);
+
+    // v1's invoice is opened again, v2's voided; v3 is history, not read again.
+    z.accrual[0]!.status = "Open";
+    z.accrual.splice(1, 2);
+    const r = await run(c.org, c.id, z, later(2));
+    expect(r.visits.removed).toBe(2);
+    expect((await stored(c.org)).visits.map((v) => v.externalId)).toEqual(["v3:s1"]);
+  });
+
+  it("removes a line from the older report only when its service and sale both fall in the days read again", async () => {
+    const z = fakeZenoti(["salesReport"]);
+    const c = await clinic({ backfillDays: 7, ...checked(may("salesReport"), "sales_report") });
+    // r1 was serviced on 30 September and invoiced the day after.
+    z.report.push(sold("r1", 1, "2026-09-30", "2026-10-01", "Peel"), sold("r2", 2, "2026-10-02", "2026-10-02", "Peel"));
+    await run(c.org, c.id, z, NOW);
+    expect((await stored(c.org)).visits.map((v) => [v.externalId, v.visitDate, v.listedOn])).toEqual([
+      ["r1", "2026-09-30", "2026-10-01"],
+      ["r2", "2026-10-02", "2026-10-02"],
+    ]);
+    z.report.length = 0;
+    const r = await run(c.org, c.id, z, later(2));
+    expect(r.visits.removed).toBe(1);
+    expect((await stored(c.org)).visits.map((v) => v.externalId)).toEqual(["r1"]);
+  });
+});
+
+describe("long reports", () => {
+  it("carries on a span of the accrual report from the page it stopped at, at Zenoti's own page size", async () => {
+    const z = fakeZenoti(["salesAccrual"]);
+    const c = await clinic({ backfillDays: 0, reportPageSize: 2, ...checked(may("salesAccrual"), "sales_accrual") });
+    for (const n of [1, 2, 3, 4, 5]) z.accrual.push(sale(`p${n}`, "2026-10-02", n, "s1", "Peel"));
+    const pages = () => z.asked("salesAccrual").map((q) => [q.query.get("Page"), q.query.get("Size")]);
+
+    let r = await run(c.org, c.id, z, NOW, 2);
+    expect(r).toMatchObject({ calls: 2, done: false });
+    expect((await stored(c.org)).integration.pullCursor.zenotiPage).toMatchObject({ [KONDAPUR]: { from: "2026-10-01", to: "2026-10-04", page: 3, seen: 4 } });
+    r = await run(c.org, c.id, z, later(0.5), 1);
+    expect(r).toMatchObject({ calls: 1, done: true });
+    expect(pages()).toEqual([
+      ["1", "2"],
+      ["2", "2"],
+      ["3", "2"],
+    ]);
+    const s = await stored(c.org);
+    expect(s.visits).toHaveLength(5);
+    expect(s.integration.pullCursor.zenotiPage).toEqual({});
+
+    // A Zenoti that gives at most 2 rows a page, whatever is asked: every row is still read.
+    const capped = fakeZenoti(["salesAccrual"]);
+    const d = await clinic({ backfillDays: 0, reportPageSize: 4, ...checked(may("salesAccrual"), "sales_accrual") });
+    for (const n of [1, 2, 3, 4, 5]) capped.accrual.push(sale(`q${n}`, "2026-10-02", n, "s1", "Peel"));
+    capped.answer = (q, e) => {
+      if (e !== "salesAccrual") return undefined;
+      const [page, size] = [Number(q.query.get("Page")), Math.min(2, Number(q.query.get("Size")))];
+      return { status: 200, body: { sales: capped.accrual.slice((page - 1) * size, page * size), page_info: { total: capped.accrual.length, page, size } } };
+    };
+    await run(d.org, d.id, capped, NOW);
+    expect(capped.asked("salesAccrual").map((q) => [q.query.get("Page"), q.query.get("Size")])).toEqual([
+      ["1", "4"],
+      ["2", "2"],
+      ["3", "2"],
+    ]);
+    expect((await stored(d.org)).visits).toHaveLength(5);
+  });
+
+  it("falls back to the older report when the accrual report says the key cannot access it", async () => {
+    const z = fakeZenoti(["salesReport"]);
+    const c = await clinic({ backfillDays: 7, ...checked(may("salesAccrual", "salesReport"), "sales_accrual") });
+    z.answer = (_r, e) => (e === "salesAccrual" ? { status: 400, body: { code: 918, message: "cannot access" } } : undefined);
+    const r = await run(c.org, c.id, z, NOW);
+    expect(r).toMatchObject({ tested: true, path: "sales_report" });
+    expect(r.error).toBe("Zenoti does not let this key read the sales accrual report. Services done are read from Zenoti's older sales report instead.");
+    expect(r.calls).toBe(1 + 6 + 2);
+  });
+});
+
+describe("a busy Zenoti", () => {
+  it("stops a run before its hold on the connection runs out, however slowly Zenoti lets it in", async () => {
+    const z = fakeZenoti(["appointments"]);
+    const c = await clinic({ ...checked(may("appointments"), "appointments") });
+    // The clinic's other apps keep the organisation's minute spent: every call waits a minute.
+    z.headers = { "ratelimit-remaining": "0", "ratelimit-reset": "60" };
+    const r = await run(c.org, c.id, z, NOW, 400);
+    // The 15 minute lease, less 2 minutes to spare: 13 calls a minute apart.
+    expect(r).toMatchObject({ calls: 13, error: null, done: false });
+    expect(r.left[0]).toMatch(/days at Kondapur$/);
+    expect((await stored(c.org)).integration.pullLeaseUntil).toBeNull();
+  });
+
+  it("lets go only of its own hold on the connection", async () => {
+    const c = await clinic({});
+    const first = (await takePullLease(c.org, c.id))!;
+    // It outlived its lease, and another run took the connection.
+    await withTenant(c.org, (tx) => tx.update(integrations).set({ pullLeaseUntil: new Date(Date.now() - 1000) }).where(eq(integrations.id, c.id)));
+    const second = (await takePullLease(c.org, c.id))!;
+    await endPull(c.org, c.id, null, first.lease);
+    expect((await stored(c.org)).integration.pullLeaseUntil).toEqual(second.lease);
+    await endPull(c.org, c.id, null, second.lease);
+    expect((await stored(c.org)).integration.pullLeaseUntil).toBeNull();
+  });
+
+  it("waits as long as Zenoti asked when that is longer than a run waits", async () => {
+    const z = fakeZenoti(["appointments"]);
+    const c = await clinic({ backfillDays: 0, ...checked(may("appointments"), "appointments") });
+    z.answer = (_r, e) => (e === "appointments" ? { status: 429, body: {}, headers: { "retry-after": "600" } } : undefined);
+    let r = await run(c.org, c.id, z, NOW);
+    expect(r.calls).toBe(1);
+    expect(r.error).toBe("Zenoti asked JENAI to slow down while reading appointments. It asked JENAI to wait until 4 Oct 2026 at 11:40, so nothing more is read before then.");
+    z.answer = null;
+    z.seen.length = 0;
+    r = await run(c.org, c.id, z, later(0.05));
+    expect(r).toMatchObject({ calls: 0, error: null, left: ["everything, as Zenoti asked JENAI to wait until 4 Oct 2026 at 11:40"] });
+    expect(z.seen).toEqual([]);
+    r = await run(c.org, c.id, z, later(0.5));
+    expect(r.calls).toBeGreaterThan(0);
   });
 });
 
