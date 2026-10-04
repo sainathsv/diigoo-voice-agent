@@ -274,7 +274,7 @@ describe("importing a visit list", () => {
     await platformDb().delete(organizations).where(inArray(organizations.id, [org]));
   });
 
-  const stored = async () => (await withTenant(org, (tx) => tx.select().from(visits))).sort((a, b) => a.phoneE164.localeCompare(b.phoneE164));
+  const stored = async () => (await withTenant(org, (tx) => tx.select().from(visits))).sort((a, b) => (a.phoneE164 ?? "").localeCompare(b.phoneE164 ?? ""));
 
   it("stores each visit once, refuses what it cannot use, and logs nothing about anyone", async () => {
     const said = ["log", "info", "warn", "error", "debug"].map((m) => vi.spyOn(console, m as "log"));
@@ -308,7 +308,7 @@ describe("importing a visit list", () => {
     expect(of(ANITHA)).toMatchObject({ name: "Anitha Reddy", source: "call" });
     expect(of(RAVI)).toMatchObject({ name: "Ravi", source: "call" });
     expect(of(SITA)).toMatchObject({ name: "Sita, K", source: "visit_list", branchId: kondapur });
-    for (const x of await stored()) expect(x.contactId).toBe(of(x.phoneE164).id);
+    for (const x of await stored()) expect(x.contactId).toBe(of(x.phoneE164!).id);
   });
 
   it("plans the feedback call and the result check for what they had", async () => {

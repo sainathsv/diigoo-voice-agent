@@ -952,7 +952,8 @@ export type ClientProgram = typeof clientPrograms.$inferSelect;
 // ---------------------------------------------------------------------------
 // Integrations (migration 0014): the client's own system stays the record of truth
 // ---------------------------------------------------------------------------
-export const integrationKind = pgEnum("integration_kind", ["webhook_out", "rest_generic", "zoho_crm", "salesforce", "hubspot", "leadsquared", "sap_odata", "google_sheets"]);
+/** zenoti (migration 0030): a clinic's or salon's front desk and billing, read only. */
+export const integrationKind = pgEnum("integration_kind", ["webhook_out", "rest_generic", "zoho_crm", "salesforce", "hubspot", "leadsquared", "sap_odata", "google_sheets", "zenoti"]);
 export const integrationStatus = pgEnum("integration_status", ["draft", "connected", "error", "paused"]);
 export type IntegrationKind = (typeof integrationKind.enumValues)[number];
 
@@ -1314,7 +1315,12 @@ export const visits = pgTable(
     tenantId: uuid("tenant_id").notNull(),
     id: uuid("id").notNull().defaultRandom(),
     contactId: uuid("contact_id"),
-    phoneE164: text("phone_e164").notNull(),
+    /**
+     * Always there on an uploaded visit. Empty only on one read from a
+     * connected system whose number has not been read yet (guestRef says
+     * whose); the plan counts it and leaves it out until it arrives.
+     */
+    phoneE164: text("phone_e164"),
     name: text("name"),
     service: text("service").notNull(),
     /** A calendar day, "2026-10-03", with no time and no time zone to shift it. */
@@ -1328,6 +1334,10 @@ export const visits = pgTable(
     batch: text("batch"),
     createdAt: ts("created_at").notNull().defaultNow(),
     updatedAt: ts("updated_at").notNull().defaultNow(),
+    /** Read from a connected system (migration 0030): which one, their line on the invoice, and their person id. */
+    integrationId: uuid("integration_id"),
+    externalId: text("external_id"),
+    guestRef: text("guest_ref"),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
@@ -1394,3 +1404,85 @@ export const plannedCalls = pgTable(
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
 export type PlannedCall = typeof plannedCalls.$inferSelect;
+
+// ---------------------------------------------------------------- front desk systems (0030)
+/**
+ * A person in the client's front desk system (Zenoti's guest), as last read:
+ * how to reach them and whether they agreed to messages. Empty consent means
+ * their system did not say.
+ */
+export const externalPeople = pgTable(
+  "external_people",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    integrationId: uuid("integration_id").notNull(),
+    /** Their person id, which their visits, bookings and packages name as guestRef. */
+    externalId: text("external_id").notNull(),
+    phoneE164: text("phone_e164"),
+    name: text("name"),
+    marketingSmsConsent: boolean("marketing_sms_consent"),
+    transactionalSmsConsent: boolean("transactional_sms_consent"),
+    fetchedAt: ts("fetched_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type ExternalPerson = typeof externalPeople.$inferSelect;
+
+/** What a booking in their system came to. Anything their documentation does not explain is "unknown": neither booked nor done. */
+export const CLINIC_APPOINTMENT_STATUSES = ["booked", "confirmed", "checked_in", "completed", "no_show", "cancelled", "unknown"] as const;
+export type ClinicAppointmentStatus = (typeof CLINIC_APPOINTMENT_STATUSES)[number];
+
+/** A booking in the client's front desk system. Not appointments, which are the visits JENAI itself books. */
+export const clinicAppointments = pgTable(
+  "clinic_appointments",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    integrationId: uuid("integration_id").notNull(),
+    externalId: text("external_id").notNull(),
+    guestRef: text("guest_ref").notNull(),
+    phoneE164: text("phone_e164"),
+    name: text("name"),
+    service: text("service").notNull(),
+    category: text("category"),
+    startsAt: ts("starts_at").notNull(),
+    status: text("status").$type<ClinicAppointmentStatus>().notNull(),
+    doctor: text("doctor"),
+    /** Their centre id. */
+    centreRef: text("centre_ref"),
+    branchId: uuid("branch_id"),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type ClinicAppointment = typeof clinicAppointments.$inferSelect;
+
+export const PACKAGE_STATUSES = ["active", "frozen", "expired", "cancelled", "not_started", "unknown"] as const;
+export type PackageStatus = (typeof PACKAGE_STATUSES)[number];
+
+/** Sessions bought, used and left on one package, per service in it, as last read. Counts are as their system gives them. */
+export const packageBalances = pgTable(
+  "package_balances",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    id: uuid("id").notNull().defaultRandom(),
+    integrationId: uuid("integration_id").notNull(),
+    guestRef: text("guest_ref").notNull(),
+    phoneE164: text("phone_e164"),
+    /** Their package id. */
+    packageRef: text("package_ref"),
+    packageName: text("package_name").notNull(),
+    service: text("service").notNull(),
+    total: integer("total"),
+    used: integer("used"),
+    balance: integer("balance"),
+    status: text("status").$type<PackageStatus>().notNull(),
+    /** A calendar day, "2026-12-31". */
+    expiresOn: date("expires_on", { mode: "string" }),
+    fetchedAt: ts("fetched_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
+);
+export type PackageBalance = typeof packageBalances.$inferSelect;

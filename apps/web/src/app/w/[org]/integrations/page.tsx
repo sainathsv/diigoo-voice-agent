@@ -18,6 +18,7 @@ const KIND: Record<string, string> = {
   leadsquared: "LeadSquared",
   sap_odata: "SAP",
   google_sheets: "Google Sheets",
+  zenoti: "Zenoti",
 };
 
 export default async function IntegrationsPage({ params, searchParams }: { params: Promise<{ org: string }>; searchParams: Promise<{ ok?: string; error?: string; new_key?: string; add?: string }> }) {

@@ -776,9 +776,11 @@ export interface ReplanResult {
   removed: number;
   byVerdict: Record<PlannedCallVerdict, number>;
   byJourney: Partial<Record<PlanJourney, Partial<Record<PlannedCallVerdict, number>>>>;
+  /** Visits read from a connected system whose phone number has not been read yet: not planned until it is. */
+  waitingForPhone: number;
 }
 
-const CRM_NAMES: Record<string, string> = { zoho_crm: "Zoho", salesforce: "Salesforce", hubspot: "HubSpot", leadsquared: "LeadSquared", google_sheets: "their sheet" };
+const CRM_NAMES: Record<string, string> = { zoho_crm: "Zoho", salesforce: "Salesforce", hubspot: "HubSpot", leadsquared: "LeadSquared", google_sheets: "their sheet", zenoti: "Zenoti" };
 /** Rows per insert statement. */
 const CHUNK = 500;
 
@@ -787,7 +789,8 @@ const CHUNK = 500;
  * planned_calls: rows that still apply are updated in place (same id),
  * rows for records, visits or calls that no longer apply are removed.
  * Reads crm_records (not deleted), visits, do-not-call entries, the last
- * call with each number, plan settings and treatment rules.
+ * call with each number, plan settings and treatment rules. A visit still
+ * waiting for its phone number is counted, not planned.
  *
  * A preview only: never creates campaign targets, never dials, never writes
  * to the client's CRM.
@@ -824,9 +827,16 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
       return p;
     };
     for (const r of records) personFor(r.phoneE164 ?? `record:${r.id}`, r.phoneE164).records.push({ ...r, crm: crmOf.get(r.integrationId) ?? "their CRM" });
+    // A visit read from their system before its number: counted, and planned once the number arrives.
+    let waitingForPhone = 0;
     for (const v of taken) {
-      const p = personFor(v.phoneE164, v.phoneE164);
-      p.visits.push(v);
+      const phone = v.phoneE164;
+      if (!phone) {
+        waitingForPhone++;
+        continue;
+      }
+      const p = personFor(phone, phone);
+      p.visits.push({ ...v, phoneE164: phone });
       p.contactId ??= v.contactId;
     }
     for (const b of blocked) people.get(b.phone)?.suppressions!.push({ reason: b.reason, expiresAt: b.expiresAt });
@@ -877,6 +887,6 @@ export async function replanTenant(tenantId: string, opts: { now?: Date } = {}):
       const j = (byJourney[r.journey] ??= {});
       j[r.verdict] = (j[r.verdict] ?? 0) + 1;
     }
-    return { people: people.size, rows: list.length, removed: removed.length, byVerdict, byJourney };
+    return { people: people.size, rows: list.length, removed: removed.length, byVerdict, byJourney, waitingForPhone };
   });
 }

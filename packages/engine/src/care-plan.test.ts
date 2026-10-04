@@ -447,7 +447,7 @@ describe("replanning a client", () => {
 
   it("plans everyone, stores it, and gives the same rows when run again", async () => {
     const first = await replanTenant(org, { now: NOW });
-    expect(first).toMatchObject({ people: 7, removed: 0 });
+    expect(first).toMatchObject({ people: 7, removed: 0, waitingForPhone: 0 });
     expect(first.byJourney.new_enquiry).toEqual({ scheduled: 1, kept_out: 2 });
     expect(first.byJourney.appointment_reminder).toEqual({ scheduled: 1 });
     expect(first.byJourney.no_call).toEqual({ kept_out: 2 });
@@ -490,5 +490,20 @@ describe("replanning a client", () => {
       expect(await tx.select().from(calls)).toHaveLength(1);
     });
     expect(await withTenant(other, (tx) => tx.select().from(plannedCalls))).toHaveLength(1);
+  });
+
+  it("counts a visit still waiting for its phone number, and plans it once the number arrives", async () => {
+    const [v] = await withTenant(org, async (tx) => {
+      const [desk] = await tx.insert(integrations).values({ tenantId: org, kind: "zenoti", name: "Zenoti", direction: "in" }).returning();
+      return tx.insert(visits).values({ tenantId: org, integrationId: desk!.id, externalId: "line-1", guestRef: "guest-1", service: "Hydrafacial", visitDate: "2026-09-30", source: "api" }).returning();
+    });
+    const before = await replanTenant(org, { now: NOW });
+    expect(before.waitingForPhone).toBe(1);
+    expect((await stored()).some((r) => r.originId === v!.id)).toBe(false);
+
+    await withTenant(org, (tx) => tx.update(visits).set({ phoneE164: phone(8) }).where(eq(visits.id, v!.id)));
+    const after = await replanTenant(org, { now: NOW });
+    expect(after).toMatchObject({ waitingForPhone: 0, people: before.people + 1 });
+    expect((await stored()).find((r) => r.originId === v!.id && r.journey === "visit_feedback")).toMatchObject({ verdict: "scheduled", phoneE164: phone(8) });
   });
 });

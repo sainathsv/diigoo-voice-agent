@@ -192,6 +192,7 @@ const TENANT_TABLES = [
   "integrations", "integration_events", "external_links",
   // After integrations and contacts, which they point at.
   "crm_records", "visits", "treatment_rules", "call_plan_settings", "planned_calls",
+  "external_people", "clinic_appointments", "package_balances",
   "security_events", "security_alerts", "agent_safety_checks",
 ] as const;
 
