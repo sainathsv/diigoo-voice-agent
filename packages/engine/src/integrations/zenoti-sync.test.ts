@@ -12,7 +12,7 @@ import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { auditEvents, branches, clinicAppointments, externalPeople, integrations, organizations, packageBalances, plannedCalls, platformDb, visits, withTenant } from "@jenai/db";
 import { sealCredentials } from "./queue";
-import { syncZenoti } from "./zenoti-sync";
+import { errorWithoutValues, syncZenoti } from "./zenoti-sync";
 
 const KEY = "zen-test-key-not-real";
 const KONDAPUR = "80963e4e-6625-4b83-8b88-9708c0cb2303";
@@ -364,6 +364,47 @@ describe("a run's call budget", () => {
     expect((await stored(c.org)).visits.map((v) => v.externalId)).toEqual(["b1", "b2"]);
   });
 
+  it("reads the days a widened window adds, newest first, carrying on where a short run stopped", async () => {
+    const z = fakeZenoti(["appointments"]);
+    const access = checked({ appointments: true, guestDetails: false, guestPackages: false, salesAccrual: false, salesReport: false }, "appointments");
+    const c = await clinic({ backfillDays: 14, ...access });
+    z.appointments.push(appointment("w0", 6, "2026-08-20", "10:00", 1, "Hydrafacial"), appointment("w1", 6, "2026-09-08", "10:00", 1, "Hydrafacial"), appointment("w2", 6, "2026-09-22", "10:00", 1, "Peel"));
+    const marks = async () => {
+      const i = (await stored(c.org)).integration;
+      return [cursorOf(i), (i.pullCursor.zenotiFrom as Record<string, string> | undefined)?.[KONDAPUR]];
+    };
+
+    let r = await run(c.org, c.id, z, NOW);
+    expect(r).toMatchObject({ calls: 5, done: true });
+    expect(await marks()).toEqual(["2026-10-03", "2026-09-20"]);
+
+    await withTenant(c.org, (tx) => tx.update(integrations).set({ config: { ...access, backfillDays: 30 } }).where(eq(integrations.id, c.id)));
+    r = await run(c.org, c.id, z, later(1), 1);
+    // Nine days of the widening still to read, and the recent days, not read this run.
+    expect(r).toMatchObject({ calls: 1, done: false, left: ["27 days at Kondapur"] });
+    expect(r.centres[0]).toMatchObject({ cursor: "2026-10-03", from: "2026-09-13" });
+    expect(await marks()).toEqual(["2026-10-03", "2026-09-13"]);
+
+    r = await run(c.org, c.id, z, later(2));
+    expect(r).toMatchObject({ calls: 5, done: true, left: [] });
+    expect(await marks()).toEqual(["2026-10-03", "2026-09-04"]);
+    expect(spansAsked(z)).toEqual([
+      ["2026-09-20", "2026-09-27"],
+      ["2026-09-27", "2026-10-01"],
+      ["2026-10-01", "2026-10-08"],
+      ["2026-10-08", "2026-10-15"],
+      ["2026-10-15", "2026-10-19"],
+      ["2026-09-13", "2026-09-20"],
+      ["2026-09-06", "2026-09-13"],
+      ["2026-09-04", "2026-09-06"],
+      ["2026-10-01", "2026-10-08"],
+      ["2026-10-08", "2026-10-15"],
+      ["2026-10-15", "2026-10-19"],
+    ]);
+    // Older than even the widened window: never asked for.
+    expect((await stored(c.org)).visits.map((v) => v.externalId)).toEqual(["w1", "w2"]);
+  });
+
   it("reads nothing when the budget cannot even cover a check of what the key may read", async () => {
     const z = fakeZenoti(["appointments"]);
     const c = await clinic({});
@@ -505,6 +546,22 @@ describe("reading Zenoti through a sales report", () => {
     expect(s.integration.config.access).toMatchObject({ path: "sales_report", capabilities: { appointments: false, salesReport: true } });
     expect(s.bookings.map((b) => b.externalId)).toEqual(["old"]);
     expect(s.visits.map((v) => [v.externalId, v.guestRef, v.phoneE164, v.service, v.visitDate, v.sessionsTotal, v.doctor])).toEqual([["ii-1", "g5", null, "LHR Full Legs", "2026-09-30", 5, "Dr. Asha"]]);
+  });
+});
+
+describe("what a run that stopped says", () => {
+  it("never repeats the names and numbers a database error carries", async () => {
+    const c = await clinic({});
+    const e = await withTenant(c.org, (tx) =>
+      tx.insert(clinicAppointments).values({ tenantId: c.org, integrationId: c.id, externalId: "x", guestRef: "g9", phoneE164: e164(9), name: "Guest Number 9", service: "Peel", startsAt: NOW, status: "nonsense" as never }),
+    ).catch((x: unknown) => x);
+    // Drizzle's own message has the values in it.
+    expect((e as Error).message).toContain(e164(9));
+    const said = errorWithoutValues(e);
+    expect(said).toMatch(/^JENAI's database refused to store what was read \(Postgres error 23514, [a-z_0-9]+\)\.$/);
+    expect(said).not.toContain(e164(9));
+    expect(said).not.toContain("Guest Number 9");
+    expect(errorWithoutValues(new Error("Zenoti sent a day that does not exist."))).toBe("Zenoti sent a day that does not exist.");
   });
 });
 

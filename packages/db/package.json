@@ -21,6 +21,7 @@
     "tenant-db": "tsx src/scripts/tenant-db.ts",
     "client": "tsx src/scripts/client.ts",
     "zoho": "tsx src/scripts/zoho.ts",
+    "zenoti": "tsx src/scripts/zenoti.ts",
     "visits": "tsx src/scripts/visits.ts",
     "catalog": "tsx src/scripts/catalog.ts",
     "voice": "tsx src/scripts/voice.ts",

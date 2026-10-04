@@ -2,10 +2,10 @@ import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, or, sql } from "dri
 import { audit, branches, clinicAppointments, externalPeople, integrations, packageBalances, visits, withTenant, type Integration, type Tx } from "@jenai/db";
 import { replanTenant, type ReplanResult } from "../care-plan";
 import { localParts, zoned } from "../dialer/time";
-import { branchMatcher } from "../visits-import";
 import { endPull, takePullLease } from "./crm-sync";
-import { credentialsOf, sealCredentials } from "./queue";
+import { credentialsOf } from "./queue";
 import type { ConnectorContext } from "./types";
+import { zenotiBranchMap, zenotiSaver } from "./zenoti-connect";
 import {
   ZenotiBudgetSpent,
   ZenotiClient,
@@ -46,7 +46,10 @@ import {
  *     day or when Zenoti refuses the way services done are read;
  *  2. per centre, the days not yet read, back to config.backfillDays (120
  *     unless said), seven at a time, oldest first. pull_cursor.zenoti[centre
- *     id] is the last day fully stored, moved in the transaction that stores it;
+ *     id] is the last day fully stored, moved in the transaction that stores
+ *     it, and pull_cursor.zenotiFrom[centre id] the first. When backfillDays
+ *     is widened later, the days before the first are read too, newest
+ *     first, so what is stored stays one unbroken run of days;
  *  3. per centre, the last three days and today again, and on the
  *     appointments path the next fourteen days, because bookings and
  *     statuses change after the fact;
@@ -66,8 +69,10 @@ import {
 
 /** Calls to Zenoti one run makes at most when the caller does not say. */
 export const ZENOTI_SYNC_CALLS = 30;
-const DEFAULT_BACKFILL_DAYS = 120;
-const MAX_BACKFILL_DAYS = 365;
+/** Days of history read back when the connection does not say (config.backfillDays). */
+export const ZENOTI_DEFAULT_BACKFILL_DAYS = 120;
+/** The furthest back a connection reads. */
+export const ZENOTI_MAX_BACKFILL_DAYS = 365;
 /** Zenoti's appointments and older sales report take at most seven days a request. */
 const SPAN_DAYS = 7;
 /** Days before today read again every run: a visit is closed, a no-show marked, a day or two late. */
@@ -106,6 +111,8 @@ export interface ZenotiCentreSync {
   branchId: string | null;
   /** The last day fully stored. */
   cursor: string | null;
+  /** The first day stored: every day from it to the cursor is. */
+  from: string | null;
   /** Spans of up to seven days read this run. */
   spans: number;
   /** Days still to read, history and the recent days together. */
@@ -183,14 +190,14 @@ export async function syncZenoti(tenantId: string, integrationId: string, opts: 
     await run.go();
     await run.account();
   } catch (e) {
-    run.problems.push(`Reading Zenoti stopped: ${(e as Error).message}`.slice(0, 300));
+    run.problems.push(`Reading Zenoti stopped: ${errorWithoutValues(e)}`.slice(0, 300));
   } finally {
     result.calls = budget.used;
     result.path = run.path;
     try {
       result.plan = await replanTenant(tenantId, { now });
     } catch (e) {
-      run.problems.push(`The call plan could not be made again: ${(e as Error).message}`.slice(0, 300));
+      run.problems.push(`The call plan could not be made again: ${errorWithoutValues(e)}`.slice(0, 300));
     }
     result.left = run.left;
     result.error = run.problems.length ? run.problems.join(" ").slice(0, 1000) : null;
@@ -234,16 +241,22 @@ interface CentreState {
   branchId: string | null;
   timeZone: string;
   cursor: string | null;
+  /** The first day stored. */
+  from: string | null;
   /** The last of the recent days read this run. */
   recentThrough: string | null;
   out: ZenotiCentreSync;
 }
 
-/** Days from `from` to `to`, both included. `moves` is where the cursor goes once they are stored. */
+/**
+ * Days from `from` to `to`, both included. Once they are stored, the cursor
+ * (the last day stored) goes to `moves` and the first day stored to `starts`.
+ */
 interface Span {
   from: string;
   to: string;
   moves: string | null;
+  starts: string | null;
   recent: boolean;
 }
 
@@ -312,22 +325,13 @@ class Run {
     } else if (e instanceof ZenotiError) {
       this.problems.push(e.retryLater ? `${e.message} JENAI tries again next time.` : e.message);
     } else {
-      this.problems.push(`Reading Zenoti stopped: ${(e as Error).message}`.slice(0, 300));
+      this.problems.push(`Reading Zenoti stopped: ${errorWithoutValues(e)}`.slice(0, 300));
     }
   }
 
   /** Keeps what the run learnt on the connection, merged into what is there, so nothing saved meanwhile is lost. */
   async save(patch: { credentials?: Record<string, string>; config?: Record<string, unknown> }): Promise<void> {
-    await withTenant(this.tenantId, (tx) =>
-      tx
-        .update(integrations)
-        .set({
-          ...(patch.credentials ? { credentials: sealCredentials(this.tenantId, patch.credentials) } : {}),
-          ...(patch.config ? { config: sql`${integrations.config} || ${JSON.stringify(patch.config)}::jsonb` } : {}),
-          updatedAt: new Date(),
-        })
-        .where(eq(integrations.id, this.i.id)),
-    );
+    await zenotiSaver(this.tenantId, this.i.id)(patch);
     if (patch.config) {
       this.config = { ...this.config, ...patch.config };
       this.access = accessOf(this.config);
@@ -377,8 +381,9 @@ class Run {
     const places = await this.places(centres);
     this.states = centres.map((c) => {
       const p = places.get(c.id)!;
-      const cursor = cursorOf(this.i, c.id);
-      return { c, ...p, cursor, recentThrough: null, out: { centreId: c.id, name: c.name, branchId: p.branchId, cursor, spans: 0, daysLeft: 0 } };
+      const cursor = markOf(this.i, "zenoti", c.id);
+      const from = markOf(this.i, "zenotiFrom", c.id);
+      return { c, ...p, cursor, from, recentThrough: null, out: { centreId: c.id, name: c.name, branchId: p.branchId, cursor, from, spans: 0, daysLeft: 0 } };
     });
     this.r.centres = this.states.map((s) => s.out);
     if (this.path !== "appointments") await this.dropFutureBookings();
@@ -421,13 +426,8 @@ class Run {
    */
   private async places(centres: ZenotiCentre[]): Promise<Map<string, { branchId: string | null; timeZone: string }>> {
     const list = await withTenant(this.tenantId, (tx) => tx.select({ id: branches.id, name: branches.name, code: branches.code, timezone: branches.timezone }).from(branches));
-    const match = branchMatcher(list);
     const had = obj(this.config.branchMap);
-    const map: Record<string, string | null> = { ...(had as Record<string, string | null>) };
-    for (const c of centres) {
-      const kept = typeof had[c.id] === "string" && list.some((b) => b.id === had[c.id]) ? (had[c.id] as string) : null;
-      map[c.id] = kept ?? match(c.name) ?? match(c.code) ?? null;
-    }
+    const map = zenotiBranchMap(centres, list, had);
     if (JSON.stringify(map) !== JSON.stringify(had)) await this.save({ config: { branchMap: map } });
     return new Map(centres.map((c) => [c.id, { branchId: map[c.id] ?? null, timeZone: list.find((b) => b.id === map[c.id])?.timezone ?? this.timeZone }]));
   }
@@ -447,16 +447,31 @@ class Run {
     this.r.bookings.removed += gone.length;
   }
 
-  /** The days one centre still has to read: history from the cursor, oldest first, then the recent days. */
+  /**
+   * The days one centre still has to read: any days the window was widened
+   * by, newest first; history from the cursor, oldest first; then the recent days.
+   */
   private spans(s: CentreState): Span[] {
     const today = dayIn(this.now, s.timeZone);
     const recentFrom = addDays(today, -RECENT_DAYS);
-    const earliest = addDays(today, -backfillDaysOf(this.config));
-    const start = s.cursor && s.cursor >= earliest ? addDays(s.cursor, 1) : earliest;
-    const out: Span[] = split(start, addDays(recentFrom, -1)).map((w) => ({ ...w, moves: w.to, recent: false }));
+    const earliest = addDays(today, -zenotiBackfillDays(this.config));
+    // Carrying on from the cursor, or starting again when there is none or it fell out of the window.
+    const carryOn = !!s.cursor && s.cursor >= earliest;
+    const out: Span[] = [];
+    if (carryOn && s.from && earliest < s.from) {
+      // Newest first, so each span stored joins on to what is stored already.
+      for (const w of splitBack(earliest, addDays(s.from, -1))) out.push({ ...w, moves: null, starts: w.from, recent: false });
+    }
+    const start = carryOn ? addDays(s.cursor!, 1) : earliest;
+    for (const w of split(start, addDays(recentFrom, -1))) out.push({ ...w, moves: w.to, starts: null, recent: false });
     const until = this.path === "appointments" ? addDays(today, AHEAD_DAYS) : today;
     // Once the recent days through yesterday are stored too, every day before today is.
-    split(recentFrom, until).forEach((w, n) => out.push({ ...w, moves: n === 0 ? addDays(today, -1) : null, recent: true }));
+    split(recentFrom, until).forEach((w, n) => out.push({ ...w, moves: n === 0 ? addDays(today, -1) : null, starts: null, recent: true }));
+    if (!carryOn) {
+      // Starting again: the first span stored is where the stored days begin.
+      const first = out.find((w) => w.moves);
+      if (first) first.starts = first.from;
+    }
     return out;
   }
 
@@ -490,17 +505,23 @@ class Run {
         });
       }
       if (w.moves && w.moves > (s.cursor ?? "")) s.cursor = s.out.cursor = w.moves;
+      if (w.starts) s.from = s.out.from = w.starts;
       if (w.recent) s.recentThrough = w.to;
       s.out.spans++;
     }
   }
 
   private async moveCursor(tx: Tx, s: CentreState, w: Span): Promise<void> {
-    if (!w.moves || w.moves <= (s.cursor ?? "")) return;
+    if (w.moves && w.moves > (s.cursor ?? "")) await this.mark(tx, "zenoti", s.c.id, w.moves);
+    if (w.starts) await this.mark(tx, "zenotiFrom", s.c.id, w.starts);
+  }
+
+  /** Sets pull_cursor[key][centre id] to a day, leaving every other centre's and key's as it is. */
+  private async mark(tx: Tx, key: Mark, centreId: string, day: string): Promise<void> {
     await tx
       .update(integrations)
       .set({
-        pullCursor: sql`${integrations.pullCursor} || jsonb_build_object('zenoti', coalesce(${integrations.pullCursor} -> 'zenoti', '{}'::jsonb) || jsonb_build_object(${s.c.id}::text, ${w.moves}::text))`,
+        pullCursor: sql`${integrations.pullCursor} || jsonb_build_object(${key}::text, coalesce(${integrations.pullCursor} -> ${key}::text, '{}'::jsonb) || jsonb_build_object(${centreId}::text, ${day}::text))`,
       })
       .where(eq(integrations.id, this.i.id));
   }
@@ -1039,14 +1060,18 @@ function centresOf(config: Record<string, unknown>): ZenotiCentre[] {
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
-function cursorOf(i: Integration, centreId: string): string | null {
-  const c = obj(obj(i.pullCursor).zenoti)[centreId];
+/** pull_cursor.zenoti holds each centre's last day stored, pull_cursor.zenotiFrom its first. */
+type Mark = "zenoti" | "zenotiFrom";
+
+function markOf(i: Integration, key: Mark, centreId: string): string | null {
+  const c = obj(obj(i.pullCursor)[key])[centreId];
   return typeof c === "string" && DAY.test(c) ? c : null;
 }
 
-function backfillDaysOf(config: Record<string, unknown>): number {
-  const n = Math.floor(Number(config.backfillDays ?? DEFAULT_BACKFILL_DAYS));
-  return Number.isFinite(n) && n >= 0 ? Math.min(n, MAX_BACKFILL_DAYS) : DEFAULT_BACKFILL_DAYS;
+/** How many days back a connection reads, as its config says, within the limits. */
+export function zenotiBackfillDays(config: Record<string, unknown>): number {
+  const n = Math.floor(Number(config.backfillDays ?? ZENOTI_DEFAULT_BACKFILL_DAYS));
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, ZENOTI_MAX_BACKFILL_DAYS) : ZENOTI_DEFAULT_BACKFILL_DAYS;
 }
 
 function pageSizeOf(config: Record<string, unknown>): number {
@@ -1070,6 +1095,16 @@ function startOfDay(day: string, tz: string): Date {
   return zoned(y!, m!, d!, 0, tz);
 }
 
+/** `from` to `to`, both included, in spans of at most seven days, newest first. Empty when `to` is before `from`. */
+function splitBack(from: string, to: string): Array<{ from: string; to: string }> {
+  const out: Array<{ from: string; to: string }> = [];
+  for (let end = to; end >= from; end = addDays(end, -SPAN_DAYS)) {
+    const start = addDays(end, -(SPAN_DAYS - 1));
+    out.push({ from: start > from ? start : from, to: end });
+  }
+  return out;
+}
+
 /** `from` to `to`, both included, in spans of at most seven days. Empty when `to` is before `from`. */
 function split(from: string, to: string): Array<{ from: string; to: string }> {
   const out: Array<{ from: string; to: string }> = [];
@@ -1081,6 +1116,23 @@ function split(from: string, to: string): Array<{ from: string; to: string }> {
 }
 
 // ---------------------------------------------------------------- small things
+
+/**
+ * An unexpected error in words safe to store in last_pull_error and to show.
+ * A database error must not be shown as it is: Drizzle puts the statement's
+ * values in its message, and here those are guests' names and numbers. So
+ * only Postgres's error code and the constraint it names are kept.
+ */
+export function errorWithoutValues(e: unknown): string {
+  const o = obj(e);
+  const pg = "query" in o && "params" in o ? obj(o.cause) : o;
+  if (typeof pg.code === "string" && /^[0-9A-Z]{5}$/.test(pg.code) && ("severity" in pg || pg !== o)) {
+    const constraint = typeof pg.constraint_name === "string" ? `, ${pg.constraint_name}` : "";
+    return `JENAI's database refused to store what was read (Postgres error ${pg.code}${constraint}).`;
+  }
+  if ("query" in o && "params" in o) return "JENAI's database refused to store what was read.";
+  return e instanceof Error ? e.message : String(e);
+}
 
 const obj = (v: unknown): Record<string, unknown> => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
 
