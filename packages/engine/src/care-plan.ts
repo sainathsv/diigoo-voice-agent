@@ -91,13 +91,14 @@ const BOOKING_JOURNEYS = new Set<PlanJourney>(["callback_due", "new_enquiry", "n
  */
 const ENQUIRY_JOURNEYS = new Set<PlanJourney>(["callback_due", "new_enquiry", "no_show_rebook", "cancelled_rebook"]);
 
-/** The variables each program's script fills in (packages/db/seed-data/programs). */
-const PROGRAM_VARIABLES: Record<string, readonly string[]> = {
+/** The variables each program's script fills in (packages/db/seed-data/programs); program-files.test.ts keeps the two in line. */
+export const PROGRAM_VARIABLES: Record<string, readonly string[]> = {
   "clinic.warm_followup": ["caller_name", "enquiry_about", "enquiry_date", "enquiry_source", "branch"],
   "clinic.appointment_reminder": ["caller_name", "appointment_date", "appointment_time", "doctor", "branch"],
   "clinic.prescription_followup": ["caller_name", "visit_date", "treatment", "doctor", "review_due"],
   "clinic.feedback": ["caller_name", "visit_date", "doctor", "branch"],
   "clinic.revisit_recall": ["caller_name", "treatment", "last_visit", "doctor"],
+  "clinic.course_checkin": ["caller_name", "treatment", "last_visit", "sitting_number", "sessions_left", "next_due", "doctor", "branch"],
 };
 
 /**
@@ -110,6 +111,7 @@ export const PROGRAM_PURPOSE: Record<string, Purpose> = {
   "clinic.feedback": "service",
   "clinic.warm_followup": "service",
   "clinic.revisit_recall": "service",
+  "clinic.course_checkin": "service",
 };
 /** The purpose a row's calls would have; a row that is never called counts as service. */
 export const purposeOf = (programKey: string): Purpose => PROGRAM_PURPOSE[programKey] ?? "service";
