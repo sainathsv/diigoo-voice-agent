@@ -982,6 +982,10 @@ export const integrations = pgTable(
     pullCursor: jsonb("pull_cursor").$type<Record<string, unknown>>().notNull().default({}),
     lastPullAt: ts("last_pull_at"),
     lastPullError: text("last_pull_error"),
+    /** What the last read passed over or noticed, in plain words (migration 0027). */
+    lastPullNotes: jsonb("last_pull_notes").$type<string[]>().notNull().default([]),
+    /** Reads that failed in a row; the next read waits longer after each. */
+    pullFailures: integer("pull_failures").notNull().default(0),
   },
   (t) => [primaryKey({ columns: [t.tenantId, t.id] })],
 );
@@ -1297,8 +1301,12 @@ export const crmRecords = pgTable(
     createdExt: ts("created_ext"),
     modifiedExt: ts("modified_ext"),
     appointmentAt: ts("appointment_at"),
+    /** False when their field held a date only, so there is no time of day to remind them of. Empty on rows read before 0027. */
+    appointmentHasTime: boolean("appointment_has_time"),
     /** Their follow-up field, or a callback date read from their notes. */
     followUpAt: ts("follow_up_at"),
+    /** Their notes say not to call this person. Only this flag is kept, never the notes. */
+    notesSayDoNotCall: boolean("notes_say_do_not_call").notNull().default(false),
     treatment: text("treatment"),
     consultant: text("consultant"),
     deletedAt: ts("deleted_at"),
@@ -1369,11 +1377,20 @@ export const treatmentRules = pgTable(
 );
 export type TreatmentRule = typeof treatmentRules.$inferSelect;
 
-/** One client's choices for the plan. Keys left out take the defaults in code. */
+/**
+ * One client's choices for the plan (keys left out take the defaults in code),
+ * its switch, and its clock: when it was last worked out, when next, and
+ * which worker holds it meanwhile (migration 0027).
+ */
 export const callPlanSettings = pgTable("call_plan_settings", {
   tenantId: uuid("tenant_id").primaryKey(),
   settings: jsonb("settings").$type<Record<string, unknown>>().notNull().default({}),
   updatedAt: ts("updated_at").notNull().defaultNow(),
+  /** The client switched the plan on: their CRM is read on a timer. */
+  enabled: boolean("enabled").notNull().default(false),
+  computedAt: ts("computed_at"),
+  nextReplanAt: ts("next_replan_at"),
+  replanLeaseUntil: ts("replan_lease_until"),
 });
 
 export const PLANNED_CALL_VERDICTS = ["call_now", "scheduled", "waiting", "kept_out"] as const;

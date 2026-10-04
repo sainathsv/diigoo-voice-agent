@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { assertClientUrl, toE164 } from "@jenai/voice";
-import { zoned } from "../dialer/time";
+import { localParts, zoned } from "../dialer/time";
 import {
   CALL_DETAIL,
   HEALTH_DETAIL,
@@ -216,10 +217,13 @@ const GRANT_GONE = new Set(["invalid_code", "invalid_client", "invalid_client_se
 class GrantGoneError extends Error {}
 
 /**
- * Refreshes under way, per connection. The pull and the write-backs share one
- * refresh token, and Zoho keeps only the newest 15 access tokens per refresh
- * token and limits how fast new ones are made, so callers that find the token
- * stale at the same moment wait for one refresh instead of each making their own.
+ * Token exchanges under way, per connection. The pull and the write-backs
+ * share one refresh token, and Zoho keeps only the newest 10 access tokens per
+ * refresh token and allows 10 token requests per 10 minutes (accounts token
+ * limits), so callers that find the token stale at the same moment wait for
+ * one exchange instead of each making their own. Only the exchange is shared:
+ * each caller stores the token itself, in its own transaction, so a caller
+ * holding the connection's row never waits on another caller's write to it.
  */
 const refreshing = new Map<string, Promise<{ token: string; until: string }>>();
 
@@ -231,16 +235,18 @@ async function accessToken(ctx: ConnectorContext, fresh = false): Promise<string
   const key = `${ctx.integration.tenantId}:${ctx.integration.id}`;
   let flight = refreshing.get(key);
   if (!flight) {
-    flight = refresh(ctx).finally(() => refreshing.delete(key));
+    flight = exchange(ctx).finally(() => refreshing.delete(key));
     refreshing.set(key, flight);
   }
   const t = await flight;
   ctx.credentials.access_token = t.token;
   ctx.credentials.access_token_until = t.until;
+  await ctx.save({ credentials: { ...ctx.credentials } });
   return t.token;
 }
 
-async function refresh(ctx: ConnectorContext): Promise<{ token: string; until: string }> {
+/** One refresh-token exchange with Zoho's accounts server. Stores nothing. */
+async function exchange(ctx: ConnectorContext): Promise<{ token: string; until: string }> {
   const dc = dcOf(ctx);
   const url = `${ACCOUNTS[dc] ?? ACCOUNTS.in}/oauth/v2/token`;
   await assertClientUrl(url);
@@ -250,16 +256,18 @@ async function refresh(ctx: ConnectorContext): Promise<{ token: string; until: s
     client_secret: ctx.credentials.client_secret ?? "",
     grant_type: "refresh_token",
   });
-  const res = await ctx.fetch(url, { method: "POST", body, headers: { "Content-Type": "application/x-www-form-urlencoded" }, redirect: "error" });
+  // A hung accounts server would otherwise hold every caller of this connection for minutes.
+  const res = await ctx.fetch(url, { method: "POST", body, headers: { "Content-Type": "application/x-www-form-urlencoded" }, redirect: "error", signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS) });
   const j = (await res.json().catch(() => ({}))) as Token;
   if (!j.access_token) {
     const why = `Zoho refused the refresh token: ${j.error ?? res.status}`;
     throw GRANT_GONE.has(j.error ?? "") ? new GrantGoneError(`${why}. Reconnect Zoho.`) : new Error(why);
   }
-  const until = String(Date.now() + (j.expires_in ?? 3600) * 1000);
-  await ctx.save({ credentials: { ...ctx.credentials, access_token: j.access_token, access_token_until: until } });
-  return { token: j.access_token, until };
+  return { token: j.access_token, until: String(Date.now() + (j.expires_in ?? 3600) * 1000) };
 }
+
+/** How long a token exchange may take. */
+const TOKEN_TIMEOUT_MS = 30_000;
 
 interface Answer {
   status: number;
@@ -286,7 +294,7 @@ async function call(ctx: ConnectorContext, path: string, init: RequestInit = {},
   } catch {
     json = {};
   }
-  // Zoho keeps only the newest 15 access tokens per refresh token and drops
+  // Zoho keeps only the newest 10 access tokens per refresh token and drops
   // the oldest, so a cached one can die before its hour is up. One more try
   // with a new token, before a 401 is taken as the connection's.
   if (res.status === 401 && json.code === "INVALID_TOKEN" && !fresh) return call(ctx, path, init, true);
@@ -735,19 +743,43 @@ export const ZOHO_PULL_LABELS: Record<PullKey, string[]> = {
   consultant: ["Consultant Name", "Doctor"],
   centre: ["Select Your Centre", "Select Your Branch", "Centre", "Branch", "Location"],
 };
+/** The items a client may give their own field labels for. */
+export const ZOHO_PULL_ITEMS: readonly PullKey[] = PULL_KEYS;
 
 /** Records per page: Zoho's most (get-records: per_page "default and maximum is 200"). */
 const PER_PAGE = 200;
 /**
- * The deepest page asked for. Zoho's later API versions stop page-based
- * listing at 2,000 records; v2's page does not say, so we stop there too and
- * start again from the newest change read instead.
+ * The deepest page asked for. Pages are positions in a live listing
+ * (get-records: page and per_page "fetch records according to their
+ * position"), so the listing moves on by Modified_Time instead (keyset), and
+ * pages past the first are used only while one second holds more than a page
+ * of changes. Zoho's later API versions stop page-based listing at 2,000
+ * records, so this stops there too.
  */
 const MAX_PAGE = 10;
 const READ_TIMEOUT_MS = 30_000;
 const FIELDS_SCOPE = "ZohoCRM.settings.fields.READ";
 /** How long a module's field list is trusted before it is read again. */
 const FIELD_MAP_MS = 60 * 60_000;
+/**
+ * How often deletions are asked for. Each ask costs 2 API credits
+ * (api-limits: "Get IDs of deleted records"), against 1 for a page of
+ * records, and a deletion only takes a call out of the plan.
+ */
+const DELETIONS_EVERY_MS = 60 * 60_000;
+/**
+ * Zoho lists a deleted record for 60 days from the recycle bin and 120 once
+ * deleted for good (get-deleted-records). A module whose deletions were last
+ * read longer ago than this may have missed some, so it is read again in full
+ * and anything not listed any more is taken as deleted.
+ */
+const DELETIONS_KEPT_MS = 55 * 86_400_000;
+/**
+ * Changes when what a read keeps from a record changes, so every module is
+ * read again in full with the new reading. 2: appointment dates with no time,
+ * "do not call" in the notes, yearless dates anchored to Created_Time.
+ */
+const PULL_PARSER_VERSION = 2;
 
 const squash = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 
@@ -822,6 +854,16 @@ async function fieldMap(ctx: ConnectorContext, module: string): Promise<FieldMap
   return map;
 }
 
+/**
+ * What a read of this module means: which Zoho (data centre), which of their
+ * fields hold what, and how a record is read. A cursor made under another
+ * meaning is no use: the records read before it carry the old reading.
+ */
+function meaningOf(ctx: ConnectorContext, map: FieldMap, labels: Record<PullKey, string[]>): string {
+  const fields = map.names ? JSON.stringify(map.names) : `api-names:${JSON.stringify(labels)}`;
+  return createHash("sha256").update(`${dcOf(ctx)}|${PULL_PARSER_VERSION}|${fields}`).digest("hex").slice(0, 16);
+}
+
 /** A field's value as plain text: a pick list, a lookup ({name}), a multi-select, a number. */
 function textOf(v: unknown, max = 200): string | null {
   if (v === null || v === undefined || typeof v === "boolean") return null;
@@ -868,65 +910,142 @@ const CUE = String.raw`\b(?:call(?:ing)?[\s-]*back|callback|cb|call|ring|follow[
 const FILLER = String.raw`(?:[\s:,.@-]*\b(?:after|on|by|before|from|for|the|again|date|dt|is|at|next|this|me|him|her|them|pt|patient|client)\b)*[\s:,.@-]*`;
 const CALLBACK = new RegExp(`${CUE}${FILLER}(?:${DAY_FIRST})`, "gi");
 const A_DAY = new RegExp(`(?<![\\d./-])(?:${DAY_FIRST})`, "i");
+/** "do not", "dont", "never", "not to", "no" right before the cue: the opposite of a callback. */
+const NEGATED = /(?:\bnot|\bdo\s*n[o'’]?t|\bdon[’']?t|\bdont|\bnever|\bno)\s+(?:(?:to|please|pls|again|ever)\s+)?$/i;
+
+/**
+ * A note saying not to call this person at all: "do not call", "dont call
+ * again", "DND", "stop calling". Not one that only names when not to call
+ * ("dont call after 7 pm", "do not call on 5/10"): that is about the timing.
+ */
+const DO_NOT_CALL = new RegExp(
+  [
+    String.raw`\b(?:do\s*n[o'’]?t|don[’']?t|dont|never|not\s+to)\s+(?:(?:please|pls|again|ever|her|him|them|me|this\s+number)\s+)?(?:call|contact|disturb|ring|phone)(?:\s+(?:her|him|them|me|again|back))*\b(?!\s*(?:after|before|between|during|on|till|until|from|today|tomorrow|tonight|next|in\s+(?:the\s+)?(?:morning|afternoon|evening|office)|at\s+(?!all\b)|\d))`,
+    String.raw`\bdnd\b`,
+    String.raw`\bstop\s+(?:calling|contacting)\b`,
+    String.raw`\bno\s+more\s+calls?\b`,
+    String.raw`\bnot\s+to\s+be\s+(?:called|contacted)\b`,
+  ].join("|"),
+  "i",
+);
+
+/**
+ * Whether the team wrote in a record's notes that this person is not to be
+ * called. Only the answer leaves here: the notes are never kept or logged.
+ */
+export function notesSayDoNotCall(notes: string | null | undefined): boolean {
+  return !!notes && DO_NOT_CALL.test(notes);
+}
+
+interface Ymd {
+  y: number;
+  m: number;
+  d: number;
+}
 
 /**
  * The day a match names. Without a year (or with one that cannot be meant),
- * the year that puts it nearest the record's own time is taken, so a note
- * "call on 5/1" written in late December reads as January next year.
+ * the first such day on or after `ref`: the record's creation, the earliest
+ * the note or field could have been written. So a note "call on 5/1" written
+ * in late December reads as January next year, and a note from last year
+ * stays in last year however often the record is edited since.
  */
-function dayOf(g: Array<string | undefined>, ref: Date, tz: string): Date | null {
+function dayIn(g: Array<string | undefined>, ref: Date, tz: string): Ymd | null {
   const [d, m, y] = g[0] ? [g[0], g[1], g[2]] : g[3] ? [g[3], g[4], g[5]] : [g[6], String(MONTHS.indexOf(String(g[7]).toLowerCase().slice(0, 3)) + 1), g[8]];
   const day = Number(d);
   const month = Number(m);
   if (!(day >= 1 && day <= 31 && month >= 1 && month <= 12)) return null;
-  const refYear = ref.getUTCFullYear();
+  const local = localParts(ref, tz);
   let year = y ? Number(y.length === 2 ? `20${y}` : y) : null;
-  if (year !== null && (year < refYear - 1 || year > refYear + 2)) year = null;
-  const real = (yy: number) => {
+  if (year !== null && (year < local.y - 1 || year > local.y + 2)) year = null;
+  const real = (yy: number): Ymd | null => {
     const t = new Date(Date.UTC(yy, month - 1, day));
-    return t.getUTCMonth() === month - 1 ? zoned(yy, month, day, 0, tz) : null;
+    return t.getUTCMonth() === month - 1 ? { y: yy, m: month, d: day } : null;
   };
   if (year !== null) return real(year);
-  const near = [refYear - 1, refYear, refYear + 1].map(real).filter((x): x is Date => x !== null);
-  return near.sort((a, b) => Math.abs(a.getTime() - ref.getTime()) - Math.abs(b.getTime() - ref.getTime()))[0] ?? null;
+  const from = local.y * 10_000 + local.m * 100 + local.d;
+  // Up to four years on, for 29 February.
+  for (let yy = local.y; yy <= local.y + 4; yy++) {
+    const t = real(yy);
+    if (t && t.y * 10_000 + t.m * 100 + t.d >= from) return t;
+  }
+  return null;
 }
+
+const startOfDay = (x: Ymd, tz: string, minutes = 0) => zoned(x.y, x.m, x.d, minutes, tz);
 
 /**
  * A callback date the team wrote in a record's notes ("call back after 3 /10/
  * 26", "cb 5-10-2026", "call on 12/10"), as the start of that day in the
  * client's time zone. The latest one, when the notes name several, since a
- * callback is pushed forward more often than back. Null for anything else.
- * Only the date leaves here: the notes themselves are never kept or logged.
+ * callback is pushed forward more often than back. A date the note says not
+ * to call on ("do not call on 5/10") is no callback. Null for anything else.
+ * `ref` is when the record was made. Only the date leaves here: the notes
+ * themselves are never kept or logged.
  */
 export function callbackFromNotes(notes: string | null | undefined, ref: Date, tz = "Asia/Kolkata"): Date | null {
   if (!notes) return null;
   let latest: Date | null = null;
   for (const m of notes.matchAll(CALLBACK)) {
-    const day = dayOf(m.slice(1), ref, tz);
+    if (NEGATED.test(notes.slice(Math.max(0, m.index - 40), m.index))) continue;
+    const ymd = dayIn(m.slice(1), ref, tz);
+    const day = ymd && startOfDay(ymd, tz);
     if (day && (!latest || day > latest)) latest = day;
   }
   return latest;
 }
 
 /**
- * A date or time field's value: Zoho's datetime ("2026-10-05T11:00:00+05:30"),
- * its date ("2026-10-05", the start of that day for the client), or a day
- * typed into a text field, read day first.
+ * A time of day written just after a date: "4 pm", "at 11:30 AM", "16:00",
+ * "10.30 am". Minutes after midnight, or null when none is there. A bare
+ * number is not a time: it needs minutes or am/pm.
  */
-function whenOf(v: unknown, ref: Date, tz: string): Date | null {
+function timeAfter(text: string): number | null {
+  const t = /^\s*(?:[,@-]|at\b)?\s*(\d{1,2})(?:[:.](\d{2}))?(?::\d{2})?\s*(?:([ap])\.?\s*m\b)?/i.exec(text);
+  if (!t || (t[2] === undefined && !t[3])) return null;
+  let h = Number(t[1]);
+  const min = Number(t[2] ?? 0);
+  if (min > 59) return null;
+  if (t[3]) {
+    if (h < 1 || h > 12) return null;
+    h = (h % 12) + (t[3].toLowerCase() === "p" ? 12 : 0);
+  } else if (h > 23) return null;
+  return h * 60 + min;
+}
+
+/** A date or time field's value, and whether it said a time of day. */
+interface When {
+  at: Date;
+  /** False for a date only: "2026-10-05", "5/10/2026". Then `at` is the start of that day for the client. */
+  hasTime: boolean;
+}
+
+/**
+ * A date or time field's value: Zoho's datetime ("2026-10-05T11:00:00+05:30"),
+ * its date ("2026-10-05"), or a day typed into a text field, read day first,
+ * with a time when one is written after it ("5/10/2026 11:30 AM").
+ */
+function whenOf(v: unknown, ref: Date, tz: string): When | null {
   const s = textOf(v);
   if (!s) return null;
   // Year first is ISO: Zoho's own date and datetime, or a date typed that way.
-  const iso = /^(\d{4})-(\d{2})-(\d{2})(T)?/.exec(s);
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
   if (iso) {
-    const at = iso[4] ? instant(s) : null;
-    if (at) return at;
+    if (s[10] === "T") {
+      const at = instant(s);
+      if (at) return { at, hasTime: true };
+    }
     const [y, m, d] = [Number(iso[1]), Number(iso[2]), Number(iso[3])];
     const day = new Date(Date.UTC(y, m - 1, d));
-    return day.getUTCMonth() === m - 1 && day.getUTCDate() === d ? zoned(y, m, d, 0, tz) : null;
+    if (!(day.getUTCMonth() === m - 1 && day.getUTCDate() === d)) return null;
+    const t = timeAfter(s.slice(10).replace(/^T/, " "));
+    return { at: zoned(y, m, d, t ?? 0, tz), hasTime: t !== null };
   }
   const m = A_DAY.exec(s);
-  return m ? dayOf(m.slice(1), ref, tz) : null;
+  const ymd = m && dayIn(m.slice(1), ref, tz);
+  if (!m || !ymd) return null;
+  const t = timeAfter(s.slice(m.index + m[0].length));
+  return { at: startOfDay(ymd, tz, t ?? 0), hasTime: t !== null };
 }
 
 /** One Zoho record as the plan reads it. Nothing else of it, the notes least of all, goes further. */
@@ -938,7 +1057,10 @@ function readRecord(raw: Record<string, unknown>, module: string, map: FieldMap,
   const first = (k: PullKey, max?: number) => values(k).map((v) => textOf(v, max)).find(Boolean) ?? null;
   const modifiedAt = instant(raw.Modified_Time);
   const createdAt = instant(raw.Created_Time);
-  const ref = modifiedAt ?? createdAt ?? new Date();
+  // A date written without a year is read against when the record was made,
+  // never when it last changed: an edit (a mass update, a new owner) must not
+  // carry last year's note into this year.
+  const ref = createdAt ?? modifiedAt ?? new Date();
   const when = (k: PullKey) => values(k).map((v) => whenOf(v, ref, tz)).find(Boolean) ?? null;
   // Mobile first: it is the number the person answers.
   const phone = values("phone").map((v) => toE164(textOf(v, 40))).find(Boolean) ?? null;
@@ -947,6 +1069,8 @@ function readRecord(raw: Record<string, unknown>, module: string, map: FieldMap,
   const status = raw.$converted === true ? "Converted" : first("status");
   const parts = [first("treatment"), first("subTreatment"), first("category")].filter((x): x is string => !!x);
   const treatment = parts.filter((p, i) => parts.findIndex((q) => q.toLowerCase() === p.toLowerCase()) === i).join(" / ").slice(0, 300) || null;
+  const notes = first("notes", 32_000);
+  const appointment = when("appointment");
   return {
     externalId,
     module,
@@ -957,25 +1081,39 @@ function readRecord(raw: Record<string, unknown>, module: string, map: FieldMap,
     status,
     source: first("source"),
     centre: first("centre"),
-    appointmentAt: when("appointment"),
-    followUpAt: when("followUp") ?? callbackFromNotes(first("notes", 32_000), ref, tz),
+    appointmentAt: appointment?.at ?? null,
+    appointmentHasTime: appointment ? appointment.hasTime : null,
+    followUpAt: when("followUp")?.at ?? callbackFromNotes(notes, ref, tz),
+    notesSayDoNotCall: notesSayDoNotCall(notes),
     treatment,
     consultant: first("consultant"),
   };
 }
 
-/** Where one module got to: the newest change stored, and a page only while stuck on one second (see pullZoho). */
+/**
+ * Where one module got to: the newest change stored, a page only while stuck
+ * on one second (see pullZoho), what the read meant (`meaning`), when a full
+ * read under way started (`full`), and the deletions read so far.
+ */
 interface ModuleCursor {
   since?: string;
   page?: number;
-  deleted?: { since?: string; page?: number; newest?: string };
+  meaning?: string;
+  full?: string;
+  deleted?: { since?: string; page?: number; newest?: string; checkedAt?: string };
 }
 
 function cursorOf(raw: Record<string, unknown>): ModuleCursor {
   const str = (v: unknown) => (typeof v === "string" && instant(v) ? v : undefined);
   const num = (v: unknown) => (typeof v === "number" && Number.isInteger(v) && v > 1 && v <= MAX_PAGE ? v : undefined);
   const d = (raw.deleted ?? {}) as Record<string, unknown>;
-  return { since: str(raw.since), page: num(raw.page), deleted: { since: str(d.since), page: num(d.page), newest: str(d.newest) } };
+  return {
+    since: str(raw.since),
+    page: num(raw.page),
+    meaning: typeof raw.meaning === "string" ? raw.meaning : undefined,
+    full: str(raw.full),
+    deleted: { since: str(d.since), page: num(d.page), newest: str(d.newest), checkedAt: str(d.checkedAt) },
+  };
 }
 
 const later = (a: Date | null, b: Date | null) => (!a ? b : !b ? a : a > b ? a : b);
@@ -986,65 +1124,93 @@ const later = (a: Date | null, b: Date | null) => (!a ? b : !b ? a : a > b ? a :
  *
  * Changes are listed by Modified_Time with If-Modified-Since one second before
  * the newest change already stored, so records sharing that second are read
- * again rather than lost; storing them twice changes nothing. The cursor moves
- * only as far as what this read hands back, and the caller stores it after
- * the records. Page-based listing stops at page 10, so a longer backlog is
- * read again from its newest change, on this run if the budget allows or the
- * next.
+ * again rather than lost; storing them twice changes nothing. Zoho's pages
+ * are positions in a live listing, so a record changed or deleted between two
+ * page requests would shift the next page and hide a record for good. Instead
+ * each page starts again from the newest change read so far (keyset paging);
+ * page 2 onwards is asked for only while more than a page of changes share
+ * one second. The cursor moves only as far as what this read hands back, and
+ * the caller stores it after the records.
  *
- * Deletions are read once the changes are caught up. On the first read they
- * start from now: a record deleted before we ever read it was never listed.
+ * A module is read again in full when what a read means has changed (another
+ * Zoho, other fields, a new way of reading a record), and when its deletions
+ * were last read longer ago than Zoho keeps them: at the end of that read,
+ * whatever was not listed is gone from their Zoho (sweepBefore).
+ *
+ * Deletions are read once the changes are caught up, at most hourly. On the
+ * first read they start from now: a record deleted before we ever read it was
+ * never listed.
  */
 async function pullZoho(ctx: ConnectorContext, input: PullInput): Promise<PullResult> {
   const { module } = input;
   const tz = input.timeZone ?? "Asia/Kolkata";
-  const cur = cursorOf(input.cursor);
   const out: PullResult = { records: [], deleted: [], cursor: input.cursor, done: false, pages: 0 };
   const notes: string[] = [];
   if (!may(ctx, module, "READ")) return { ...out, done: true, skipped: `${module} not read: Zoho was not granted ${scopeFor(module, "READ")}.` };
   let budget = Math.max(0, Math.floor(input.pageBudget));
   const signal = () => AbortSignal.timeout(READ_TIMEOUT_MS);
-
-  // Changes. `from` is the time the listing reads from, `newest` the newest change read so far.
-  let from = cur.since ? new Date(cur.since) : null;
-  let page = cur.page ?? 1;
-  let newest: Date | null = from;
-  let more = true;
+  const startedAt = new Date();
+  let cur = cursorOf(input.cursor);
   let stopped = false;
-  // Zoho lists no deeper than MAX_PAGE, so the listing starts again from the newest change read.
-  const restart = () => {
-    if (newest && (!from || newest > from)) from = newest;
-    else {
-      // A whole listing changed within one second (a mass update): the rest
-      // of that second is passed over and read the next time it changes.
-      const at = newest ?? from;
-      from = at ? new Date(at.getTime() + 2000) : null;
-      notes.push(`More than ${MAX_PAGE * PER_PAGE} ${module} changed within one second; Zoho lists no further, so the rest are read when they next change.`);
-    }
-    page = 1;
-  };
-  // Deletions are counted from the first read on.
-  const deletedSince = cur.deleted?.since ? new Date(cur.deleted.since) : new Date(Date.now() - 10 * 60_000);
-  let deleted: ModuleCursor["deleted"] = { ...cur.deleted, since: deletedSince.toISOString() };
 
   const stop = (r: Answer, what: string) => {
     stopped = true;
     if (verdict(r).code === "INVALID_MODULE") out.skipped = `${module} not read: Zoho has no module by that name.`;
     else if (judge(r) === "not-allowed") out.skipped = `${module} not read: Zoho answered ${said(r)} to ${what}. The grant needs ${scopeFor(module, "READ")}.`;
-    else out.error = `Zoho answered ${said(r)} to ${what} in ${module}.`;
+    else {
+      out.error = `Zoho answered ${said(r)} to ${what} in ${module}.`;
+      // A dead grant fails every read alike: the connection needs reconnecting, not retrying.
+      if (judge(r) === "connection") out.connectionBroken = true;
+    }
+  };
+
+  let map: FieldMap;
+  let labels: Record<PullKey, string[]>;
+  try {
+    const m = await fieldMap(ctx, module);
+    if ("refused" in m) {
+      stop(m.refused, "the list of fields");
+      return { ...out, done: !!out.skipped, notes };
+    }
+    map = m;
+    labels = labelsOf(ctx);
+  } catch (e) {
+    return { ...out, error: `Reading ${module} stopped: ${(e as Error).message}`.slice(0, 300), connectionBroken: e instanceof GrantGoneError, notes };
+  }
+  if (map.note) notes.push(map.note);
+
+  // A read that means something else now starts again in full.
+  const meaning = meaningOf(ctx, map, labels);
+  if (cur.meaning !== meaning) {
+    if (cur.since || cur.full) notes.push(`What JENAI reads from ${module} has changed (their fields, or how a record is read), so every ${module} record is read again.`);
+    cur = { meaning, full: startedAt.toISOString(), deleted: cur.deleted };
+  }
+  // Deletions not read for longer than Zoho keeps them: find them by reading everything again.
+  const checked = cur.deleted?.checkedAt ?? cur.deleted?.since;
+  if (!cur.full && checked && startedAt.getTime() - Date.parse(checked) > DELETIONS_KEPT_MS) {
+    notes.push(`Deleted ${module} were last read more than 55 days ago, longer than Zoho lists them, so every ${module} record is read again to find the ones deleted meanwhile.`);
+    cur = { meaning, full: startedAt.toISOString(), deleted: {} };
+  }
+  if (cur.full) out.rereading = true;
+
+  // Changes. `from` is the time the listing reads from, `newest` the newest change read so far.
+  const began = cur.since ? new Date(cur.since) : null;
+  let from = began;
+  let page = cur.page ?? 1;
+  let newest: Date | null = from;
+  let more = true;
+  // The rest of one second's changes passed over (a mass update deeper than Zoho lists).
+  const skipSecond = () => {
+    const at = from ?? newest;
+    notes.push(`More than ${MAX_PAGE * PER_PAGE} ${module} changed within one second; Zoho lists no further, so the rest are read when they next change.`);
+    // If-Modified-Since is exclusive ("not been modified after" it): from = at + 1 s asks for everything after `at`.
+    from = at ? new Date(at.getTime() + 1000) : null;
+    newest = later(newest, from);
+    page = 1;
   };
 
   try {
-    const map = await fieldMap(ctx, module);
-    if ("refused" in map) {
-      stop(map.refused, "the list of fields");
-      return { ...out, done: !!out.skipped, notes };
-    }
-    if (map.note) notes.push(map.note);
-    const labels = labelsOf(ctx);
-
     while (more && budget > 0) {
-      if (page > MAX_PAGE) restart();
       const q = new URLSearchParams({ sort_by: "Modified_Time", sort_order: "asc", per_page: String(PER_PAGE), page: String(page) });
       if (map.ask.length) q.set("fields", map.ask.join(","));
       // Zoho leaves converted Leads out unless asked, and they are the ones not to chase.
@@ -1069,22 +1235,36 @@ async function pullZoho(ctx: ConnectorContext, input: PullInput): Promise<PullRe
         newest = later(newest, rec.modifiedAt);
       }
       more = (r.json.info as { more_records?: boolean } | undefined)?.more_records === true;
-      if (more) page++;
+      if (!more) break;
+      if (newest && (!from || newest > from)) {
+        // Carry on from the newest change read, not from a position that may have moved.
+        from = newest;
+        page = 1;
+      } else if (page < MAX_PAGE) page++;
+      else skipSecond();
     }
   } catch (e) {
     stopped = true;
     out.error = `Reading ${module} stopped: ${(e as Error).message}`.slice(0, 300);
+    if (e instanceof GrantGoneError) out.connectionBroken = true;
   }
 
   // Where the next read starts: from the newest change read, or, while one
   // second's changes run deeper than a page, the next page of that listing.
-  if (more && page > MAX_PAGE) restart();
-  const next: ModuleCursor =
-    !more || (newest && (!from || newest > from)) ? { since: later(newest, from)?.toISOString() } : { since: from?.toISOString(), page: page > 1 ? page : undefined };
+  const caughtUp = !more && !stopped;
+  const stuck = more && page > 1 && newest?.getTime() === from?.getTime();
+  const since = (stuck ? from : later(newest, from))?.toISOString();
+  out.advanced = !!since && since !== began?.toISOString();
+  const next: ModuleCursor = { since, page: stuck ? page : undefined, meaning, full: caughtUp ? undefined : cur.full };
+  // A full read that reached the end: what it did not list is gone from their Zoho.
+  if (caughtUp && cur.full) out.sweepBefore = new Date(cur.full);
 
-  // Deletions, once the changes are caught up.
-  let deletionsDone = false;
-  if (!more && !stopped) {
+  // Deletions, once the changes are caught up, and at most hourly.
+  const deletedSince = cur.deleted?.since ? new Date(cur.deleted.since) : new Date(startedAt.getTime() - 10 * 60_000);
+  let deleted: ModuleCursor["deleted"] = { ...cur.deleted, since: deletedSince.toISOString() };
+  const deletionsDue = !!cur.deleted?.page || !cur.deleted?.checkedAt || startedAt.getTime() - Date.parse(cur.deleted.checkedAt) >= DELETIONS_EVERY_MS;
+  let deletionsDone = caughtUp && !deletionsDue;
+  if (caughtUp && deletionsDue) {
     let dPage = cur.deleted?.page ?? 1;
     let dNewest: Date | null = cur.deleted?.newest ? new Date(cur.deleted.newest) : deletedSince;
     let dMore = true;
@@ -1106,7 +1286,10 @@ async function pullZoho(ctx: ConnectorContext, input: PullInput): Promise<PullRe
             notes.push(`Deleted ${module} not read: Zoho answered ${said(r)}.`);
             dMore = false;
             dNewest = deletedSince;
-          } else out.error = `Zoho answered ${said(r)} to the list of deleted ${module}.`;
+          } else {
+            out.error = `Zoho answered ${said(r)} to the list of deleted ${module}.`;
+            if (judge(r) === "connection") out.connectionBroken = true;
+          }
           break;
         }
         for (const x of (r.json.data as Array<Record<string, unknown>> | undefined) ?? []) {
@@ -1121,16 +1304,17 @@ async function pullZoho(ctx: ConnectorContext, input: PullInput): Promise<PullRe
       }
     } catch (e) {
       out.error = `Reading deleted ${module} stopped: ${(e as Error).message}`.slice(0, 300);
+      if (e instanceof GrantGoneError) out.connectionBroken = true;
     }
-    if (!dMore || dPage > MAX_PAGE) {
-      deleted = { since: (dNewest ?? deletedSince).toISOString() };
-      deletionsDone = !dMore;
+    if (!out.error && (!dMore || dPage > MAX_PAGE)) {
+      deleted = { since: (dNewest ?? deletedSince).toISOString(), checkedAt: startedAt.toISOString() };
+      deletionsDone = true;
       if (dMore) notes.push(`More than ${MAX_PAGE * PER_PAGE} ${module} were deleted since the last read; Zoho lists no further, so some of them may still show here as not deleted.`);
-    } else deleted = { since: deletedSince.toISOString(), page: dPage, newest: dNewest?.toISOString() };
+    } else if (!out.error) deleted = { ...deleted, since: deletedSince.toISOString(), page: dPage, newest: dNewest?.toISOString() };
   }
 
   // A module skipped for good (a scope, a name) has nothing more to read until someone changes that.
-  return { ...out, cursor: { ...next, deleted }, done: !!out.skipped || (!more && deletionsDone && !out.error), notes };
+  return { ...out, cursor: { ...next, deleted } as Record<string, unknown>, done: !!out.skipped || (caughtUp && deletionsDone && !out.error), notes };
 }
 
 export const zohoConnector: Connector = {

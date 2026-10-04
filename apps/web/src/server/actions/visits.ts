@@ -1,7 +1,8 @@
 "use server";
 
+import { revalidatePath } from "next/cache";
 import { branchesFor, holdsAnywhere } from "@jenai/authz";
-import { VISIT_IMPORT_MAX_BYTES, VisitImportError, decodeVisitFile, importVisits, type VisitReject } from "@jenai/engine";
+import { VISIT_IMPORT_MAX_BYTES, VisitImportError, dbErrorCode, decodeVisitFile, importVisits, type VisitReject } from "@jenai/engine";
 import { actorFields, requireWorkspace } from "../access";
 import { logDenied } from "../security-log";
 import { requestMeta } from "../session";
@@ -46,6 +47,8 @@ export async function uploadVisitList(_: VisitUploadState, fd: FormData): Promis
       branchIds: scope === "all" ? undefined : scope,
     });
     const refused = r.rejected.length;
+    // The call plan page shows the new plan with the result, without a reload.
+    revalidatePath(`/w/${ctx.org.slug}/call-plan`);
     return {
       ok:
         `Visit list read: ${r.added} new ${r.added === 1 ? "visit" : "visits"}, ${r.updated} updated, ${r.unchanged} already here` +
@@ -56,6 +59,9 @@ export async function uploadVisitList(_: VisitUploadState, fd: FormData): Promis
     };
   } catch (e) {
     if (e instanceof VisitImportError) return { error: e.message };
-    throw e;
+    // A failed query's message holds every row it was writing (names, numbers,
+    // services), so only Postgres's code for it is logged, and nothing is rethrown.
+    console.error(JSON.stringify({ event: "visits.upload_failed", code: dbErrorCode(e) ?? (e instanceof Error ? e.name : "unknown") }));
+    return { error: "The visit list could not be stored or planned just now. Try again in a minute: uploading it again adds nothing twice." };
   }
 }

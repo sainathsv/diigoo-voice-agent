@@ -14,12 +14,15 @@ import { auditEvents, branches, contacts, organizations, plannedCalls, platformD
 import {
   VISIT_IMPORT_MAX_ROWS,
   VisitImportError,
+  VisitRemovalError,
   decodeVisitFile,
+  eraseNumber,
   findColumns,
   importVisits,
   parseCsv,
   parseVisitDate,
   readVisitRows,
+  removeVisitUpload,
   visitColumnsOf,
   type VisitColumns,
 } from "./visits-import";
@@ -362,5 +365,32 @@ describe("importing a visit list", () => {
     await expect(importVisits(org, "Name,Service,Date\nA,Peel,30/09/2026", { now: NOW })).rejects.toThrow(VisitImportError);
     await expect(importVisits(org, "\r\n\r\n", { now: NOW })).rejects.toThrow("The file is empty.");
     expect(await stored()).toHaveLength(3);
+  });
+
+  it("takes out an upload's visits, and their planned calls, when asked", async () => {
+    const r = await importVisits(org, "Mobile,Service,Date\n9848077777,Peel,29/09/2026", { now: NOW });
+    expect((await stored()).some((x) => x.phoneE164 === "+919848077777")).toBe(true);
+    const out = await removeVisitUpload(org, r.batch, { removedBy: "user-1", now: NOW });
+    expect(out.removed).toBe(1);
+    expect((await stored()).some((x) => x.phoneE164 === "+919848077777")).toBe(false);
+    expect(await withTenant(org, (tx) => tx.select().from(plannedCalls).where(eq(plannedCalls.phoneE164, "+919848077777")))).toEqual([]);
+    const [logged] = await withTenant(org, (tx) => tx.select().from(auditEvents).where(eq(auditEvents.action, "visits.upload_removed")));
+    expect(logged).toMatchObject({ targetId: r.batch, summary: "Visit list upload removed: 1 visit taken out", diff: { removed: 1 } });
+    await expect(removeVisitUpload(org, "not-a-batch")).rejects.toThrow(VisitRemovalError);
+  });
+
+  it("erases one person from what the plan keeps, naming them nowhere in the log", async () => {
+    const r = await eraseNumber(org, "98480 66666", { removedBy: "user-1", now: NOW });
+    expect(r).toMatchObject({ visits: 1 });
+    expect(r.planned).toBeGreaterThan(0);
+    expect((await stored()).some((x) => x.phoneE164 === SITA)).toBe(false);
+    expect(await withTenant(org, (tx) => tx.select().from(plannedCalls).where(eq(plannedCalls.phoneE164, SITA)))).toEqual([]);
+    // The name the visit list gave their contact goes too; a contact from a call keeps its own.
+    const people = await withTenant(org, (tx) => tx.select().from(contacts));
+    expect(people.find((c) => c.phoneE164 === SITA)!.name).toBeNull();
+    const [logged] = await withTenant(org, (tx) => tx.select().from(auditEvents).where(eq(auditEvents.action, "call_plan.number_erased")));
+    expect(logged).toMatchObject({ targetType: "phone", targetId: "ending 6666" });
+    expect(JSON.stringify(logged)).not.toMatch(/98480|Sita/);
+    await expect(eraseNumber(org, "12")).rejects.toThrow(VisitRemovalError);
   });
 });

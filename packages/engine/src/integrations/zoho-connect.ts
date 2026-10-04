@@ -1,6 +1,8 @@
 import { and, eq } from "drizzle-orm";
 import { externalLinks, integrations, type Integration, type Tx } from "@jenai/db";
 import { assertClientUrl } from "@jenai/voice";
+import { dropOrphanedPlanRows } from "../care-plan";
+import { forgetPulled } from "./crm-sync";
 import { sealCredentials } from "./queue";
 import { ACCOUNTS, zohoScopes } from "./zoho";
 
@@ -88,7 +90,9 @@ const ZOHO_EVENTS = ["call.completed", "lead.updated", "appointment.booked", "do
  * the connection failing; what was refused under the old grant is forgotten.
  *
  * A grant from another data centre is another Zoho account, where the
- * records we linked people to do not exist, so those links go.
+ * records we linked people to do not exist, so those links go, and so does
+ * what was read from the old account for the call plan: the new one is read
+ * from the start.
  *
  * It stays a draft until a test shows Zoho answers. Events are still queued
  * for it meanwhile, and wait.
@@ -126,7 +130,13 @@ export async function saveZohoConnection(
     updatedAt: new Date(),
   };
   if (existing) {
-    if (String(existing.config.dc ?? "in") !== grant.dc) await tx.delete(externalLinks).where(eq(externalLinks.integrationId, existing.id));
+    if (String(existing.config.dc ?? "in") !== grant.dc) {
+      await tx.delete(externalLinks).where(eq(externalLinks.integrationId, existing.id));
+      // Another Zoho account: what was read from the old one is not theirs any
+      // more, and the new one is read from the start.
+      await forgetPulled(tx, existing.id);
+      await dropOrphanedPlanRows(tx);
+    }
     const [i] = await tx.update(integrations).set(row).where(and(eq(integrations.tenantId, tenantId), eq(integrations.id, existing.id))).returning();
     return { integration: i!, reconnected: true };
   }

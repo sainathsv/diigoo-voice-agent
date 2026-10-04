@@ -23,6 +23,7 @@
     "zoho": "tsx src/scripts/zoho.ts",
     "zenoti": "tsx src/scripts/zenoti.ts",
     "visits": "tsx src/scripts/visits.ts",
+    "plan": "tsx src/scripts/plan.ts",
     "catalog": "tsx src/scripts/catalog.ts",
     "voice": "tsx src/scripts/voice.ts",
     "whatsapp": "tsx src/scripts/whatsapp.ts",

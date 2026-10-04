@@ -12,8 +12,22 @@
  * is ever logged or repeated in a reason.
  */
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { audit, branches, callPlanSettings, contacts, organizations, withTenant, type AuditInput } from "@jenai/db";
+import { and, eq, inArray, or, sql, type AnyColumn, type SQL } from "drizzle-orm";
+import {
+  audit,
+  branches,
+  callPlanSettings,
+  clinicAppointments,
+  contacts,
+  crmRecords,
+  externalPeople,
+  organizations,
+  packageBalances,
+  plannedCalls,
+  visits,
+  withTenant,
+  type AuditInput,
+} from "@jenai/db";
 import { toE164 } from "@jenai/voice";
 import { replanTenant, type ReplanResult } from "./care-plan";
 import { localParts } from "./dialer/time";
@@ -142,6 +156,17 @@ export function visitColumnsOf(raw: unknown): Record<VisitField, readonly string
     if (Array.isArray(v)) out[f] = [...v.filter((x): x is string => typeof x === "string" && !!norm(x)), ...VISIT_COLUMNS[f]];
   }
   return out;
+}
+
+/** Why a value cannot be the visitColumns setting, in plain words, or null when it can. visitColumnsOf() would ignore it quietly. */
+export function visitColumnsProblem(value: unknown): string | null {
+  const example = `such as {"phone": ["Mobile No"]}. The fields are ${FIELDS.join(", ")}.`;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return `visitColumns must list, per field, the column names to look for, ${example}`;
+  for (const [field, names] of Object.entries(value)) {
+    if (!(FIELDS as string[]).includes(field)) return `"${field}" is not a field of the visit list. The fields are ${FIELDS.join(", ")}.`;
+    if (!Array.isArray(names) || !names.every((x) => typeof x === "string" && norm(x))) return `visitColumns.${field} must be a list of column names, ${example}`;
+  }
+  return null;
 }
 
 export interface VisitColumns {
@@ -571,4 +596,98 @@ export async function importVisits(tenantId: string, csvText: string, opts: Visi
 
   const plan = await replanTenant(tenantId, { now });
   return { rows: read.rows, added: counts.added, updated: counts.updated, unchanged: counts.unchanged, repeated: counts.repeated, rejected: read.rejected, columns: cols.names, batch, plan };
+}
+
+// ---------------------------------------------------------------- taking visits out again
+
+/** A removal or erasure that cannot be done, with a reason the clinic can act on. */
+export class VisitRemovalError extends Error {
+  override name = "VisitRemovalError";
+}
+
+export interface VisitRemovalOptions {
+  /** The user who asked, for the audit log. Null from the command line. */
+  removedBy?: string | null;
+  audit?: Pick<AuditInput, "impersonatorUserId" | "via" | "ip" | "userAgent">;
+  now?: Date;
+}
+
+const auditOf = (tenantId: string, opts: VisitRemovalOptions) => ({
+  tenantId,
+  actorUserId: opts.removedBy ?? null,
+  impersonatorUserId: opts.audit?.impersonatorUserId ?? null,
+  via: opts.audit?.via ?? (opts.removedBy ? ("user" as const) : ("system" as const)),
+  ip: opts.audit?.ip ?? null,
+  userAgent: opts.audit?.userAgent ?? null,
+});
+
+/**
+ * Takes out the visits one upload added or last changed (its batch, as the
+ * call plan page and the audit log name it), then plans again. A visit a
+ * later upload changed carries that upload's batch instead, and stays.
+ */
+export async function removeVisitUpload(tenantId: string, batch: string, opts: VisitRemovalOptions = {}): Promise<{ removed: number; plan: ReplanResult }> {
+  if (!/^[0-9a-f-]{36}$/i.test(batch)) throw new VisitRemovalError("That is not an upload JENAI knows.");
+  const removed = await withTenant(tenantId, async (tx) => {
+    const gone = await tx.delete(visits).where(eq(visits.batch, batch)).returning({ id: visits.id });
+    await audit(tx, {
+      ...auditOf(tenantId, opts),
+      action: "visits.upload_removed",
+      targetType: "visit_batch",
+      targetId: batch,
+      summary: `Visit list upload removed: ${gone.length} ${gone.length === 1 ? "visit" : "visits"} taken out`,
+      diff: { removed: gone.length },
+    });
+    return gone.length;
+  });
+  return { removed, plan: await replanTenant(tenantId, { now: opts.now }) };
+}
+
+/**
+ * Erases one person's number from what the call plan keeps: their visits,
+ * the CRM records read for them, what was read from a front desk system
+ * (their guest records, bookings and packages, and visits read before their
+ * number was known), and their planned calls; their contact loses the name
+ * the visit list gave it. For someone who asked the clinic to erase their
+ * data. The clinic deletes them in its own CRM and front desk system too, or
+ * the next read brings them back. The audit entry names the number by its
+ * last 4 digits only.
+ */
+export async function eraseNumber(
+  tenantId: string,
+  rawPhone: string,
+  opts: VisitRemovalOptions = {},
+): Promise<{ visits: number; records: number; frontDesk: number; planned: number; plan: ReplanResult }> {
+  const phone = toE164(rawPhone.trim());
+  if (!phone) throw new VisitRemovalError("That is not a phone number JENAI can read.");
+  const counts = await withTenant(tenantId, async (tx) => {
+    // Planned calls first: taking a visit or record out takes its calls along too (0033), and the count says how many went.
+    const p = await tx.delete(plannedCalls).where(eq(plannedCalls.phoneE164, phone)).returning({ id: plannedCalls.id });
+    // Their guest records, and with them what their system named them by but gave no number (a sales line, a package).
+    const guests = await tx.delete(externalPeople).where(eq(externalPeople.phoneE164, phone)).returning({ i: externalPeople.integrationId, r: externalPeople.externalId });
+    const theirs = (integrationId: AnyColumn, guestRef: AnyColumn): SQL =>
+      guests.length ? sql`(${integrationId}, ${guestRef}) in (select (g->>'i')::uuid, g->>'r' from jsonb_array_elements(${JSON.stringify(guests)}::jsonb) g)` : sql`false`;
+    const v = await tx.delete(visits).where(or(eq(visits.phoneE164, phone), theirs(visits.integrationId, visits.guestRef))).returning({ id: visits.id });
+    const b = await tx
+      .delete(clinicAppointments)
+      .where(or(eq(clinicAppointments.phoneE164, phone), theirs(clinicAppointments.integrationId, clinicAppointments.guestRef)))
+      .returning({ id: clinicAppointments.id });
+    const k = await tx
+      .delete(packageBalances)
+      .where(or(eq(packageBalances.phoneE164, phone), theirs(packageBalances.integrationId, packageBalances.guestRef)))
+      .returning({ id: packageBalances.id });
+    const r = await tx.delete(crmRecords).where(eq(crmRecords.phoneE164, phone)).returning({ id: crmRecords.id });
+    await tx.update(contacts).set({ name: null, updatedAt: new Date() }).where(and(eq(contacts.phoneE164, phone), eq(contacts.source, "visit_list")));
+    const c = { visits: v.length, records: r.length, frontDesk: guests.length + b.length + k.length, planned: p.length };
+    await audit(tx, {
+      ...auditOf(tenantId, opts),
+      action: "call_plan.number_erased",
+      targetType: "phone",
+      targetId: `ending ${phone.slice(-4)}`,
+      summary: `Erased from the call plan: ${c.visits} visits, ${c.records} CRM records, ${c.frontDesk} front desk records, ${c.planned} planned calls`,
+      diff: c,
+    });
+    return c;
+  });
+  return { ...counts, plan: await replanTenant(tenantId, { now: opts.now }) };
 }

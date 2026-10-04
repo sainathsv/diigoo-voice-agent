@@ -2,7 +2,7 @@ import { and, eq, inArray, isNotNull, sql, type SQL } from "drizzle-orm";
 import { audit, branches, clinicAppointments, externalPeople, integrations, visits, withTenant, type Integration, type Tx } from "@jenai/db";
 import { replanTenant, type ReplanResult } from "../care-plan";
 import { localParts, zoned } from "../dialer/time";
-import { PULL_LEASE_MINUTES, endPull, takePullLease } from "./crm-sync";
+import { PULL_LEASE_MINUTES, endPull, leasedPull, takePullLease } from "./crm-sync";
 import { credentialsOf } from "./queue";
 import type { ConnectorContext } from "./types";
 import { applyBranchMap, zenotiBranchMap, zenotiSaver } from "./zenoti-connect";
@@ -117,7 +117,8 @@ const LOOKBACK_DAYS = 180;
 const DEFAULT_PAGE_SIZE = 100;
 const MAX_PAGE_SIZE = 1000;
 /** Calls a check of what the key may read makes: the centres, then one per kind of read. */
-const TEST_CALLS = 6;
+export const ZENOTI_TEST_CALLS = 6;
+const TEST_CALLS = ZENOTI_TEST_CALLS;
 /** A centre Zenoti keeps refusing is tried again after an hour, then two, four, and so on up to a day. */
 const CENTRE_RETRY_MS = HOUR_MS;
 const CENTRE_RETRY_MAX_MS = DAY_MS;
@@ -134,6 +135,14 @@ export interface ZenotiSyncOptions {
   fetchImpl?: typeof fetch;
   /** For tests: pacing and Zenoti's waits pass on this clock instead of the real one. */
   clock?: ZenotiClock;
+  /**
+   * The caller holds the connection's pull lease already, ending then (the
+   * worker's claim, claimPulls), and lets go of it itself once the next read
+   * is set. Without this the lease is taken here and let go at the end.
+   */
+  lease?: Date | null;
+  /** False leaves the call plan to the caller, which plans only when the read brought something new. Default true. */
+  replan?: boolean;
 }
 
 export interface ZenotiCentreSync {
@@ -199,27 +208,14 @@ export interface ZenotiSyncResult {
  */
 export async function syncZenoti(tenantId: string, integrationId: string, opts: ZenotiSyncOptions = {}): Promise<ZenotiSyncResult> {
   const startedAt = opts.clock?.now() ?? Date.now();
+  const leased = opts.lease !== undefined;
+  // The lease a caller took may have started a while ago: only what is left of it counts.
+  const leaseLeft = Math.min(PULL_LEASE_MINUTES * 60_000, opts.lease ? opts.lease.getTime() - Date.now() : Infinity);
   // No call starts once the lease is nearly out, so no second run can be reading the connection with this one.
-  const budget: ZenotiCallBudget = { left: Math.max(0, Math.floor(opts.callBudget ?? ZENOTI_SYNC_CALLS)), used: 0, until: startedAt + PULL_LEASE_MINUTES * 60_000 - LEASE_MARGIN_MS };
+  const budget: ZenotiCallBudget = { left: Math.max(0, Math.floor(opts.callBudget ?? ZENOTI_SYNC_CALLS)), used: 0, until: startedAt + leaseLeft - LEASE_MARGIN_MS };
   const now = opts.now ?? new Date(startedAt);
-  const result: ZenotiSyncResult = {
-    ran: false,
-    path: null,
-    calls: 0,
-    budget: budget.left,
-    tested: false,
-    centres: [],
-    bookings: { read: 0, changed: 0, removed: 0 },
-    visits: { read: 0, added: 0, updated: 0, merged: 0, removed: 0, numbered: 0 },
-    guests: { read: 0, left: 0 },
-    packages: { guests: 0, rows: 0, sessions: 0, left: 0 },
-    done: false,
-    left: [],
-    error: null,
-    summary: "",
-    plan: null,
-  };
-  const taken = await takePullLease(tenantId, integrationId);
+  const result = zenotiResult(budget.left);
+  const taken = leased ? await leasedPull(tenantId, integrationId) : await takePullLease(tenantId, integrationId);
   if (!taken) return result;
   result.ran = true;
 
@@ -232,10 +228,12 @@ export async function syncZenoti(tenantId: string, integrationId: string, opts: 
   } finally {
     result.calls = budget.used;
     result.path = run.path;
-    try {
-      result.plan = await replanTenant(tenantId, { now });
-    } catch (e) {
-      run.problems.push(`The call plan could not be made again: ${errorWithoutValues(e)}`.slice(0, 300));
+    if (opts.replan !== false) {
+      try {
+        result.plan = await replanTenant(tenantId, { now });
+      } catch (e) {
+        run.problems.push(`The call plan could not be made again: ${errorWithoutValues(e)}`.slice(0, 300));
+      }
     }
     result.left = run.left;
     result.error = run.problems.length ? run.problems.join(" ").slice(0, 1000) : null;
@@ -259,10 +257,43 @@ export async function syncZenoti(tenantId: string, integrationId: string, opts: 
       }
     } finally {
       // Only this run's own lease: one that outlived it never frees a lease another run took since.
-      await endPull(tenantId, integrationId, result.error, taken.lease);
+      // A read that went wrong and read nothing waits longer before the next on the timer.
+      await endPull(tenantId, integrationId, result.error, taken.lease, { keepLease: leased, failed: !!result.error && !zenotiProgressed(result) });
     }
   }
   return result;
+}
+
+/** A run's result before anything is read. */
+export function zenotiResult(budget: number): ZenotiSyncResult {
+  return {
+    ran: false,
+    path: null,
+    calls: 0,
+    budget,
+    tested: false,
+    centres: [],
+    bookings: { read: 0, changed: 0, removed: 0 },
+    visits: { read: 0, added: 0, updated: 0, merged: 0, removed: 0, numbered: 0 },
+    guests: { read: 0, left: 0 },
+    packages: { guests: 0, rows: 0, sessions: 0, left: 0 },
+    done: false,
+    left: [],
+    error: null,
+    summary: "",
+    plan: null,
+  };
+}
+
+/** The run moved on: it read some days of a centre, guests' profiles or packages. Reading again soon is worth it only then. */
+export function zenotiProgressed(r: ZenotiSyncResult): boolean {
+  return r.centres.some((c) => c.spans > 0) || r.guests.read > 0 || r.packages.guests > 0;
+}
+
+/** What the run changed that the call plan has to take in, counted. */
+export function zenotiChanges(r: ZenotiSyncResult): number {
+  const v = r.visits;
+  return r.bookings.changed + r.bookings.removed + v.added + v.updated + v.removed + v.numbered + r.guests.read + r.packages.guests;
 }
 
 // ---------------------------------------------------------------- one run
@@ -1729,8 +1760,7 @@ const count = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 /** Whether the run changed anything JENAI holds, which is when it is audited: a run that found nothing new leaves no entry. */
 function changedAnything(r: ZenotiSyncResult): boolean {
-  const v = r.visits;
-  return r.bookings.changed + r.bookings.removed + v.added + v.updated + v.removed + v.numbered + r.guests.read + r.packages.guests > 0;
+  return zenotiChanges(r) > 0;
 }
 
 const PATH_TEXT: Record<ZenotiPath, string> = { appointments: "appointments", sales_accrual: "the sales accrual report", sales_report: "Zenoti's older sales report" };

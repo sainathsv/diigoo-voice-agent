@@ -85,8 +85,12 @@ export interface PulledRecord {
   source: string | null;
   centre: string | null;
   appointmentAt: Date | null;
+  /** False when their field held a date only: no time of day to remind them of. Null with no appointment. */
+  appointmentHasTime: boolean | null;
   /** Their follow-up field, or else a callback date the team wrote in their notes. */
   followUpAt: Date | null;
+  /** The team wrote in the notes not to call this person. Only this answer travels, never the notes. */
+  notesSayDoNotCall: boolean;
   treatment: string | null;
   consultant: string | null;
 }
@@ -117,6 +121,17 @@ export interface PullResult {
   error?: string;
   /** Things worth knowing that did not stop the read. */
   notes?: string[];
+  /** The read moved past where earlier reads had got to: there may be more to read at once. */
+  advanced?: boolean;
+  /** This read is part of reading the module again in full: store every record, changed or not. */
+  rereading?: boolean;
+  /**
+   * A full read of the module ended: a record of it stored before this time
+   * and not read since is gone from their system.
+   */
+  sweepBefore?: Date;
+  /** Their system refused the connection itself (a revoked grant): reading again will not help until it is reconnected. */
+  connectionBroken?: boolean;
 }
 
 export interface Connector {

@@ -36,7 +36,7 @@ export default async function IntegrationsPage({ params, searchParams }: { param
     <>
       <PageHead
         title="Your systems"
-        sub="Keep running Zoho, SAP or whatever you already use. JENAI sends every call result back into it, and a button in your system can start a call here. Nothing has to move."
+        sub="Keep running Zoho, SAP or whatever you already use. JENAI reads your Zoho leads and contacts to plan who to call, sends every call result back, and a button in your system can start a call here. Nothing has to move."
       />
       <Flash ok={sp.ok} error={sp.error} />
       {sp.new_key ? (
@@ -74,6 +74,11 @@ export default async function IntegrationsPage({ params, searchParams }: { param
                     <td className="whitespace-nowrap text-[12.5px] text-ink-soft">
                       {c.lastError ? <span className="text-bad" title={c.lastError}>{c.lastError.slice(0, 60)}</span> : c.lastOkAt ? `worked ${fmtDate(c.lastOkAt)}` : "not tested"}
                       {skippedToday[c.id] ? <div className="text-warn">{skippedToday[c.id]} skipped in 24 h</div> : null}
+                      {c.lastPullError ? (
+                        <div className="text-warn" title={c.lastPullError}>reading: {c.lastPullError.slice(0, 60)}</div>
+                      ) : c.lastPullAt ? (
+                        <div>records read {fmtDate(c.lastPullAt)}</div>
+                      ) : null}
                     </td>
                     {manage ? (
                       <td>
@@ -95,7 +100,7 @@ export default async function IntegrationsPage({ params, searchParams }: { param
       </Section>
 
       {manage ? (
-        <Section title="Connect a system" sub="A webhook is the quickest. Zoho writes a note on the right record after every call.">
+        <Section title="Connect a system" sub="A webhook is the quickest. From Zoho, JENAI reads your leads and contacts to plan calls, and writes a note on the right record after every call.">
           <form action={connectSystem} className="grid gap-4 px-5 py-4 lg:grid-cols-2">
             <input type="hidden" name="slug" value={slug} />
             <div className="lg:col-span-2">
@@ -146,7 +151,7 @@ export default async function IntegrationsPage({ params, searchParams }: { param
                 <div><label className="label" htmlFor="client_id">Client id</label><input className="input" id="client_id" name="client_id" maxLength={200} /></div>
                 <div><label className="label" htmlFor="client_secret">Client secret</label><input className="input" id="client_secret" name="client_secret" type="password" maxLength={200} /></div>
                 <div className="md:col-span-2"><label className="label" htmlFor="refresh_token">Refresh token</label><input className="input" id="refresh_token" name="refresh_token" type="password" maxLength={400} /></div>
-                <p className="md:col-span-2 text-[12px] text-grey">From your Zoho API console: a Self Client with the scopes ZohoCRM.modules.ALL and ZohoSearch.securesearch.READ (the second is how JENAI finds a caller by number). Connecting Zoho again takes only these credentials and keeps the connection&apos;s settings. JENAI stores them encrypted and uses them only to write your call results back.</p>
+                <p className="md:col-span-2 text-[12px] text-grey">From your Zoho API console: a Self Client with the scopes ZohoCRM.modules.ALL and ZohoSearch.securesearch.READ (the second is how JENAI finds a caller by number). Add ZohoCRM.settings.fields.READ so JENAI finds your fields by the names you see in Zoho. Connecting Zoho again takes only these credentials and keeps the connection&apos;s settings. JENAI stores them encrypted and uses them to read your leads and contacts, so it can plan who to call (see Call plan), and to write your call results back.</p>
               </div>
             </details>
             <div className="lg:col-span-2">
