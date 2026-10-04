@@ -170,7 +170,7 @@ export default async function CallPlanSettingsPage({ params, searchParams }: { p
           </form>
         </Section>
 
-        <Section title="Treatment timings" sub="When each treatment's calls fall due. JENAI's defaults are a starting point for your doctors to confirm or change, never medical advice.">
+        <Section title="Treatment timings" sub="When each treatment's calls fall due. Services that match one timing count as one course, unless each is had again and again, like two areas of laser hair removal; add a timing of your own to keep others apart. A patch test, consultation, review or follow-up is never counted as a sitting. JENAI's defaults are a starting point for your doctors to confirm or change, never medical advice.">
           <div className="grid gap-4 px-5 py-4">
             {p.rules.own.length ? (
               <div className="tbl-wrap">

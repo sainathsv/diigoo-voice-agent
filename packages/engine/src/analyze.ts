@@ -107,7 +107,7 @@ function prompt(input: { transcript: string; startedAt: Date; domain: string; di
 Return ONLY a JSON object with exactly these keys, null when not said. Every value must be in ENGLISH: translate Telugu or Hindi, never copy the caller's words.
 {"caller_name": string|null (in English letters), "concern": string|null (what they asked about, 3 to 8 English words, e.g. "hair fall treatment"),
  "preferred_time": string|null (the agreed appointment, written like "20 Sep 2026, 11:00 AM" or "20 Sep 2026" if no time; resolve words like today, tomorrow, repu, kal, next Monday against the call date),
- "interest_level": "hot"|"warm"|"cold"|null, "next_step": "booked"|"callback"|"whatsapp"|"none"|null ("booked" only if a day AND exact time were confirmed),
+ "interest_level": "hot"|"warm"|"cold"|null, "next_step": "booked"|"callback"|"whatsapp"|"none"|null ("booked" only if a day AND exact time were confirmed for an appointment made on this call; one they say was booked before the call is not "booked"),
  "do_not_call": true|false|null (true only if they asked not to be called again), "summary": string|null (one sentence),
  "duration": string|null (how long they have had the problem, as they said it, e.g. "6 months", "since last winter"),
  "tried_before": string|null (what they already tried: home remedies, shampoos, creams, other doctors or clinics; up to 15 words),
@@ -224,6 +224,16 @@ function cleanProgramFields(raw: unknown, p: ProgramAsk): Record<string, string>
 }
 
 /**
+ * The appointment made on this call, as the analysis wrote it ("20 Oct 2026,
+ * 2:00 PM"), or null: none was agreed, or the program's outcome says the
+ * one they spoke of was booked before the call, so it goes in no calendar
+ * and to no CRM a second time.
+ */
+export function bookedOnCall(merged: Record<string, unknown>): string | null {
+  return merged.next_step === "booked" && typeof merged.preferred_time === "string" && merged.outcome !== "already_booked" ? merged.preferred_time : null;
+}
+
+/**
  * Whether the call heard "do not call me again", from any of the ways it is
  * recorded: the standard answer, a program's own do_not_call or
  * asked_to_stop_calling answer, or a program outcome of do_not_call. The
@@ -319,8 +329,9 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
           if (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt, programStage })) stats.leads++;
         }
         // A booking goes straight into the calendar, so the front desk sees it without asking.
-        if (merged.next_step === "booked" && typeof merged.preferred_time === "string") {
-          const when = parsePreferredTime(merged.preferred_time);
+        const booked = bookedOnCall(merged);
+        if (booked) {
+          const when = parsePreferredTime(booked);
           if (when) {
             await appointmentFromCall(tx, tenantId, {
               callId: c.id,
@@ -335,7 +346,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
         }
         // Hand the result back to the client's own system (their CRM stays the record of truth).
         await emitCallCompleted(tx, tenantId, c.id);
-        if (merged.next_step === "booked" && typeof merged.preferred_time === "string") await emitAppointmentBooked(tx, tenantId, c.id, merged.preferred_time);
+        if (booked) await emitAppointmentBooked(tx, tenantId, c.id, booked);
       });
       stats.analyzed++;
     } catch {
