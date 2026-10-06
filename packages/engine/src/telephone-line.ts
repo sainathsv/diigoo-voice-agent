@@ -8,7 +8,8 @@
  * configured in JENAI_TEL_SIP_PEER.
  */
 import { createSocket } from "node:dgram";
-import { connect } from "node:net";
+import { connect, isIP } from "node:net";
+import { connect as tlsConnect } from "node:tls";
 import { randomBytes } from "node:crypto";
 import { readFile, readdir, access } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
@@ -36,8 +37,42 @@ export interface LineConfig {
   iface: string;
   /** The telecom team's SIP address, host or host:port, once they give it. */
   sipPeer: string | null;
-  /** Our telephone gateway's health address (set when the gateway is installed): http(s)://… or tcp://host:port. */
+  /**
+   * Our telephone gateway's health addresses (set when the gateway is installed), separated by
+   * commas: http(s)://…, tcp://host:port or tls://host:port. The gateway is up when all answer.
+   */
   gatewayHealthUrl: string | null;
+  /**
+   * The line as this server's Asterisk sees it, written every minute by sip-bridge-setup.sh's job:
+   * its sign-in to the SIP server as an extension, or the SIP server answering it. When set, the
+   * SIP server is judged by Asterisk's own view (a SIP server that ignores strangers' "are you
+   * there" still shows as connected once Asterisk is signed in).
+   */
+  asteriskStatusFile?: string | null;
+}
+
+/** What the status file says: "key=value" lines (at, asterisk, user, register, gov, voice). */
+export interface AsteriskView {
+  at: number;
+  asterisk?: string;
+  user?: string;
+  register?: string;
+  gov?: string;
+  voice?: string;
+}
+
+export function parseAsteriskStatus(text: string): AsteriskView | null {
+  const kv = Object.fromEntries(
+    text
+      .split("\n")
+      .map((l) => /^([a-z]+)=(.*)$/.exec(l.trim()))
+      .filter((m): m is RegExpExecArray => !!m)
+      .map((m) => [m[1], m[2]!.trim()]),
+  ) as Record<string, string>;
+  const at = Number(kv.at);
+  if (!Number.isFinite(at) || at <= 0) return null;
+  const { asterisk, user, register, gov, voice } = kv;
+  return { at, ...(asterisk ? { asterisk } : {}), ...(user ? { user } : {}), ...(register ? { register } : {}), ...(gov ? { gov } : {}), ...(voice ? { voice } : {}) };
 }
 
 /** Monitoring is on when JENAI_TEL_IFACE is set (a port name, or "auto"). */
@@ -45,7 +80,8 @@ export function lineConfigFromEnv(env: Record<string, string | undefined> = proc
   const iface = env.JENAI_TEL_IFACE?.trim();
   if (!iface) return null;
   if (iface !== "auto" && !/^[a-zA-Z0-9_.:-]{1,15}$/.test(iface)) throw new Error("JENAI_TEL_IFACE must be a network port name (for example the second Ethernet port) or auto");
-  return { iface, sipPeer: env.JENAI_TEL_SIP_PEER?.trim() || null, gatewayHealthUrl: env.JENAI_TEL_GATEWAY_HEALTH_URL?.trim() || null };
+  const asteriskStatusFile = env.JENAI_TEL_ASTERISK_STATUS?.trim() || null;
+  return { iface, sipPeer: env.JENAI_TEL_SIP_PEER?.trim() || null, gatewayHealthUrl: env.JENAI_TEL_GATEWAY_HEALTH_URL?.trim() || null, ...(asteriskStatusFile ? { asteriskStatusFile } : {}) };
 }
 
 export interface PortFacts {
@@ -105,15 +141,42 @@ export function pickPort(cfg: LineConfig, facts: NetFacts): { port: PortFacts | 
   return { port: null, why: `This server has ${spare.length} spare Ethernet ports (${spare.map((p) => p.name).join(", ")}); name the one for the government cable in JENAI_TEL_IFACE.` };
 }
 
+/** The address this server sends from to reach host:port: a route lookup, nothing is sent. */
+function sourceAddress(host: string, port: number, type: "udp4" | "udp6"): Promise<string | null> {
+  return new Promise((resolve) => {
+    const s = createSocket(type);
+    const finish = (address: string | null) => {
+      try {
+        s.close();
+      } catch {
+        /* already closed */
+      }
+      resolve(address);
+    };
+    s.once("error", () => finish(null));
+    s.connect(port, host, () => {
+      try {
+        finish(s.remoteAddress() ? s.address().address : null);
+      } catch {
+        finish(null);
+      }
+    });
+  });
+}
+
 /**
  * A SIP OPTIONS request (the standard "are you there" of telephone systems) over
  * UDP to the configured peer. Any SIP reply counts as reachable; the status is reported.
+ * It is sent from, and names in its Via header, the address the peer sees, so a peer that
+ * answers to the Via address (not only to where the request came from) is heard too.
  */
 export async function sipOptions(peer: string, timeoutMs = 3000): Promise<{ ok: boolean; status?: number; ms?: number; error?: string }> {
   const [host, portText] = peer.includes(":") ? [peer.slice(0, peer.lastIndexOf(":")), peer.slice(peer.lastIndexOf(":") + 1)] : [peer, "5060"];
   const port = Number(portText);
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, error: `not a SIP address: ${peer}` };
-  const sock = createSocket(host.includes(":") ? "udp6" : "udp4");
+  const type = host.includes(":") ? "udp6" : "udp4";
+  const from = await sourceAddress(host, port, type);
+  const sock = createSocket(type);
   const branch = `z9hG4bK${randomBytes(6).toString("hex")}`;
   const tag = randomBytes(4).toString("hex");
   const callId = `${randomBytes(8).toString("hex")}@jenai`;
@@ -130,11 +193,12 @@ export async function sipOptions(peer: string, timeoutMs = 3000): Promise<{ ok: 
       const m = /^SIP\/2\.0 (\d{3})/.exec(buf.toString("latin1"));
       if (m && buf.toString("latin1").includes(callId)) done({ ok: true, status: Number(m[1]), ms: Date.now() - started });
     });
-    sock.bind(0, () => {
+    sock.bind({ port: 0, ...(from ? { address: from } : {}) }, () => {
       const local = sock.address();
+      const sentBy = local.address === "0.0.0.0" || local.address === "::" ? "127.0.0.1" : local.address.includes(":") ? `[${local.address}]` : local.address;
       const msg = [
         `OPTIONS sip:${host}:${port} SIP/2.0`,
-        `Via: SIP/2.0/UDP ${local.address === "0.0.0.0" || local.address === "::" ? "127.0.0.1" : local.address}:${local.port};branch=${branch};rport`,
+        `Via: SIP/2.0/UDP ${sentBy}:${local.port};branch=${branch};rport`,
         "Max-Forwards: 70",
         `From: <sip:jenai-monitor@${host}>;tag=${tag}`,
         `To: <sip:${host}:${port}>`,
@@ -151,20 +215,38 @@ export async function sipOptions(peer: string, timeoutMs = 3000): Promise<{ ok: 
   });
 }
 
-/** The gateway answers: an HTTP health address returns 200, or a tcp://host:port accepts a connection (Asterisk's ARI). */
+/** An address on this server itself, where a gateway's own (self-made) certificate is accepted. */
+const isLocal = (host: string) => host === "127.0.0.1" || host === "localhost" || host === "::1";
+
+/**
+ * The gateway answers: an HTTP health address returns 200, a tcp://host:port accepts a
+ * connection, or a tls://host:port completes a TLS handshake (Asterisk's encrypted SIP), its
+ * certificate checked against the host name unless the host is this server itself.
+ */
 export async function gatewayUp(url: string, timeoutMs = 3000): Promise<boolean> {
-  const tcp = /^tcp:\/\/([^:/\s]+):(\d{1,5})$/.exec(url);
-  if (!tcp) return (await fetch(url, { signal: AbortSignal.timeout(timeoutMs) }).catch(() => null))?.ok ?? false;
+  const m = /^(tcp|tls):\/\/([^:/\s]+):(\d{1,5})$/.exec(url);
+  if (!m) return (await fetch(url, { signal: AbortSignal.timeout(timeoutMs) }).catch(() => null))?.ok ?? false;
+  const [, scheme, host, port] = m as unknown as [string, "tcp" | "tls", string, string];
   return new Promise((resolve) => {
-    const s = connect({ host: tcp[1]!, port: Number(tcp[2]) });
+    const s =
+      scheme === "tls"
+        ? tlsConnect({ host, port: Number(port), servername: isIP(host) ? undefined : host, rejectUnauthorized: !isLocal(host) })
+        : connect({ host, port: Number(port) });
     const done = (up: boolean) => {
       s.destroy();
       resolve(up);
     };
     s.setTimeout(timeoutMs, () => done(false));
-    s.once("connect", () => done(true));
+    s.once(scheme === "tls" ? "secureConnect" : "connect", () => done(true));
     s.once("error", () => done(false));
   });
+}
+
+/** How the line card names a gateway address that is not answering. */
+function gatewayPart(url: string): string {
+  const m = /^(?:tcp|tls):\/\/([^:/\s]+):(\d{1,5})$/.exec(url);
+  if (!m) return url;
+  return isLocal(m[1]!) ? "Asterisk on this server" : `${m[1]}:${m[2]}`;
 }
 
 const RANK: Record<CheckState, number> = { ok: 0, waiting: 1, fail: 2 };
@@ -173,7 +255,8 @@ const RANK: Record<CheckState, number> = { ok: 0, waiting: 1, fail: 2 };
 export async function checkLine(
   cfg: LineConfig,
   facts: NetFacts,
-  probes: { sip: typeof sipOptions; gateway: (url: string) => Promise<boolean> } = { sip: sipOptions, gateway: (u) => gatewayUp(u) },
+  probes: { sip: typeof sipOptions; gateway: (url: string) => Promise<boolean>; asterisk?: (file: string) => Promise<AsteriskView | null> } = { sip: sipOptions, gateway: (u) => gatewayUp(u) },
+  now = Date.now(),
 ): Promise<LineStatus> {
   const checks: LineCheck[] = [];
   const { port, why } = pickPort(cfg, facts);
@@ -200,7 +283,26 @@ export async function checkLine(
   );
   if (!cfg.sipPeer) checks.push({ key: "telecom", label: "Telecom telephone system", state: "waiting", detail: "Waiting for the telecom team's SIP address and settings.", fix: "Ask the telecom team for the questions in the integration checklist, then set JENAI_TEL_SIP_PEER." });
   else if (!ip) checks.push({ key: "telecom", label: "Telecom telephone system", state: "waiting", detail: "Waiting for a network address on the cable port." });
-  else {
+  else if (cfg.asteriskStatusFile) {
+    const read = probes.asterisk ?? ((f: string) => readFile(f, "utf8").then(parseAsteriskStatus, () => null));
+    const v = await read(cfg.asteriskStatusFile);
+    const peer = cfg.sipPeer;
+    const label = "Telecom telephone system";
+    if (!v || now / 1000 - v.at > 180) checks.push({ key: "telecom", label, state: "fail", detail: "Asterisk on this server has not reported the line for over 3 minutes.", fix: "Run sip-bridge-setup.sh again." });
+    else if (v.asterisk === "down") checks.push({ key: "telecom", label, state: "fail", detail: "Asterisk on this server is not running.", fix: "It restarts by itself; if this stays red, run sip-bridge-setup.sh again." });
+    else if (v.user)
+      checks.push(
+        v.register === "Registered"
+          ? { key: "telecom", label, state: "ok", detail: `${v.user} signed in to ${peer} (through Asterisk).` }
+          : { key: "telecom", label, state: "fail", detail: `${v.user} is not signed in to ${peer} (${v.register || "no answer"}).`, fix: `Check extension ${v.user}'s password on the SIP server, then run sip-bridge-setup.sh again with that password.` },
+      );
+    else
+      checks.push(
+        v.gov === "Avail"
+          ? { key: "telecom", label, state: "ok", detail: `${peer} answers Asterisk on this server.` }
+          : { key: "telecom", label, state: "fail", detail: `${peer} does not answer Asterisk on this server (${v.gov || "no answer"}).`, fix: "Ask the telecom team to confirm the SIP address, port and transport, and that our address is allowed on their side." },
+      );
+  } else {
     const r = await probes.sip(cfg.sipPeer);
     checks.push(
       r.ok
@@ -208,10 +310,25 @@ export async function checkLine(
         : { key: "telecom", label: "Telecom telephone system", state: "fail", detail: `${cfg.sipPeer} did not answer: ${r.error ?? "no reply"}.`, fix: "Ask the telecom team to confirm the SIP address, port and transport, and that our address is allowed on their side." },
     );
   }
-  if (!cfg.gatewayHealthUrl) checks.push({ key: "gateway", label: "Telephone gateway", state: "waiting", detail: "Not set up yet: it is configured from the telecom team's answers." });
+  const gatewayUrls = (cfg.gatewayHealthUrl ?? "").split(/[\s,]+/).filter(Boolean);
+  if (!gatewayUrls.length) checks.push({ key: "gateway", label: "Telephone gateway", state: "waiting", detail: "Not set up yet: it is configured from the telecom team's answers." });
   else {
-    const up = await probes.gateway(cfg.gatewayHealthUrl);
-    checks.push(up ? { key: "gateway", label: "Telephone gateway", state: "ok", detail: "Running." } : { key: "gateway", label: "Telephone gateway", state: "fail", detail: "Not answering.", fix: "It restarts by itself; if this stays red, see the troubleshooting guide." });
+    const down: string[] = [];
+    for (const url of gatewayUrls) if (!(await probes.gateway(url))) down.push(url);
+    const remote = down.filter((u) => gatewayPart(u) !== "Asterisk on this server");
+    checks.push(
+      !down.length
+        ? { key: "gateway", label: "Telephone gateway", state: "ok", detail: "Running." }
+        : {
+            key: "gateway",
+            label: "Telephone gateway",
+            state: "fail",
+            detail: `${down.map(gatewayPart).join(" and ")} ${down.length > 1 ? "are" : "is"} not answering.`,
+            fix: remote.length
+              ? "Check this office's internet connection. On the voice server, run sip-gateway-setup.sh, and check that its AWS security group lets this office's internet address in (TCP 5061 and UDP 10000-10200)."
+              : "It restarts by itself; if this stays red, run sip-bridge-setup.sh again.",
+          },
+    );
   }
   checks.push({ key: "test_call", label: "Automatic AI test call", state: "waiting", detail: "Runs every few minutes once the gateway is set up, and shows whether a caller hears the AI." });
   const overall = checks.reduce<CheckState>((w, c) => (RANK[c.state] > RANK[w] ? c.state : w), "ok");

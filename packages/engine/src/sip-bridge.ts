@@ -1,12 +1,12 @@
 /**
- * The voice engine's side of the police server's SIP bridge:
+ * The voice engine's side of the government telephone line:
  *
- *   department's SIP server <-SIP-> police server (Asterisk) <-ARI + audio WebSocket-> voice engine
+ *   department's SIP server <-SIP-> police server (Asterisk) <-SIP over TLS + SRTP-> voice server
+ *     (Asterisk <-ARI + audio WebSocket, on that server-> voice engine)
  *
- * SIP stays on the office network. The engine controls each call through Asterisk's REST
- * interface (ARI, reached over Tailscale) and gets only the call's audio, over a WebSocket the
- * police server opens to it. Every call the SIP server sends goes to one extension, answered by
- * the CY Police agent.
+ * The police server forwards each call to the voice server's Asterisk, which the engine controls
+ * through its REST interface (ARI) on the voice server itself. Every call goes to one extension,
+ * answered by the CY Police agent. deploy/voice/sip-gateway-setup.sh sets up the voice server.
  */
 import type { DograhClient } from "@jenai/voice";
 
