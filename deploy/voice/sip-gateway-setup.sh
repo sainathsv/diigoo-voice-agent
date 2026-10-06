@@ -33,14 +33,15 @@ ok() { printf "  \033[32mOK\033[0m  %s\n" "$*"; }
 note() { printf "  \033[33mNOTE\033[0m  %s\n" "$*"; }
 die() { printf "  \033[31mPROBLEM\033[0m  %s\n" "$*"; exit 1; }
 ast() { docker exec $NAME asterisk -rx "$1" 2>/dev/null || true; }
-container() { docker ps --format '{{.Names}} {{.Image}}' | awk -v re="$1" '$0 ~ re {print $1; exit}'; }
+container() { docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk -v re="$1" '$0 ~ re {print $1; exit}' || true; }
 [ "$(id -u)" = 0 ] || die "Run it with sudo: ... | sudo bash -s -- <office address>"
 [[ "$OFFICE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Give the office's internet address that sip-bridge-setup.sh printed on the police server: ... | sudo bash -s -- <office address>"
 case "$OFFICE_IP" in
   10.* | 127.* | 192.168.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*)
     die "$OFFICE_IP is a private address. Give the office's internet address that sip-bridge-setup.sh printed." ;;
 esac
-command -v docker >/dev/null || die "Docker is not on this server: run this on the voice server."
+command -v docker >/dev/null || die "Docker is not on this server: run this on the voice server (prompt ubuntu@ip-172-31-24-250)."
+docker info >/dev/null 2>&1 || die "Docker is not running here: run this on the voice server (prompt ubuntu@ip-172-31-24-250)."
 
 say "1. This server"
 API=$(container 'dograh-api')
@@ -62,7 +63,7 @@ ARI_HOST=${BASH_REMATCH[1]}
 ARI_PORT=${BASH_REMATCH[2]}
 [[ "$ARI_USER$STASIS$WS_CLIENT" =~ ^[A-Za-z0-9_.-]+$ ]] && [[ "$ARI_PASS" =~ ^[A-Za-z0-9]+$ ]] || die "The bridge's settings on the voice engine are not as sip-bridge-setup.sh makes them: run it on the police server again."
 if ! ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -qx "$ARI_HOST"; then
-  D0=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+  D0=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
   die "The bridge sends the voice engine to $ARI_URL, which is not on this server. On the police server run: ARI_URL=http://${D0:-172.17.0.1}:8088 bash ~/Desktop/sip-bridge-setup.sh"
 fi
 ok "ARI user $ARI_USER at $ARI_URL; calls go to the Stasis application $STASIS"
