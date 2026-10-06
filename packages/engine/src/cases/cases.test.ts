@@ -10,7 +10,7 @@ import { agents, calls, caseCalls, caseEvidence, caseMessages, cases, organizati
 import { CYBER_INTAKE_DOMAIN } from "@jenai/voice";
 import { scamKeyFromText } from "../scams";
 import { ResilientReader, caseFromCall, complainantNumber, fieldsFromCall, followUpCalls, handleInbound, parseRead, remindPending, resendFailed, type CaseReader, type ReadResult } from "./cases";
-import { missingFor, questionFor, reminderText } from "./catalog";
+import { missingFor, questionFor, reminderText, withPinLocation } from "./catalog";
 import { INBOX_MAX_ATTEMPTS, processInbox, queueInbound, retryInbox } from "./inbox";
 import { SimulatedWhatsApp, chatIdFor, parseOpenWaWebhook, validSignature, type QueuedMessage, type WhatsAppSender } from "./whatsapp";
 import { createHmac } from "node:crypto";
@@ -49,7 +49,12 @@ describe("case catalogue", () => {
     expect(missingFor({}, "account_frozen", 0)).toEqual([]);
     expect(missingFor({}, "online_harassment", 0)).toEqual([]);
     const money = missingFor({}, "upi_bank_card", 0);
-    expect(money).toEqual(["complainant_name", "father_or_husband_name", "date_of_birth", "house_number", "present_address", "police_station", "district", "pincode", "victim_bank_and_account", "transactions", "money_lost", "how_it_happened", "fraudster_details", "apk_or_link", "proof"]);
+    // The police station and district come after the PIN code: found from it and confirmed, or asked when it is not listed.
+    expect(money).toEqual(["complainant_name", "father_or_husband_name", "date_of_birth", "house_number", "present_address", "pincode", "victim_bank_and_account", "transactions", "money_lost", "how_it_happened", "fraudster_details", "apk_or_link", "proof"]);
+    expect(missingFor(withPinLocation({ pincode: "249201" }), "upi_bank_card", 0)).toContain("location_check");
+    expect(missingFor(withPinLocation({ pincode: "110001" }), "upi_bank_card", 0)).toEqual(expect.arrayContaining(["police_station", "district"]));
+    // A money fraud reported 3 or more days late goes to the form link: nothing is asked.
+    expect(missingFor({ followup: "form_link", financial: "yes" }, "upi_bank_card", 0)).toEqual([]);
     expect(missingFor({ money_lost: "5000" }, "other", 0)).toContain("transactions");
     expect(missingFor({ financial: "yes" }, "other", 0)).toContain("transactions");
     expect(missingFor({}, "upi_bank_card", 1)).not.toContain("proof");
@@ -109,7 +114,7 @@ describe("a money fraud from call to officers", () => {
     expect(c!.missing[0]).toBe("father_or_husband_name");
     expect(c!.missing).not.toContain("complainant_name");
     expect(c!.missing).not.toContain("how_it_happened");
-    expect(c!.missing).toHaveLength(12);
+    expect(c!.missing).toHaveLength(10);
     expect(wa.sent).toHaveLength(1);
     expect(wa.sent[0]!.body).toMatch(/शिकायत संख्या CY-\d{4}-000001/);
     expect(wa.sent[0]!.body).toContain("पिता या पति");
@@ -135,10 +140,9 @@ describe("a money fraud from call to officers", () => {
       "15/08/1990": { fields: { date_of_birth: "1990-08-15" } },
       "12-4": { fields: { house_number: "12-4" } },
       "Shanti Vihar, Rishikesh": { fields: { present_address: "Shanti Vihar, Rishikesh" } },
-      "Rishikesh thana": { fields: { police_station: "Rishikesh" } },
-      "Dehradun": { fields: { district: "Dehradun" } },
       "24920": { fields: { pincode: "24920" } },
       "249201": { fields: { pincode: "249201" } },
+      "haan sahi hai": { fields: { location_confirmed: "yes" } },
       "SBI 30012345678": { fields: { victim_bank_and_account: "SBI; 30012345678" } },
       "UTR 412345678901, 40000, 28 Sep": { fields: { transactions: "40000 | 28 Sep | 412345678901" } },
       "40000": { fields: { money_lost: "40000" } },
@@ -148,12 +152,17 @@ describe("a money fraud from call to officers", () => {
     const say = (text: string) => handleInbound(tenant, { from: phone, id: randomUUID(), at: new Date(), text }, reader, wa);
     await say("Sadanandam");
     expect(wa.sent.at(-1)!.body).toContain("जन्म तिथि");
-    for (const t of ["15/08/1990", "12-4", "Shanti Vihar, Rishikesh", "Rishikesh thana", "Dehradun"]) await say(t);
-    expect(wa.sent.at(-1)!.body).toContain("पिनकोड");
+    for (const t of ["15/08/1990", "12-4", "Shanti Vihar, Rishikesh"]) await say(t);
+    expect(wa.sent.at(-1)!.body).toContain("6. आपके क्षेत्र का पिनकोड");
     await say("24920"); // five digits
     expect(wa.sent.at(-1)!.body).toContain("6 अंकों");
-    expect(wa.sent.at(-1)!.body).toContain("8. आपके क्षेत्र का पिनकोड");
-    for (const t of ["249201", "SBI 30012345678", "UTR 412345678901, 40000, 28 Sep"]) await say(t);
+    expect(wa.sent.at(-1)!.body).toContain("6. आपके क्षेत्र का पिनकोड");
+    // The PIN code gives the district and the likely police station: only confirmed, not asked.
+    await say("249201");
+    expect(wa.sent.at(-1)!.body).toContain("By your PIN code 249201, your district is Dehradun and your police station is likely Rishikesh. Is that right?");
+    await say("haan sahi hai");
+    expect(wa.sent.at(-1)!.body).toContain("8. Which bank");
+    for (const t of ["SBI 30012345678", "UTR 412345678901, 40000, 28 Sep"]) await say(t);
     // The amount and what happened came from the call, the fraudster's number from the second call: next is the APK question.
     expect(wa.sent.at(-1)!.body).toContain("APK");
     await say("no");
@@ -169,6 +178,8 @@ describe("a money fraud from call to officers", () => {
     expect(c!.status).toBe("ready");
     expect(c!.missing).toEqual([]);
     expect(c!.district).toBe("Dehradun");
+    expect(c!.fields.police_station).toBe("Rishikesh");
+    expect(c!.fields.location_confirmed).toBe("yes");
     expect(c!.amountLostPaise).toBe(4_000_000);
     const ev = await withTenant(tenant, (tx) => tx.select().from(caseEvidence));
     expect(ev).toHaveLength(1);
@@ -286,15 +297,16 @@ describe("each call is followed once", () => {
     const wa = new SimulatedWhatsApp();
     const who = "+919800000051";
     await at(who, { complaint_type: "UPI fraud", money_lost: "5000", complainant_name: "Kavita Joshi", father_or_husband_name: "F: Mohan Joshi", date_of_birth: "1990-01-01", house_number: "12", present_address: "Rajpur Road, Dehradun", police_station: "Rajpur", district: "Dehradun", pincode: "248001" }, wa);
-    expect(wa.sent.at(-1)!.body).toContain("9. Which bank");
+    expect(wa.sent.at(-1)!.body).toContain("8. Which bank"); // their own police station and district: nothing to confirm
     const say = (text: string) => handleInbound(tenant, { from: who, id: randomUUID(), at: new Date(), text }, new ResilientReader(null), wa);
     await say("Hdfc");
     expect(wa.sent.at(-1)!.body).toContain("both the bank name and the account number");
-    expect(wa.sent.at(-1)!.body).toContain("9. Which bank");
+    expect(wa.sent.at(-1)!.body).toContain("8. Which bank");
     await say("50100123456789");
     const [c] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.complainantE164, who)));
     expect(c!.fields.victim_bank_and_account).toBe("HDFC; 50100123456789");
-    expect(wa.sent.at(-1)!.body).toContain("11. Send the UTR");
+    expect(wa.sent.at(-1)!.body).toContain("10. Send the UTR");
+    expect(c!.fields.police_station).toBe("Rajpur");
   });
 
   it("does not message about a call read long after it happened", async () => {
@@ -333,6 +345,48 @@ describe("each call is followed once", () => {
     expect(wa.sent).toHaveLength(1);
     expect(k!.fields.district).toBe("Almora");
     expect(await withTenant(tenant, (tx) => tx.select().from(caseCalls).where(eq(caseCalls.callId, fresh!.id)))).toHaveLength(1);
+  });
+});
+
+describe("the department's rules", () => {
+  const opened = (who: string, extracted: Record<string, unknown>, wa: SimulatedWhatsApp, at = new Date("2026-10-06T06:00:00Z")) =>
+    withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id: randomUUID(), phone: who, contactId: null, branchId: null, extracted, at }, wa));
+
+  it("sends a money fraud reported 3 or more days after the transaction to the form link, and asks nothing", async () => {
+    await withTenant(tenant, (tx) => tx.update(whatsappChannels).set({ formUrl: "https://cybercrime.gov.in/" }));
+    const wa = new SimulatedWhatsApp();
+    const said = await opened("+919800000091", { complaint_type: "UPI fraud", money_lost: "12000", how_it_happened: "Paid a fake seller", within_3_days: "no" }, wa);
+    expect(said!.fields).toMatchObject({ followup: "form_link", late_report: "yes", financial: "yes" });
+    expect(said!.status).toBe("ready");
+    expect(said!.missing).toEqual([]);
+    expect(wa.sent[0]!.body).toContain("This helpline takes money fraud complaints only within 3 days of the transaction. Please file your complaint at this link: https://cybercrime.gov.in/");
+    expect(wa.sent[0]!.body).toContain("ट्रांजेक्शन के 3 दिन के अंदर ही ली जाती है");
+    // Worked out from the date the money left, against the day of the call (6 October).
+    const dated = await opened("+919800000092", { complaint_type: "UPI fraud", money_lost: "900", how_it_happened: "Paid a fake seller", transaction_date: "2026-10-03" }, wa);
+    expect(dated!.fields.late_report).toBe("yes");
+    const recent = await opened("+919800000093", { complaint_type: "UPI fraud", money_lost: "900", how_it_happened: "Paid a fake seller", transaction_date: "2026-10-04" }, wa);
+    expect(recent!.fields.followup).toBe("questions");
+    expect(wa.sent.at(-1)!.body).toContain("1. What is your full name?");
+    await withTenant(tenant, (tx) => tx.update(whatsappChannels).set({ formUrl: null }));
+  });
+
+  it("asks the police station and district for a PIN code outside Uttarakhand, and takes a correction of the ones it found", async () => {
+    const wa = new SimulatedWhatsApp();
+    const ask = (who: string) => (text: string, reader: CaseReader = new ResilientReader(null)) => handleInbound(tenant, { from: who, id: randomUUID(), at: new Date(), text }, reader, wa);
+    const base = { complaint_type: "UPI fraud", money_lost: "900", how_it_happened: "Paid a fake seller", complainant_name: "Asha Rawat", father_or_husband_name: "F: Ram Rawat", date_of_birth: "1990-01-01", house_number: "7", present_address: "Karol Bagh, New Delhi" };
+    await opened("+919800000094", base, wa);
+    const delhi = ask("+919800000094");
+    await delhi("110005");
+    expect(wa.sent.at(-1)!.body).toContain("Which is your police station?");
+    // A PIN code in the list, then the right police station instead of "yes".
+    await opened("+919800000095", { ...base, present_address: "Mayapur, Haridwar" }, wa);
+    const hw = ask("+919800000095");
+    await hw("249401");
+    expect(wa.sent.at(-1)!.body).toContain("your district is Haridwar and your police station is likely Haridwar");
+    await hw("Kotwali Nagar");
+    const [c] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.complainantE164, "+919800000095")));
+    expect(c!.fields).toMatchObject({ police_station: "Kotwali Nagar", district: "Haridwar", location_confirmed: "corrected" });
+    expect(wa.sent.at(-1)!.body).toContain("8. Which bank");
   });
 });
 
@@ -423,23 +477,33 @@ describe("WhatsApp through OpenWA", () => {
     expect(parseOpenWaWebhook({ hello: "world" })).toBeNull();
   });
 
-  it("queues each message once and answers it from the worker", async () => {
+  it("queues each message once, and answers someone who has not called with the department's greeting only", async () => {
     const wa = new SimulatedWhatsApp();
     const who = "+919800000003";
-    const reader = new ScriptedReader({ "Mera naam Ravi Kumar hai, 5000 UPI se gaye": { fields: { complainant_name: "Ravi Kumar", incident_description: "Lost 5000 by UPI" }, scam_type: "upi_bank_card" } });
-    const m: QueuedMessage = { id: `wa-${randomUUID()}`, chatId: "919800000003@c.us", from: who, lid: null, at: new Date().toISOString(), text: "Mera naam Ravi Kumar hai, 5000 UPI se gaye" };
+    let read = 0;
+    const reader: CaseReader = { read: async () => (read++, { fields: {} }) };
+    const msg = (text: string): QueuedMessage => ({ id: `wa-${randomUUID()}`, chatId: "919800000003@c.us", from: who, lid: null, at: new Date().toISOString(), text });
+    const m = msg("Mera naam Ravi Kumar hai, 5000 UPI se gaye");
     expect(await queueInbound(tenant, m)).toBe(true);
     expect(await queueInbound(tenant, m)).toBe(false); // OpenWA retried the same delivery
     expect(await processInbox(tenant, reader, wa)).toEqual({ handled: 1, failed: 0 });
-    const [c] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.complainantE164, who)));
-    expect(c!.fields.complainant_name).toBe("Ravi Kumar");
-    expect(c!.scamType).toBe("upi_bank_card");
-    expect(wa.sent.at(-1)!.to).toBe(who);
-    expect(wa.sent.at(-1)!.body).toContain("पिता या पति");
+    expect(wa.sent).toHaveLength(1);
+    expect(wa.sent[0]!.to).toBe(who);
+    expect(wa.sent[0]!.body).toContain("To report a cyber crime, please call our helpline");
+    expect(wa.sent[0]!.body).toContain("साइबर अपराध की शिकायत के लिए कृपया हमारी हेल्पलाइन");
+    expect(read).toBe(0); // nothing of theirs is read or kept as a complaint
+    expect(await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.complainantE164, who)))).toHaveLength(0);
+    // A second message soon after gets no second greeting.
+    await queueInbound(tenant, msg("hello?"));
+    expect(await processInbox(tenant, reader, wa)).toEqual({ handled: 1, failed: 0 });
+    expect(wa.sent).toHaveLength(1);
     expect(await processInbox(tenant, reader, wa)).toEqual({ handled: 0, failed: 0 });
   });
 
   it("keeps a message it could not read, tries again after a widening gap, and keeps that person's later messages behind it", async () => {
+    // Both have called the helpline, so their replies are read.
+    for (const who of ["+919800000004", "+919800000014"])
+      await withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id: randomUUID(), phone: who, contactId: null, branchId: null, extracted: { complaint_type: "UPI fraud", money_lost: "700", how_it_happened: "Paid a fake seller" } }, new SimulatedWhatsApp()));
     const wa = new SimulatedWhatsApp();
     const broken: CaseReader = { read: async () => { throw new Error("database went away"); } };
     const msg = (who: string, text: string): QueuedMessage => ({ id: `wa-${randomUUID()}`, chatId: `${who.slice(1)}@c.us`, from: who, lid: null, at: new Date().toISOString(), text });
@@ -462,6 +526,7 @@ describe("WhatsApp through OpenWA", () => {
   });
 
   it("puts the messages that could not be read back for another try", async () => {
+    await withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id: randomUUID(), phone: "+919800000024", contactId: null, branchId: null, extracted: { complaint_type: "UPI fraud", money_lost: "700", how_it_happened: "Paid a fake seller" } }, new SimulatedWhatsApp()));
     const m: QueuedMessage = { id: `wa-${randomUUID()}`, chatId: "919800000024@c.us", from: "+919800000024", lid: null, at: new Date().toISOString(), text: "hello" };
     await queueInbound(tenant, m);
     await withTenant(tenant, (tx) => tx.update(whatsappInbox).set({ attempts: INBOX_MAX_ATTEMPTS, lastError: "gave up" }).where(eq(whatsappInbox.externalId, m.id)));
@@ -470,7 +535,7 @@ describe("WhatsApp through OpenWA", () => {
     expect(await processInbox(tenant, new ScriptedReader({}), new SimulatedWhatsApp())).toEqual({ handled: 1, failed: 0 });
   });
 
-  it("answers someone whose number WhatsApp hides on their private chat, and asks the number first", async () => {
+  it("asks someone whose number WhatsApp hides for it, on their private chat, and greets them when they never called", async () => {
     expect(chatIdFor("lid:12345678901234")).toBe("12345678901234@lid");
     expect(chatIdFor("+919800000001")).toBe("919800000001@c.us");
     const wa = new SimulatedWhatsApp();
@@ -489,8 +554,10 @@ describe("WhatsApp through OpenWA", () => {
     const [after] = await withTenant(tenant, (tx) => tx.select().from(cases).where(eq(cases.id, c!.id)));
     expect(after!.fields.mobile_number).toBe("+919800000071");
     expect(complainantNumber(after!)).toBe("+919800000071");
-    expect(wa.sent.at(-1)!.body).toContain("Please tell us briefly what happened."); // on with the complaint, on the private chat
+    // No call from that number: the department's greeting, on the private chat, and the chat closes.
     expect(wa.sent.at(-1)!.to).toBe("lid:12345678901234");
+    expect(wa.sent.at(-1)!.body).toContain("To report a cyber crime, please call our helpline");
+    expect(after!.status).toBe("closed");
   });
 
   it("joins a hidden-number chat to the caller's complaint once they give the number they called from", async () => {
@@ -523,6 +590,7 @@ describe("WhatsApp through OpenWA", () => {
   });
 
   it("stores a photo that arrived inside the webhook without asking the gateway again", async () => {
+    await withTenant(tenant, (tx) => caseFromCall(tx, tenant, { id: randomUUID(), phone: "+919800000005", contactId: null, branchId: null, extracted: { complaint_type: "UPI fraud", money_lost: "700", how_it_happened: "Paid a fake seller" } }, new SimulatedWhatsApp()));
     const wa = new SimulatedWhatsApp(); // has no media: a download attempt would fail
     const m: QueuedMessage = { id: `wa-${randomUUID()}`, chatId: "919800000005@c.us", from: "+919800000005", lid: null, at: new Date().toISOString(), text: "screenshot", media: { kind: "image", mime: "image/png", dataBase64: Buffer.from("png-bytes").toString("base64") } };
     await queueInbound(tenant, m);

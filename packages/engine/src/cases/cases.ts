@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
-import { and, desc, eq, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
-import { agents, audit, calls, caseCalls, caseEvidence, caseMessages, cases, organizations, withTenant, type Case, type Tx, type WhatsappChannel } from "@jenai/db";
+import { agents, audit, calls, caseCalls, caseEvidence, caseMessages, cases, organizations, phoneNumbers, withTenant, type Case, type Tx, type WhatsappChannel } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN, toE164 } from "@jenai/voice";
 import { SCAM_TYPES, categoryOf, isNotCyberCrime, scamKeyFromText } from "../scams";
 import { isOnOwnNetwork } from "../own-network";
@@ -14,14 +14,17 @@ import {
   completeText,
   dangerText,
   formLinkText,
+  greetingText,
   hintFor,
   isFinancial,
   joinedText,
+  lateFormLinkText,
   missingFor,
   openerText,
   questionFor,
   receivedProofText,
   reminderText,
+  withPinLocation,
 } from "./catalog";
 import { fallbackRead, quickRead } from "./quick-read";
 import { isLidAddress, whatsappFor, type InboundMessage, type WhatsAppSender } from "./whatsapp";
@@ -80,6 +83,7 @@ const CALL_KEYS = [
   "apk_or_link",
   "type_details",
   "complaint_type",
+  "transaction_date",
 ] as const;
 const clean = (v: unknown) => {
   const t = v === null || v === undefined ? "" : String(v).trim();
@@ -113,16 +117,19 @@ async function evidenceCount(tx: Tx, caseId: string): Promise<number> {
  * has nothing left to collect, or is not collecting at all (the caller has no WhatsApp).
  */
 async function settle(tx: Tx, tenantId: string, c: Case): Promise<Case> {
-  const missing = missingFor(c.fields, c.scamType, await evidenceCount(tx, c.id));
+  // A new PIN code fills the district and the likely police station, for the complainant to confirm.
+  const fields = withPinLocation(c.fields);
+  const missing = missingFor(fields, c.scamType, await evidenceCount(tx, c.id));
   const ready = c.status === "collecting" && (missing.length === 0 || c.fields.followup === "none");
   const [u] = await tx
     .update(cases)
     .set({
+      ...(fields !== c.fields ? { fields } : {}),
       missing,
       status: ready ? "ready" : c.status,
       readyAt: ready ? new Date() : c.readyAt,
-      amountLostPaise: rupeesToPaise(c.fields.money_lost) ?? c.amountLostPaise,
-      district: c.fields.district ?? c.district,
+      amountLostPaise: rupeesToPaise(fields.money_lost) ?? c.amountLostPaise,
+      district: fields.district ?? c.district,
       updatedAt: new Date(),
     })
     .where(eq(cases.id, c.id))
@@ -226,10 +233,11 @@ async function send(tx: Tx, tenantId: string, c: Case, sender: WhatsAppSender, b
 
 type Wa = { channel: WhatsappChannel; sender: WhatsAppSender };
 
-/** A complaint without money lost gets the cyber team's own form, once. */
+/** A complaint without money lost, or a money fraud reported 3 or more days late, gets the cyber team's own form, once. */
 async function sendFormLink(tx: Tx, tenantId: string, c: Case, wa: Wa) {
   const url = wa.channel.formUrl;
-  if (url) await send(tx, tenantId, c, wa.sender, formLinkText(await departmentName(tx, tenantId), await caseNo(tx, tenantId, c), url, c.language), "__form__");
+  const text = c.fields.late_report === "yes" ? lateFormLinkText : formLinkText;
+  if (url) await send(tx, tenantId, c, wa.sender, text(await departmentName(tx, tenantId), await caseNo(tx, tenantId, c), url, c.language), "__form__");
   else await record(tx, tenantId, c.id, { direction: "out", body: "(the complaint form link is not set up)", status: "failed", error: "Add the cyber team's form link on the WhatsApp page" });
   await tx.update(cases).set({ fields: { ...c.fields, followup: "form_link" }, ...(url ? {} : { asking: "__form__" }) }).where(eq(cases.id, c.id));
 }
@@ -239,11 +247,11 @@ async function askNext(tx: Tx, tenantId: string, c: Case, wa: Wa, prefix?: strin
   const next = c.missing[0];
   if (!next) {
     if (c.asking === "__form__" || c.asking === "__done__") return;
-    if (c.scamType && !isFinancial(c.fields, c.scamType)) return sendFormLink(tx, tenantId, c, wa);
+    if ((c.scamType && !isFinancial(c.fields, c.scamType)) || c.fields.followup === "form_link") return sendFormLink(tx, tenantId, c, wa);
     if (c.status === "ready") await send(tx, tenantId, c, wa.sender, [prefix, completeText(await caseNo(tx, tenantId, c), c.language)].filter(Boolean).join("\n\n"), "__done__");
     return;
   }
-  await send(tx, tenantId, c, wa.sender, [prefix, questionFor(next, c.language)].filter(Boolean).join("\n\n"), next);
+  await send(tx, tenantId, c, wa.sender, [prefix, questionFor(next, c.language, c.fields)].filter(Boolean).join("\n\n"), next);
 }
 
 async function markUrgent(tx: Tx, c: Case, extracted: Record<string, unknown>): Promise<Case> {
@@ -265,7 +273,7 @@ async function markUrgent(tx: Tx, c: Case, extracted: Record<string, unknown>): 
 export async function caseFromCall(
   tx: Tx,
   tenantId: string,
-  call: { id: string; phone: string | null; contactId: string | null; branchId: string | null; extracted: Record<string, unknown> },
+  call: { id: string; phone: string | null; contactId: string | null; branchId: string | null; extracted: Record<string, unknown>; at?: Date },
   sender?: WhatsAppSender,
   opts: { message?: boolean } = {},
 ): Promise<Case | null> {
@@ -288,7 +296,8 @@ export async function caseFromCall(
   if (scam === null && !incoming.how_it_happened && !FRAUDSTER_KEYS.some((k) => incoming[k])) return null; // nothing to open a case on
   const wantsWhatsApp = !noWhatsApp(call.extracted);
   const money = isFinancial(incoming, scam);
-  const followup = !wantsWhatsApp ? "none" : scam && !money ? "form_link" : "questions";
+  const late = money && reportedLate(call.extracted, call.at ?? new Date());
+  const followup = !wantsWhatsApp ? "none" : (scam && !money) || late ? "form_link" : "questions";
   const open = await openCaseFor(tx, phone);
   const was = open && continues(open, scam) ? open : null;
   const fresh = !was;
@@ -299,6 +308,7 @@ export async function caseFromCall(
     const fields: Record<string, string> = { ...incoming, followup };
     if (wantsWhatsApp) fields.whatsapp_consent = "yes";
     if (money) fields.financial = "yes";
+    if (late) fields.late_report = "yes";
     if (phone !== call.phone && call.phone) fields.caller_number = call.phone;
     c = await newCase(tx, tenantId, { phone, contactId: call.contactId, callId: call.id, branchId: call.branchId, fields, scamType: scam, language });
   } else {
@@ -327,6 +337,23 @@ export async function caseFromCall(
   const [department, no] = [await departmentName(tx, tenantId), await caseNo(tx, tenantId, c)];
   await askNext(tx, tenantId, c, wa, fresh ? openerText(department, no, c.language) : callAgainText(department, no, c.language));
   return c;
+}
+
+/** The call's date in India, as UTC midnight of that day. */
+const istDay = (at: Date) => Date.parse(`${at.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })}T00:00:00Z`);
+
+/**
+ * A money fraud reported 3 or more days after the transaction: the helpline takes those through
+ * the form link (the department's rule). The call says so ("within_3_days"); else the date the
+ * money left, against the day of the call.
+ */
+export function reportedLate(x: Record<string, unknown>, at: Date): boolean {
+  const said = clean(x.within_3_days).toLowerCase();
+  if (/^no\b/.test(said)) return true;
+  if (/^yes\b/.test(said)) return false;
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(clean(x.transaction_date));
+  if (!d) return false;
+  return Math.round((istDay(at) - Date.UTC(Number(d[1]), Number(d[2]) - 1, Number(d[3]))) / 86_400_000) >= 3;
 }
 
 /** A call this recent is followed on WhatsApp; one read later than this (a backlog, a re-read) only fills in its case. */
@@ -365,7 +392,7 @@ export async function followUpCalls(tenantId: string, opts: { sender?: WhatsAppS
   for (const { c } of due) {
     if (isNotCyberCrime(String(c.extracted.complaint_type ?? ""))) continue;
     const k = await withTenant(tenantId, (tx) =>
-      caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: c.extracted }, opts.sender),
+      caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: c.extracted, at: c.startedAt }, opts.sender),
     );
     if (k) handled++;
   }
@@ -390,6 +417,7 @@ export interface CaseReader {
 
 /** The form's lines a reply can answer, with how each value must be written. */
 const READ_FIELDS: Record<string, string> = {
+  location_confirmed: "'yes' only if they confirm the district and police station we suggested from their PIN code",
   mobile_number: "the complainant's own 10-digit mobile number, digits only",
   how_it_happened: "how the fraud happened, 1 to 3 sentences in English",
   complainant_name: "the complainant's own full name, in English letters exactly as written",
@@ -560,17 +588,22 @@ export async function handleInbound(tenantId: string, msg: InboundMessage, reade
     const wa = await whatsappFor(tx, tenantId, sender);
     if (!wa) return null;
 
-    // Writing to the helpline is consent: someone who said no on the call, or never called, is answered here.
-    // Someone whose number WhatsApp hides is asked for it first.
+    // Only people who called the helpline continue their complaint here (the department's rule);
+    // anyone else gets the department's greeting. Someone whose number WhatsApp hides is asked
+    // for it first, to find their call. A caller who said no to WhatsApp on the call and writes
+    // now is answered.
     let c = await openCaseFor(tx, msg.from);
+    if (c && c.fields.number_hidden !== "yes" && !(await fromCall(tx, c))) c = null;
     if (!c) {
-      const fields: Record<string, string> = { followup: "questions", whatsapp_consent: "wrote first" };
-      if (isLidAddress(msg.from)) fields.number_hidden = "yes";
+      if (!isLidAddress(msg.from)) {
+        await greet(tx, tenantId, msg, wa.sender);
+        return null;
+      }
+      const fields: Record<string, string> = { followup: "questions", whatsapp_consent: "wrote first", number_hidden: "yes" };
       if (msg.name) fields.whatsapp_name = msg.name;
       c = await settle(tx, tenantId, await newCase(tx, tenantId, { phone: msg.from, fields }));
-    }
-    else if (c.fields.followup === "none")
-      c = one(await tx.update(cases).set({ fields: { ...c.fields, followup: "questions", whatsapp_consent: "wrote first" }, status: "collecting" }).where(eq(cases.id, c.id)).returning());
+    } else if (c.fields.followup === "none")
+      c = one(await tx.update(cases).set({ fields: { ...c.fields, followup: "questions", whatsapp_consent: "wrote after the call" }, status: "collecting" }).where(eq(cases.id, c.id)).returning());
 
     let evidenceId: string | null = null;
     if (msg.media) {
@@ -606,6 +639,8 @@ export async function handleInbound(tenantId: string, msg: InboundMessage, reade
     if (msg.text?.trim()) {
       const r = await reader.read({ asking: asked, text: msg.text, known: c!.fields });
       const fields = { ...c!.fields, ...r.fields };
+      // A police station or district sent instead of "yes" corrects the ones found from the PIN code.
+      if (asked === "location_check" && !r.fields.location_confirmed && (r.fields.police_station || r.fields.district)) fields.location_confirmed = "corrected";
       const scam = c!.scamType ?? (r.scam_type && SCAM_TYPES.some((s) => s.key === r.scam_type) ? r.scam_type : null) ?? (c!.asking === "scam_type" ? scamKeyFromText(msg.text) : null);
       if (r.danger) fields.urgent = "yes";
       c = one(await tx
@@ -621,7 +656,7 @@ export async function handleInbound(tenantId: string, msg: InboundMessage, reade
     // A hidden-number chat whose mobile number has a complaint open (from a call, say) continues that complaint.
     const given = c.fields.number_hidden === "yes" && isLidAddress(c.complainantE164) ? toE164(c.fields.mobile_number ?? "") : null;
     const target = given ? await openCaseFor(tx, given) : null;
-    if (target && target.id !== c.id) {
+    if (target && target.id !== c.id && (await fromCall(tx, target))) {
       c = await settle(tx, tenantId, await joinInto(tx, tenantId, c, target));
       const no = await caseNo(tx, tenantId, c);
       const found = [prefix, joinedText(no, c.language)].filter(Boolean).join("\n\n");
@@ -633,6 +668,13 @@ export async function handleInbound(tenantId: string, msg: InboundMessage, reade
         await send(tx, tenantId, c, wa.sender, `${found}\n\n${rest}`);
       }
       return { caseId: c.id, ready: c.status === "ready" };
+    }
+    if (given) {
+      // No call from the number they gave: the department's greeting, and this chat closes.
+      await tx.update(cases).set({ status: "closed", officerNote: "No call to the helpline from the number given on WhatsApp: greeted only.", updatedAt: new Date() }).where(eq(cases.id, c.id));
+      greeted.delete(`${tenantId}:${msg.from}`);
+      await greet(tx, tenantId, msg, wa.sender);
+      return { caseId: c.id, ready: false };
     }
     // The reply did not answer what we asked, or not in the right shape: say why before asking again.
     if (asked && msg.text?.trim() && !evidenceId && c.missing[0] === asked) prefix = [prefix, hintFor(asked, c.language)].filter(Boolean).join("\n\n");
@@ -661,6 +703,35 @@ async function joinInto(tx: Tx, tenantId: string, chat: Case, target: Case): Pro
   await tx.update(cases).set({ status: "closed", officerNote: `Same person as complaint ${into}: WhatsApp hid their number, so this chat continues there.`, updatedAt: new Date() }).where(eq(cases.id, chat.id));
   await audit(tx, { tenantId, actorUserId: null, via: "system", action: "case.joined", targetType: "case", targetId: target.id, summary: `WhatsApp chat ${from} (number hidden) joined to complaint ${into} by the mobile number given` });
   return joined;
+}
+
+/** The case came from a call to the helpline (opened by one, or joined by one later). */
+async function fromCall(tx: Tx, c: Case): Promise<boolean> {
+  if (c.firstCallId) return true;
+  const [link] = await tx.select({ id: caseCalls.callId }).from(caseCalls).where(eq(caseCalls.caseId, c.id)).limit(1);
+  return !!link;
+}
+
+/** The helpline's phone number, for the greeting: the number set up for calls, else the one calls came in on. */
+async function helplineNumber(tx: Tx): Promise<string | null> {
+  const [n] = await tx.select({ e164: phoneNumbers.e164 }).from(phoneNumbers).where(and(eq(phoneNumbers.status, "active"), inArray(phoneNumbers.purpose, ["inbound", "both"]))).limit(1);
+  const [c] = n ? [] : await tx.select({ e164: calls.toE164 }).from(calls).where(and(eq(calls.direction, "inbound"), isNotNull(calls.toE164))).orderBy(desc(calls.startedAt)).limit(1);
+  const d = (n?.e164 ?? c?.e164 ?? "").replace(/\D/g, "");
+  return d.length >= 10 ? `${d.length > 10 ? `+${d.slice(0, -10)} ` : ""}${d.slice(-10, -5)} ${d.slice(-5)}` : null;
+}
+
+/** Senders greeted lately, so a burst of messages gets one greeting (kept by this worker; a restart may greet once more). */
+const greeted = new Map<string, number>();
+const GREET_EVERY_MS = 12 * 3_600_000;
+
+/** To someone who has not called the helpline: the department's greeting and how to complain, at most every 12 hours. */
+async function greet(tx: Tx, tenantId: string, msg: InboundMessage, sender: WhatsAppSender) {
+  const key = `${tenantId}:${msg.from}`;
+  const last = greeted.get(key);
+  if (last && Date.now() - last < GREET_EVERY_MS) return;
+  greeted.set(key, Date.now());
+  if (greeted.size > 10_000) greeted.delete(greeted.keys().next().value!);
+  await sender.sendText(msg.from, greetingText(await departmentName(tx, tenantId), await helplineNumber(tx), null)).catch(() => null);
 }
 
 /** Delivery receipts from WhatsApp (sent, delivered, read, failed), matched on the message id. */
@@ -703,7 +774,7 @@ export async function remindPending(tenantId: string, now = new Date(), policy =
     for (const c of due) {
       if (c.lastInboundAt && c.lastInboundAt > cutoff) continue;
       const no = await caseNo(tx, tenantId, c);
-      await send(tx, tenantId, c, wa.sender, `${reminderText(no, c.missing, c.language)}\n\n${questionFor(c.missing[0] ?? "proof", c.language)}`, c.missing[0] ?? null, now);
+      await send(tx, tenantId, c, wa.sender, `${reminderText(no, c.missing, c.language)}\n\n${questionFor(c.missing[0] ?? "proof", c.language, c.fields)}`, c.missing[0] ?? null, now);
       await tx.update(cases).set({ remindersSent: c.remindersSent + 1 }).where(eq(cases.id, c.id));
       sent++;
     }

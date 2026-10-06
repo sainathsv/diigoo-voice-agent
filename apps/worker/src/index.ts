@@ -83,7 +83,8 @@ const RECHECK_DAYS = Math.max(1, Number(process.env.JENAI_SAFETY_RECHECK_DAYS ??
 const INTEGRATIONS = !POLICE && process.env.JENAI_INTEGRATIONS !== "false";
 const WHATSAPP = process.env.JENAI_WHATSAPP !== "false";
 const DELIVERY_BATCH = Math.max(1, Number(process.env.JENAI_INTEGRATIONS_BATCH ?? 10));
-const SYNC_MS = Math.max(60, Number(process.env.JENAI_SYNC_SECONDS ?? 300)) * 1000;
+// A police line copies calls every 15 seconds, so WhatsApp follows a call as soon as it ends.
+const SYNC_MS = Math.max(15, Number(process.env.JENAI_SYNC_SECONDS ?? 300)) * 1000;
 const TICK_MS = 3000;
 let stopping = false;
 // Bedrock by default; JENAI_ANALYZER_PROVIDER=local keeps transcripts on this server.

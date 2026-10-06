@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { cases, organizations, platformDb, withTenant } from "@jenai/db";
-import { complaintStatusFor, newStatusToken, tenantForStatusToken } from "./voice-status";
+import { complaintLookup, complaintStatusFor, newStatusToken, tenantForStatusToken } from "./voice-status";
 
 let tenant = "";
 let other = "";
@@ -40,6 +40,15 @@ describe("complaint status at the start of a call", () => {
     expect(await complaintStatusFor(tenant, "+919800000099")).toBe("none");
     expect(await complaintStatusFor(tenant, "")).toBe("none");
     expect(await complaintStatusFor(other, "+919800000061")).toBe("none"); // another workspace's complaint is never seen
+  });
+
+  it("gives the call what a caller may hear about their own complaint, and a greeting that asks first", async () => {
+    const found = await complaintLookup(tenant, "+919800000061");
+    expect(found).toMatchObject({ complaint_status: "In Progress", complaint_number: expect.stringMatching(/^STATUS-\d{4}-000001$/), complaint_type: "cyber crime", complaint_stage: "An officer of the Uttarakhand Police is working on it." });
+    expect(found.complaint_registered).toMatch(/^\d{1,2} \w+ \d{4}$/);
+    expect(found.status_greeting).toContain("इस नंबर से आपकी एक शिकायत पहले से दर्ज है");
+    expect((await complaintLookup(tenant, "+919800000063")).complaint_stage).toMatch(/still awaited from the complainant on WhatsApp/);
+    expect(await complaintLookup(tenant, "+919800000099")).toEqual({ complaint_status: "none" });
   });
 
   it("knows the engine only by the newest token, kept here as a hash", async () => {

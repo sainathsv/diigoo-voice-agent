@@ -284,7 +284,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
         // Usually the case is already open from the engine's reading; this fills in what the AI found.
         if (cyber) {
           if (!isNotCyberCrime(String(merged.complaint_type ?? "")))
-            await caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: merged }, opts.whatsapp, {
+            await caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }, opts.whatsapp, {
               message: Date.now() - c.startedAt.getTime() < FOLLOWUP_WINDOW_MS,
             });
         } else if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;

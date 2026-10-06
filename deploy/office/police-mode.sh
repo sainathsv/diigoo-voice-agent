@@ -8,7 +8,7 @@
 #   2. Installs Ollama (AI that runs on this server) and a model that fits, so calls are
 #      read here. If the server is too small for it, calls still work without that step.
 #   3. Switches the portal to the police edition: only Analytics, Calls, Team, Roles,
-#      Branches and Activity log; every recording kept here; new calls copied every minute.
+#      Branches and Activity log; every recording kept here; new calls copied every 15 seconds.
 #   4. Removes the AWS keys from the settings file.
 #   5. Lets the portal open on every address of this server (office network and Tailscale), and shows the
 #      government telephone line status (cable, address, telecom system) on the home page.
@@ -63,7 +63,7 @@ fi
 say "3. Police edition"
 setenv JENAI_EDITION police
 setenv JENAI_SYNC true
-setenv JENAI_SYNC_SECONDS 60
+setenv JENAI_SYNC_SECONDS 15
 setenv JENAI_STORE_RECORDINGS true
 setenv JENAI_SAFETY false
 setenv JENAI_INTEGRATIONS false

@@ -99,6 +99,8 @@ else
 fi
 
 say "3. The portal"
+# Calls are copied every 15 seconds, so WhatsApp follows a call as soon as it ends.
+if sudo grep -q '^JENAI_SYNC_SECONDS=' $ENVF; then sudo sed -i 's#^JENAI_SYNC_SECONDS=.*#JENAI_SYNC_SECONDS=15#' $ENVF; else echo 'JENAI_SYNC_SECONDS=15' | sudo tee -a $ENVF >/dev/null; fi
 sudo -u postgres psql -d jenai -qtAc "update whatsapp_inbox set attempts = 0, last_error = null where processed_at is null" >/dev/null && ok "unread WhatsApp messages will be read again"
 sudo systemctl restart jenai-worker
 sleep 5

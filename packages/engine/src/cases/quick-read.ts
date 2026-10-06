@@ -165,6 +165,18 @@ function apk(t: string): QuickRead {
   return r ? sure({ apk_or_link: r[2] ? `yes: ${r[2].slice(0, 200)}` : "yes" }) : unsure;
 }
 
+/** Nothing but agreement: "yes", "haan sahi hai", "ठीक है", "correct". */
+const CONFIRM = /^(?:(?:yes|haa?n?|ji|ok(?:ay)?|correct|right|sahi|theek|thik|hai|hain|bilkul|ठीक|सही|है|हाँ|हां|हो|छ|ठिक|बिल्कुल)[\s,.!]*)+$/i;
+
+/** "yes" to the police station and district found from the PIN code, or the right police station instead. */
+function location(t: string): QuickRead {
+  const s = squash(t);
+  if (CONFIRM.test(s)) return sure({ location_confirmed: "yes" });
+  if (NO.test(s) && words(s) <= 2) return sure({}); // "no" alone: asked again, for the right name
+  const ps = place(s.replace(/^(no|nahi+n?|nahin)[\s,.-]+/i, ""), "police_station");
+  return ps.confident && ps.result.fields.police_station ? sure({ police_station: ps.result.fields.police_station, location_confirmed: "corrected" }) : unsure;
+}
+
 const PHONE = /(?<!\d)(?:\+?91)?[6-9]\d{9}(?!\d)/g;
 /** The fraudster's numbers, UPI IDs, accounts, emails and profile links, each under its own line of the form. */
 function fraudster(t: string): QuickRead {
@@ -207,6 +219,8 @@ export function quickRead(input: ReplyInput): QuickRead {
   switch (k) {
     case "mobile_number":
       return mobile(t);
+    case "location_check":
+      return location(t);
     case "pincode":
       return pincode(t);
     case "date_of_birth":
@@ -244,6 +258,8 @@ export function fallbackRead(input: ReplyInput): ReadResult {
   const t = squash(input.text).slice(0, 600);
   const danger = DANGER.test(t);
   const k = input.asking;
+  // Not a "yes" to the police station found from the PIN code: the reply is the right one, as written.
+  if (k === "location_check") return answered("police_station", { police_station: t }) && !SECRET.test(t) ? { fields: { police_station: t, location_confirmed: "corrected" }, danger } : { fields: {}, danger };
   if (!k || !AS_WRITTEN.has(k) || SECRET.test(t) || !answered(k, { [k]: t })) return { fields: {}, danger };
   return { fields: { [k]: t }, danger };
 }

@@ -6,8 +6,10 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
-import { cases, platformDb, voiceStatusTokens, withTenant } from "@jenai/db";
+import { cases, platformDb, voiceStatusTokens, withTenant, type Case } from "@jenai/db";
 import { toE164 } from "@jenai/voice";
+import { caseNo } from "./cases/cases";
+import { scamLabel } from "./scams";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -34,13 +36,36 @@ export async function tenantForStatusToken(token: string): Promise<string | null
   return row?.tenantId ?? null;
 }
 
-/** The status to say to the number calling: that of its complaint in progress, or "none". */
-export async function complaintStatusFor(tenantId: string, number: string | null | undefined): Promise<string> {
+/** Where a complaint in progress stands, for the agent to tell the caller in their language. */
+function stageOf(status: Case["status"]): string {
+  if (status === "collecting") return "Some details are still awaited from the complainant on WhatsApp: ask them to reply to the helpline's WhatsApp messages.";
+  if (status === "taken_up") return "An officer of the Uttarakhand Police is working on it.";
+  return "It has reached the officers, and the Uttarakhand Police is working on it.";
+}
+
+/** What the call script reads (as {{complaint_status}}, {{complaint_number}} …) for the number calling. */
+export interface ComplaintLookup {
+  complaint_status: string;
+  complaint_number?: string;
+  complaint_type?: string;
+  complaint_registered?: string;
+  complaint_stage?: string;
+  /** The second half of the greeting: asks first whether they call about it or about something new. */
+  status_greeting?: string;
+}
+
+/**
+ * The complaint in progress from the number calling, for the agent to ask first whether the
+ * caller wants its status or has a new complaint, and to give the status. Only what a caller
+ * may hear about their own complaint: its number, type, date, status and stage, never the
+ * amounts, accounts or anything they told the police.
+ */
+export async function complaintLookup(tenantId: string, number: string | null | undefined): Promise<ComplaintLookup> {
   const phone = toE164(String(number ?? ""));
-  if (!phone) return "none";
-  const [c] = await withTenant(tenantId, (tx) =>
-    tx
-      .select({ status: cases.status })
+  if (!phone) return { complaint_status: "none" };
+  return withTenant(tenantId, async (tx) => {
+    const [c] = await tx
+      .select()
       .from(cases)
       .where(
         and(
@@ -50,7 +75,20 @@ export async function complaintStatusFor(tenantId: string, number: string | null
         ),
       )
       .orderBy(desc(cases.updatedAt))
-      .limit(1),
-  );
-  return c ? spokenStatus(c.status) : "none";
+      .limit(1);
+    if (!c) return { complaint_status: "none" };
+    return {
+      complaint_status: spokenStatus(c.status),
+      complaint_number: await caseNo(tx, tenantId, c),
+      complaint_type: c.scamType ? scamLabel(c.scamType) : "cyber crime",
+      complaint_registered: c.createdAt.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "long", year: "numeric" }),
+      complaint_stage: stageOf(c.status),
+      status_greeting: "आप हिंदी, English या नेपालीमा बात कर सकते हैं। इस नंबर से आपकी एक शिकायत पहले से दर्ज है। क्या आप उस शिकायत की जानकारी लेना चाहते हैं, या कोई नई शिकायत दर्ज करनी है?",
+    };
+  });
+}
+
+/** The status to say to the number calling: that of its complaint in progress, or "none". */
+export async function complaintStatusFor(tenantId: string, number: string | null | undefined): Promise<string> {
+  return (await complaintLookup(tenantId, number)).complaint_status;
 }

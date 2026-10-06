@@ -23,12 +23,14 @@ const VALUES: Record<string, string> = {
   next_step_wording: "Your complaint has been registered, and the Uttarakhand Cyber Crime Police Department will work on it.",
 };
 // The department's instruction: the greeting names the helpline and the recording, without the AI line.
+// A caller with a complaint already registered is asked first whether they call about it ({{status_greeting}}
+// comes from the police server's lookup as the call starts); everyone else is asked what happened.
 const GREETING =
-  "नमस्ते, यह उत्तराखंड साइबर क्राइम पुलिस विभाग की हेल्पलाइन है। यह कॉल रिकॉर्ड हो रही है। आप हिंदी, English या नेपालीमा बात कर सकते हैं। बताइए क्या हुआ है, और अगर पैसे कटे हैं तो सबसे पहले वही बताइए।";
+  "नमस्ते, यह उत्तराखंड साइबर क्राइम पुलिस विभाग की हेल्पलाइन है। यह कॉल रिकॉर्ड हो रही है। {{status_greeting | fallback:आप हिंदी, English या नेपालीमा बात कर सकते हैं। बताइए क्या हुआ है, और अगर पैसे कटे हैं तो सबसे पहले वही बताइए।}}";
 const FACTS =
   "YOU ARE the complaint desk of the Uttarakhand Cyber Crime Police Department (in Hindi: उत्तराखंड साइबर क्राइम पुलिस विभाग). You answer citizens who ring its cyber crime helpline, take their complaint in the department's format, one question at a time, and pass it to the department's officers. Whenever you name the department, say Uttarakhand Cyber Crime Police Department (in Hindi: उत्तराखंड साइबर क्राइम पुलिस विभाग).";
 const EXTRACTION_PROMPT =
-  "Extract the cyber crime complaint from this call; null for anything not said. Always output ENGLISH, translating anything said in Hindi, Nepali, Telugu or any other language. Names and addresses in English letters, using the SPELLING the caller gave letter by letter. NEVER guess a name: if a name was not clearly said or spelled and confirmed, output null. Never use a name that only the assistant said.";
+  "Today is {{current_time_Asia/Kolkata | fallback:the day of the call}}. Extract the cyber crime complaint from this call; null for anything not said. Always output ENGLISH, translating anything said in Hindi, Nepali, Telugu or any other language. Names and addresses in English letters, using the SPELLING the caller gave letter by letter. NEVER guess a name: if a name was not clearly said or spelled and confirmed, output null. Never use a name that only the assistant said.";
 
 /** The start prompt, the end prompt and the per-call fields for a program version. */
 export function cyAgentParts(p: CyProgram) {
@@ -45,7 +47,7 @@ export function cyAgentParts(p: CyProgram) {
 
 /** When the agent moves to the End step, which hangs up once its goodbye is said. */
 const END_WHEN =
-  "END THE CALL NOW: right after you have told them what happens on WhatsApp (STEP 5); after the closing for a caller without WhatsApp; after the status of a complaint already registered when they have nothing new (STEP 0); after telling them it is not a cyber crime; when the caller is silent, abusive, playing a prank or still not making a complaint after you asked twice; or when the caller says goodbye. Do not wait for the caller to reply first.";
+  "END THE CALL NOW: right after you have told them what happens on WhatsApp (STEP 5), including the link for money lost 3 or more days ago; after the closing for a caller without WhatsApp; after the status of a complaint already registered when they have nothing to add (STEP 0); after telling them it is not a cyber crime; when the caller is silent, abusive, playing a prank or still not making a complaint after you asked twice; or when the caller says goodbye. Do not wait for the caller to reply first. Background noise is never a reason to end.";
 
 /**
  * The line must stay free for the next caller (people block helplines by staying on the

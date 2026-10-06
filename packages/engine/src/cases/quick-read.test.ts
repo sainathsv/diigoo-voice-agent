@@ -45,6 +45,15 @@ describe("plain answers, read without the AI", () => {
     expect(q("mobile_number", "12345")).toEqual({ confident: true, result: { fields: {} } }); // asked again with the hint
   });
 
+  it("reads a yes to the police station found from the PIN code, or the right one instead", () => {
+    expect(q("location_check", "haan sahi hai").result.fields).toEqual({ location_confirmed: "yes" });
+    expect(q("location_check", "ठीक है").result.fields).toEqual({ location_confirmed: "yes" });
+    expect(q("location_check", "yes correct").result.fields).toEqual({ location_confirmed: "yes" });
+    expect(q("location_check", "Kotwali Nagar").result.fields).toEqual({ police_station: "Kotwali Nagar", location_confirmed: "corrected" });
+    expect(q("location_check", "nahi, Raipur thana").result.fields).toEqual({ police_station: "Raipur", location_confirmed: "corrected" });
+    expect(q("location_check", "nahi")).toEqual({ confident: true, result: { fields: {} } }); // asked again, for the right name
+  });
+
   it("takes the bank and the account number together, or in two messages", () => {
     expect(q("victim_bank_and_account", "SBI 3001 2345 678").result.fields).toEqual({ victim_bank_and_account: "SBI; 30012345678" });
     const half = q("victim_bank_and_account", "Hdfc");
