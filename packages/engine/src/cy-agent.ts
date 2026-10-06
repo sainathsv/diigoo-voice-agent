@@ -22,11 +22,12 @@ const VALUES: Record<string, string> = {
   handover_wording: "I am marking your complaint as most urgent for the officers.",
   next_step_wording: "Your complaint has been registered, and the Uttarakhand Cyber Crime Police Department will work on it.",
 };
-// The department's instruction: the greeting names the helpline and the recording, without the AI line.
+// The department's instruction: the greeting names the helpline and the recording, without the AI line,
+// and offers Hindi and English only (2026-10-06).
 // A caller with a complaint already registered is asked first whether they call about it ({{status_greeting}}
 // comes from the police server's lookup as the call starts); everyone else is asked what happened.
 const GREETING =
-  "नमस्ते, यह उत्तराखंड साइबर क्राइम पुलिस विभाग की हेल्पलाइन है। यह कॉल रिकॉर्ड हो रही है। {{status_greeting | fallback:आप हिंदी, English या नेपालीमा बात कर सकते हैं। बताइए क्या हुआ है, और अगर पैसे कटे हैं तो सबसे पहले वही बताइए।}}";
+  "नमस्ते, यह उत्तराखंड साइबर क्राइम पुलिस विभाग की हेल्पलाइन है। यह कॉल रिकॉर्ड हो रही है। {{status_greeting | fallback:आप हिंदी या English में बात कर सकते हैं। बताइए क्या हुआ है, और अगर पैसे कटे हैं तो सबसे पहले वही बताइए।}}";
 const FACTS =
   "YOU ARE the complaint desk of the Uttarakhand Cyber Crime Police Department (in Hindi: उत्तराखंड साइबर क्राइम पुलिस विभाग). You answer citizens who ring its cyber crime helpline, take their complaint in the department's format, one question at a time, and pass it to the department's officers. Whenever you name the department, say Uttarakhand Cyber Crime Police Department (in Hindi: उत्तराखंड साइबर क्राइम पुलिस विभाग).";
 const EXTRACTION_PROMPT =
@@ -55,6 +56,24 @@ const END_WHEN =
  * whether they are there, then the call ends.
  */
 export const CY_CALL_SETTINGS = { max_call_duration: 600, max_user_idle_timeout: 10 };
+
+/** The department's instruction (2026-10-06): a male voice. Charon is Gemini Live's calm male voice. */
+export const CY_VOICE = "Charon";
+
+/**
+ * The agent's voice, set on this agent only: inside its own complete model settings when it has
+ * them (the engine keeps their keys), otherwise as an override of the organization's live voice.
+ */
+export function withVoice(configs: Record<string, unknown>, voice: string): Record<string, unknown> {
+  type Obj = Record<string, unknown>;
+  const v2 = configs.model_configuration_v2_override as Obj | undefined;
+  const byok = v2?.byok as Obj | undefined;
+  const live = byok?.realtime as Obj | undefined;
+  const rt = live?.realtime as Obj | undefined;
+  if (v2 && byok && live && rt) return { ...configs, model_configuration_v2_override: { ...v2, byok: { ...byok, realtime: { ...live, realtime: { ...rt, voice } } } } };
+  const overrides = (configs.model_overrides ?? {}) as Obj;
+  return { ...configs, model_overrides: { ...overrides, realtime: { ...((overrides.realtime ?? {}) as Obj), voice } } };
+}
 
 type Edge = { source?: string; target?: string; data?: Record<string, unknown>; [k: string]: unknown };
 

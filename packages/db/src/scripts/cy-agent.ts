@@ -20,6 +20,7 @@ import { eq } from "drizzle-orm";
 import { organizations, platformDb, withTenant } from "@jenai/db";
 import {
   CY_CALL_SETTINGS,
+  CY_VOICE,
   DograhClient,
   cyAgentParts,
   newStatusToken,
@@ -27,6 +28,7 @@ import {
   voiceClient,
   withCyConversation,
   withStatusLookup,
+  withVoice,
   type CyProgram,
 } from "@jenai/engine";
 
@@ -118,11 +120,12 @@ const result = await publishDefinition(
     if (statusUrl !== "off") return next;
     return { ...next, nodes: next.nodes.map((n) => (n.type === "startCall" ? { ...n, data: { ...(n.data ?? {}), pre_call_fetch_mode: "disabled" } } : n)) };
   },
-  (current) => (backup ? (backup.workflow_configurations ?? {}) : { ...current, ...CY_CALL_SETTINGS }),
+  (current) => (backup ? (backup.workflow_configurations ?? {}) : withVoice({ ...current, ...CY_CALL_SETTINGS }, CY_VOICE)),
 );
 if (backup) console.log(`Agent #${workflowId} (${result.name}) is back to the saved version.`);
 else {
   console.log(`Agent #${workflowId} (${result.name}) now runs the CY Police call script v${program.version}.`);
+  console.log(`  Voice: ${CY_VOICE} (male). The greeting offers Hindi and English.`);
   console.log(`  It ends the call itself after the WhatsApp line. Every call is cut at ${CY_CALL_SETTINGS.max_call_duration / 60} minutes; a caller silent for ${CY_CALL_SETTINGS.max_user_idle_timeout} seconds is asked once, then the call ends.`);
   console.log(lookup ? `  Complaint status lookup at the start of each call: on (${lookup.url}).` : statusUrl === "off" ? "  Complaint status lookup: off." : "  Complaint status lookup: unchanged. A caller who says they already complained hears the status.");
 }

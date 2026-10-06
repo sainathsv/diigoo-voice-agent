@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { addWorkflow, startFakeDograh, type FakeDograh } from "@jenai/voice/testing";
 import { DograhClient } from "@jenai/voice";
-import { CY_CALL_SETTINGS, cyAgentParts, publishDefinition, withCyConversation, withStatusLookup, type CyProgram } from "./cy-agent";
+import { CY_CALL_SETTINGS, CY_VOICE, cyAgentParts, publishDefinition, withCyConversation, withStatusLookup, withVoice, type CyProgram } from "./cy-agent";
 
 const v5 = JSON.parse(readFileSync(new URL("../../db/seed-data/programs/police.cy_cybercrime_complaint.v5.json", import.meta.url), "utf8")) as CyProgram;
 let fake: FakeDograh;
@@ -49,7 +49,7 @@ describe("CY Police phone agent", () => {
   it("asks a caller with a complaint on record first, takes the date the money left, keeps one language and handles interruptions and noise", () => {
     const parts = cyAgentParts(v5);
     // The opening asks first when the police server's lookup found a complaint; otherwise the usual opening.
-    expect(parts.prompt).toContain("यह कॉल रिकॉर्ड हो रही है। {{status_greeting | fallback:आप हिंदी, English या नेपालीमा बात कर सकते हैं। बताइए क्या हुआ है");
+    expect(parts.prompt).toContain("यह कॉल रिकॉर्ड हो रही है। {{status_greeting | fallback:आप हिंदी या English में बात कर सकते हैं। बताइए क्या हुआ है");
     expect(parts.prompt).toContain("status {{complaint_status | fallback:not checked}}");
     expect(parts.prompt).toContain("this helpline takes money fraud complaints only within 3");
     expect(parts.prompt).toContain("Today is {{current_time_Asia/Kolkata | fallback:today}}");
@@ -92,5 +92,21 @@ describe("CY Police phone agent", () => {
   it("refuses an agent it does not recognise instead of guessing", () => {
     expect(() => withCyConversation({ nodes: [], edges: [] }, cyAgentParts(v5))).toThrow(/one Start step/);
     expect(() => withCyConversation({ nodes: [{ id: "1", type: "startCall", data: {} }], edges: [] }, cyAgentParts(v5))).toThrow(/from Start to End/);
+  });
+});
+
+describe("the CY Police agent's voice", () => {
+  it("is male, set on the agent only: as an override of the organization's live voice, keeping other overrides", () => {
+    expect(CY_VOICE).toBe("Charon");
+    expect(withVoice({ max_call_duration: 600 }, CY_VOICE)).toEqual({ max_call_duration: 600, model_overrides: { realtime: { voice: "Charon" } } });
+    expect(withVoice({ model_overrides: { is_realtime: true, realtime: { model: "m" } } }, CY_VOICE)).toEqual({ model_overrides: { is_realtime: true, realtime: { model: "m", voice: "Charon" } } });
+  });
+
+  it("is set inside the agent's own complete model settings when it has them, its masked key left for the engine to keep", () => {
+    const own = { version: 2, mode: "byok", byok: { mode: "realtime", realtime: { realtime: { provider: "google_realtime", voice: "Leda", api_key: "****" }, llm: { provider: "google" } } } };
+    const out = withVoice({ model_configuration_v2_override: own }, CY_VOICE) as { model_configuration_v2_override: typeof own };
+    expect(out.model_configuration_v2_override.byok.realtime.realtime).toEqual({ provider: "google_realtime", voice: "Charon", api_key: "****" });
+    expect(out.model_configuration_v2_override.byok.realtime.llm).toEqual({ provider: "google" });
+    expect(out).not.toHaveProperty("model_overrides");
   });
 });

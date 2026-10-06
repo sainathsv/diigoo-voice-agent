@@ -83,7 +83,7 @@ export async function complaintLookup(tenantId: string, number: string | null | 
       complaint_type: c.scamType ? scamLabel(c.scamType) : "cyber crime",
       complaint_registered: c.createdAt.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "long", year: "numeric" }),
       complaint_stage: stageOf(c.status),
-      status_greeting: "आप हिंदी, English या नेपालीमा बात कर सकते हैं। इस नंबर से आपकी एक शिकायत पहले से दर्ज है। क्या आप उस शिकायत की जानकारी लेना चाहते हैं, या कोई नई शिकायत दर्ज करनी है?",
+      status_greeting: "आप हिंदी या English में बात कर सकते हैं। इस नंबर से आपकी एक शिकायत पहले से दर्ज है। क्या आप उस शिकायत की जानकारी लेना चाहते हैं, या कोई नई शिकायत दर्ज करनी है?",
     };
   });
 }
