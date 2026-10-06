@@ -80,6 +80,11 @@ export interface DograhTelephonyConfig {
   provider: string;
   is_default_outbound: boolean;
   phone_number_count?: number;
+  inactive?: boolean;
+}
+/** One telephony configuration with its (masked) credentials; an Asterisk one carries its generated stasis_app_name. */
+export interface DograhTelephonyConfigDetail extends DograhTelephonyConfig {
+  credentials: Record<string, unknown>;
 }
 export interface DograhPhoneNumber {
   id: number;
@@ -223,6 +228,22 @@ export class DograhClient {
   }
   listPhoneNumbers(configId: number) {
     return this.call<{ phone_numbers: DograhPhoneNumber[] }>("GET", `/organizations/telephony-configs/${configId}/phone-numbers`, `numbers of config ${configId}`);
+  }
+  createTelephonyConfig(body: { name: string; is_default_outbound?: boolean; config: Record<string, unknown> }) {
+    return this.call<DograhTelephonyConfigDetail>("POST", "/organizations/telephony-configs", `create telephony config ${body.name}`, body);
+  }
+  updateTelephonyConfig(id: number, body: { name?: string; config?: Record<string, unknown> }) {
+    return this.call<DograhTelephonyConfigDetail>("PUT", `/organizations/telephony-configs/${id}`, `update telephony config ${id}`, body);
+  }
+  /** Lets the engine use a configuration it parked after failing to connect. */
+  reactivateTelephonyConfig(id: number) {
+    return this.call<unknown>("POST", `/organizations/telephony-configs/${id}/reactivate`, `reactivate telephony config ${id}`, {});
+  }
+  addPhoneNumber(configId: number, body: { address: string; label?: string; inbound_workflow_id?: number }) {
+    return this.call<DograhPhoneNumber>("POST", `/organizations/telephony-configs/${configId}/phone-numbers`, `add number to config ${configId}`, body);
+  }
+  updatePhoneNumber(configId: number, numberId: number, body: { label?: string; inbound_workflow_id?: number }) {
+    return this.call<DograhPhoneNumber>("PUT", `/organizations/telephony-configs/${configId}/phone-numbers/${numberId}`, `update number ${numberId}`, body);
   }
 
   /**

@@ -33,12 +33,26 @@ export interface FakeDograh {
   /** When true, transcript and recording downloads are refused (403), like a locked media store. */
   refuseArtifacts: boolean;
   triggered: Array<{ uuid: string; body: unknown }>;
+  /** Telephony configurations and their numbers, as the engine keeps them (passwords included, for assertions). */
+  telephony: Array<{ id: number; name: string; provider: string; is_default_outbound: boolean; inactive: boolean; credentials: Record<string, unknown>; numbers: FakeNumber[] }>;
   /** Stored secrets, as the engine keeps them (tokens included, for assertions). */
   credentials: Array<{ uuid: string; name: string; credential_type: string; credential_data: Record<string, unknown> }>;
   requests: string[];
   /** What a caller dialling in hears: the published start prompt. */
   inboundHears(id: number): string;
   close(): Promise<void>;
+}
+
+interface FakeNumber {
+  id: number;
+  telephony_configuration_id: number;
+  address: string;
+  address_normalized: string;
+  address_type: string;
+  label: string | null;
+  inbound_workflow_id: number | null;
+  is_active: boolean;
+  is_default_caller_id: boolean;
 }
 
 export const baseDefinition = (prompt: string): DograhDefinition => ({
@@ -67,6 +81,18 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
   const state = { refuseArtifacts: false };
   const triggered: FakeDograh["triggered"] = [];
   const credentials: FakeDograh["credentials"] = [];
+  const telephony: FakeDograh["telephony"] = [
+    {
+      id: 3,
+      name: "Vobiz",
+      provider: "vobiz",
+      is_default_outbound: true,
+      inactive: false,
+      credentials: {},
+      numbers: [{ id: 6, telephony_configuration_id: 3, address: "+914012345678", address_normalized: "914012345678", address_type: "pstn", label: "Main", inbound_workflow_id: 2, is_active: true, is_default_caller_id: true }],
+    },
+  ];
+  let telSeq = 10;
   const requests: string[] = [];
   let versionSeq = 100;
   let runSeq = 5000;
@@ -167,10 +193,51 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
         if (!found) credentials.push(c);
         return send(200, { uuid: c.uuid, name: c.name, credential_type: c.credential_type });
       }
+      const detail = (t: FakeDograh["telephony"][number]) => ({
+        id: t.id,
+        name: t.name,
+        provider: t.provider,
+        is_default_outbound: t.is_default_outbound,
+        inactive: t.inactive,
+        credentials: Object.fromEntries(Object.entries(t.credentials).map(([k, v]) => [k, /password/.test(k) ? "****" : v])),
+      });
       if (req.method === "GET" && p === "/organizations/telephony-configs")
-        return send(200, { configurations: [{ id: 3, name: "Vobiz", provider: "vobiz", is_default_outbound: true, phone_number_count: 1 }] });
-      if (req.method === "GET" && (m = p.match(/^\/organizations\/telephony-configs\/(\d+)\/phone-numbers$/)))
-        return send(200, { phone_numbers: [{ id: 6, telephony_configuration_id: 3, address: "+914012345678", address_normalized: "914012345678", address_type: "pstn", label: "Main", inbound_workflow_id: 2, is_active: true, is_default_caller_id: true }] });
+        return send(200, { configurations: telephony.map((t) => ({ id: t.id, name: t.name, provider: t.provider, is_default_outbound: t.is_default_outbound, inactive: t.inactive, phone_number_count: t.numbers.length })) });
+      if (req.method === "POST" && p === "/organizations/telephony-configs") {
+        const b = (await body(req)) as { name: string; is_default_outbound?: boolean; config: Record<string, unknown> };
+        if (telephony.some((t) => t.name === b.name)) return send(409, { detail: `A telephony configuration named '${b.name}' already exists` });
+        const { provider, ...creds } = b.config;
+        const t = { id: ++telSeq, name: b.name, provider: String(provider), is_default_outbound: !!b.is_default_outbound, inactive: false, credentials: { ...creds, ...(provider === "ari" ? { stasis_app_name: `dograh_${telSeq.toString(16).padStart(12, "0")}` } : {}) }, numbers: [] };
+        telephony.push(t);
+        return send(200, detail(t));
+      }
+      const tc = p.match(/^\/organizations\/telephony-configs\/(\d+)(\/reactivate|\/phone-numbers(?:\/(\d+))?)?$/);
+      const t = tc ? telephony.find((x) => x.id === Number(tc[1])) : undefined;
+      if (tc && !t) return send(404, { detail: "not found" });
+      if (tc && t && req.method === "PUT" && !tc[2]) {
+        const b = (await body(req)) as { config?: Record<string, unknown> };
+        const { provider: _p, ...creds } = b.config ?? {};
+        t.credentials = { ...t.credentials, ...creds }; // the Stasis application name is kept
+        return send(200, detail(t));
+      }
+      if (tc && t && req.method === "POST" && tc[2] === "/reactivate") {
+        t.inactive = false;
+        return send(200, detail(t));
+      }
+      if (tc && t && req.method === "GET" && tc[2] === "/phone-numbers") return send(200, { phone_numbers: t.numbers });
+      if (tc && t && req.method === "POST" && tc[2] === "/phone-numbers") {
+        const b = (await body(req)) as { address: string; label?: string; inbound_workflow_id?: number };
+        const n: FakeNumber = { id: ++telSeq, telephony_configuration_id: t.id, address: b.address, address_normalized: b.address.replace(/\D/g, ""), address_type: /^\+/.test(b.address) ? "pstn" : "sip_extension", label: b.label ?? null, inbound_workflow_id: b.inbound_workflow_id ?? null, is_active: true, is_default_caller_id: false };
+        t.numbers.push(n);
+        return send(200, n);
+      }
+      if (tc && t && req.method === "PUT" && tc[3]) {
+        const n = t.numbers.find((x) => x.id === Number(tc[3]));
+        if (!n) return send(404, { detail: "not found" });
+        const b = (await body(req)) as { label?: string; inbound_workflow_id?: number };
+        Object.assign(n, b.label !== undefined ? { label: b.label } : {}, b.inbound_workflow_id !== undefined ? { inbound_workflow_id: b.inbound_workflow_id } : {});
+        return send(200, n);
+      }
       if (req.method === "POST" && (m = p.match(/^\/public\/agent\/workflow\/([^/]+)$/))) {
         if (req.headers["x-api-key"] !== apiKey) return send(401, { detail: "api key required" });
         const b = await body(req);
@@ -198,6 +265,7 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
       state.refuseArtifacts = v;
     },
     triggered,
+    telephony,
     credentials,
     requests,
     inboundHears: (id) => String(workflows.get(id)!.published.nodes.find((n) => n.type === "startCall")!.data!.prompt),

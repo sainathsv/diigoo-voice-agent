@@ -2,7 +2,8 @@
 import { describe, expect, it } from "vitest";
 import { createSocket } from "node:dgram";
 import type { AddressInfo } from "node:net";
-import { checkLine, lineConfigFromEnv, pickPort, sipOptions, type NetFacts } from "./telephone-line";
+import { createServer } from "node:net";
+import { checkLine, gatewayUp, lineConfigFromEnv, pickPort, sipOptions, type NetFacts } from "./telephone-line";
 
 const office = { name: "eno1", physical: true, carrier: true, operstate: "up", ipv4: ["192.168.2.185"] };
 const facts = (spare: Partial<NetFacts["ports"][number]> | null, more: NetFacts["ports"] = []): NetFacts => ({
@@ -57,5 +58,16 @@ describe("telephone line", () => {
     const silent = await sipOptions("127.0.0.1:9", 500);
     expect(silent.ok).toBe(false);
     expect(await sipOptions("not an address:99999")).toMatchObject({ ok: false });
+  });
+});
+
+describe("the telephone gateway check", () => {
+  it("finds Asterisk up when its port takes a connection, and down when nothing listens", async () => {
+    const server = createServer((socket) => socket.end());
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const { port } = server.address() as { port: number };
+    expect(await gatewayUp(`tcp://127.0.0.1:${port}`)).toBe(true);
+    await new Promise<void>((r) => server.close(() => r()));
+    expect(await gatewayUp(`tcp://127.0.0.1:${port}`, 1000)).toBe(false);
   });
 });

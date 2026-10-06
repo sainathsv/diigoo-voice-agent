@@ -8,6 +8,7 @@
  * configured in JENAI_TEL_SIP_PEER.
  */
 import { createSocket } from "node:dgram";
+import { connect } from "node:net";
 import { randomBytes } from "node:crypto";
 import { readFile, readdir, access } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
@@ -35,7 +36,7 @@ export interface LineConfig {
   iface: string;
   /** The telecom team's SIP address, host or host:port, once they give it. */
   sipPeer: string | null;
-  /** Our telephone gateway's health address (set when the gateway is installed). */
+  /** Our telephone gateway's health address (set when the gateway is installed): http(s)://… or tcp://host:port. */
   gatewayHealthUrl: string | null;
 }
 
@@ -150,13 +151,29 @@ export async function sipOptions(peer: string, timeoutMs = 3000): Promise<{ ok: 
   });
 }
 
+/** The gateway answers: an HTTP health address returns 200, or a tcp://host:port accepts a connection (Asterisk's ARI). */
+export async function gatewayUp(url: string, timeoutMs = 3000): Promise<boolean> {
+  const tcp = /^tcp:\/\/([^:/\s]+):(\d{1,5})$/.exec(url);
+  if (!tcp) return (await fetch(url, { signal: AbortSignal.timeout(timeoutMs) }).catch(() => null))?.ok ?? false;
+  return new Promise((resolve) => {
+    const s = connect({ host: tcp[1]!, port: Number(tcp[2]) });
+    const done = (up: boolean) => {
+      s.destroy();
+      resolve(up);
+    };
+    s.setTimeout(timeoutMs, () => done(false));
+    s.once("connect", () => done(true));
+    s.once("error", () => done(false));
+  });
+}
+
 const RANK: Record<CheckState, number> = { ok: 0, waiting: 1, fail: 2 };
 
 /** Runs every check once. The facts and the SIP probe are passed in so tests need no real network. */
 export async function checkLine(
   cfg: LineConfig,
   facts: NetFacts,
-  probes: { sip: typeof sipOptions; gateway: (url: string) => Promise<boolean> } = { sip: sipOptions, gateway: async (u) => (await fetch(u, { signal: AbortSignal.timeout(3000) }).catch(() => null))?.ok ?? false },
+  probes: { sip: typeof sipOptions; gateway: (url: string) => Promise<boolean> } = { sip: sipOptions, gateway: (u) => gatewayUp(u) },
 ): Promise<LineStatus> {
   const checks: LineCheck[] = [];
   const { port, why } = pickPort(cfg, facts);

@@ -24,7 +24,8 @@
     "catalog": "tsx src/scripts/catalog.ts",
     "voice": "tsx src/scripts/voice.ts",
     "whatsapp": "tsx src/scripts/whatsapp.ts",
-    "cy-agent": "tsx src/scripts/cy-agent.ts"
+    "cy-agent": "tsx src/scripts/cy-agent.ts",
+    "sip-bridge": "tsx src/scripts/sip-bridge.ts"
   },
   "dependencies": {
     "@jenai/authz": "workspace:*",
