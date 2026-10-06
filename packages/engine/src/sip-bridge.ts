@@ -34,14 +34,14 @@ export interface SipBridgeInput {
  * Creates the bridge's Asterisk (ARI) configuration on the engine, or updates it in place (a new
  * password keeps the same Stasis application name), lets the engine use it again if it parked
  * it, and points the extension at the agent. Returns the Stasis application name the dialplan
- * must hand calls to.
+ * must hand calls to: newer engines name it themselves; up to Dograh 1.35 it is the ARI user.
  */
 export async function connectSipBridge(client: DograhClient, input: SipBridgeInput): Promise<{ configId: number; stasisApp: string; numberId: number }> {
   const config = { provider: "ari", ari_endpoint: input.ariEndpoint, app_name: input.ariUser, app_password: input.ariPassword, ws_client_name: input.wsClientName };
   const existing = (await client.listTelephonyConfigs()).configurations.find((c) => c.name === SIP_BRIDGE_NAME);
   const detail = existing ? await client.updateTelephonyConfig(existing.id, { config }) : await client.createTelephonyConfig({ name: SIP_BRIDGE_NAME, is_default_outbound: false, config });
   if (detail.inactive) await client.reactivateTelephonyConfig(detail.id);
-  const stasisApp = String(detail.credentials?.stasis_app_name ?? "");
+  const stasisApp = String(detail.credentials?.stasis_app_name || input.ariUser);
   if (!/^[A-Za-z0-9_.-]+$/.test(stasisApp)) throw new Error("The voice engine did not give the bridge a Stasis application name.");
   const have = (await client.listPhoneNumbers(detail.id)).phone_numbers.find((n) => n.address === input.extension);
   const number = !have

@@ -32,6 +32,8 @@ export interface FakeDograh {
   failRuns: Set<number>;
   /** When true, transcript and recording downloads are refused (403), like a locked media store. */
   refuseArtifacts: boolean;
+  /** When true, the engine works like Dograh 1.35 and earlier: Asterisk configurations get no Stasis application name of their own (the ARI user is the Stasis application). */
+  legacyAri: boolean;
   triggered: Array<{ uuid: string; body: unknown }>;
   /** Telephony configurations and their numbers, as the engine keeps them (passwords included, for assertions). */
   telephony: Array<{ id: number; name: string; provider: string; is_default_outbound: boolean; inactive: boolean; credentials: Record<string, unknown>; numbers: FakeNumber[] }>;
@@ -78,7 +80,7 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
   const runs = new Map<number, DograhRun[]>();
   const failPublish = new Set<number>();
   const failRuns = new Set<number>();
-  const state = { refuseArtifacts: false };
+  const state = { refuseArtifacts: false, legacyAri: false };
   const triggered: FakeDograh["triggered"] = [];
   const credentials: FakeDograh["credentials"] = [];
   const telephony: FakeDograh["telephony"] = [
@@ -207,7 +209,7 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
         const b = (await body(req)) as { name: string; is_default_outbound?: boolean; config: Record<string, unknown> };
         if (telephony.some((t) => t.name === b.name)) return send(409, { detail: `A telephony configuration named '${b.name}' already exists` });
         const { provider, ...creds } = b.config;
-        const t = { id: ++telSeq, name: b.name, provider: String(provider), is_default_outbound: !!b.is_default_outbound, inactive: false, credentials: { ...creds, ...(provider === "ari" ? { stasis_app_name: `dograh_${telSeq.toString(16).padStart(12, "0")}` } : {}) }, numbers: [] };
+        const t = { id: ++telSeq, name: b.name, provider: String(provider), is_default_outbound: !!b.is_default_outbound, inactive: false, credentials: { ...creds, ...(provider === "ari" && !state.legacyAri ? { stasis_app_name: `dograh_${telSeq.toString(16).padStart(12, "0")}` } : {}) }, numbers: [] };
         telephony.push(t);
         return send(200, detail(t));
       }
@@ -263,6 +265,12 @@ export async function startFakeDograh(opts: { apiKey?: string; email?: string; p
     },
     set refuseArtifacts(v: boolean) {
       state.refuseArtifacts = v;
+    },
+    get legacyAri() {
+      return state.legacyAri;
+    },
+    set legacyAri(v: boolean) {
+      state.legacyAri = v;
     },
     triggered,
     telephony,

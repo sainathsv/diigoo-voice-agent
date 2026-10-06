@@ -71,7 +71,9 @@ ARIPASS=$(sudo sed -n 's/^password *= *//p' "$AST/ari.conf" 2>/dev/null | head -
 OUT=$(printf '%s' "$ARIPASS" | sudo -u jenai bash -c "set -a; . $ENVF; set +a; export COREPACK_ENABLE_DOWNLOAD_PROMPT=0; cd /opt/jenai/app && pnpm --silent --filter @jenai/db sip-bridge --slug cy-police --workflow $WORKFLOW --ari http://$TS_IP:8088 --extension $EXTEN" 2>&1 || true)
 STASIS=$(echo "$OUT" | sed -n 's/^stasis=//p' | head -1)
 MEDIA=$(echo "$OUT" | sed -n 's/^media=//p' | head -1)
-{ [ -n "$STASIS" ] && [ -n "$MEDIA" ]; } || die "The voice engine did not take the bridge: $(echo "$OUT" | tail -3)"
+WHY=$(echo "$OUT" | sed -n 's/^error=//p' | head -1)
+[ -n "$WHY" ] || WHY=$(echo "$OUT" | grep -m1 -E '^(Error|[A-Za-z]*Error):' || echo "$OUT" | grep -v '^ *at ' | tail -2)
+{ [ -n "$STASIS" ] && [ -n "$MEDIA" ]; } || die "The voice engine did not take the bridge: $WHY"
 ok "the voice engine knows the bridge; extension $EXTEN is answered by agent #$WORKFLOW"
 
 say "3. Asterisk"

@@ -42,4 +42,18 @@ describe("SIP bridge on the voice engine", () => {
     expect(first.inactive).toBe(false);
     expect(first.numbers).toEqual([expect.objectContaining({ address: "1930", inbound_workflow_id: 18 })]);
   });
+
+  it("on an engine up to Dograh 1.35, hands calls to the ARI user, which is the Stasis application there", async () => {
+    const older = await startFakeDograh({ apiKey: "k-test" });
+    older.legacyAri = true;
+    try {
+      const r = await connectSipBridge(new DograhClient(older.url, { kind: "api_key", apiKey: "k-test" }), input);
+      expect(r.stasisApp).toBe("jenai");
+      const bridge = older.telephony.find((t) => t.name === SIP_BRIDGE_NAME)!;
+      expect(bridge.credentials).not.toHaveProperty("stasis_app_name");
+      expect(bridge.numbers).toEqual([expect.objectContaining({ address: "1930", inbound_workflow_id: 18 })]);
+    } finally {
+      await older.close();
+    }
+  });
 });

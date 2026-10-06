@@ -31,7 +31,11 @@ const [org] = await platformDb().select({ id: organizations.id }).from(organizat
 if (!org) throw new Error(`No workspace "${slug}" on this server.`);
 const vc = await withTenant(org.id, (tx) => voiceClient(tx, org.id));
 if (!vc) throw new Error(`The workspace "${slug}" has no voice engine connection on this server.`);
-const r = await connectSipBridge(vc.client, { ariEndpoint: ari, ariUser: "jenai", ariPassword: password, wsClientName: "dograh", extension, workflowId });
+const r = await connectSipBridge(vc.client, { ariEndpoint: ari, ariUser: "jenai", ariPassword: password, wsClientName: "dograh", extension, workflowId }).catch((e: Error) => {
+  // One line the setup script shows as is: the engine's own answer, not a stack trace.
+  console.log(`error=${e.message.replace(/\s+/g, " ")}`);
+  process.exit(1);
+});
 console.log(`stasis=${r.stasisApp}`);
 console.log(`media=${ariMediaUri(vc.conn.baseUrl)}`);
 process.exit(0);
