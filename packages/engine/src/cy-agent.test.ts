@@ -6,6 +6,7 @@ import { DograhClient } from "@jenai/voice";
 import { CY_CALL_SETTINGS, CY_VOICE, cyAgentParts, publishDefinition, withCyConversation, withStatusLookup, withVoice, type CyProgram } from "./cy-agent";
 
 const v5 = JSON.parse(readFileSync(new URL("../../db/seed-data/programs/police.cy_cybercrime_complaint.v5.json", import.meta.url), "utf8")) as CyProgram;
+const v6 = JSON.parse(readFileSync(new URL("../../db/seed-data/programs/police.cy_cybercrime_complaint.v6.json", import.meta.url), "utf8")) as CyProgram;
 let fake: FakeDograh;
 let client: DograhClient;
 
@@ -108,5 +109,19 @@ describe("the CY Police agent's voice", () => {
     expect(out.model_configuration_v2_override.byok.realtime.realtime).toEqual({ provider: "google_realtime", voice: "Charon", api_key: "****" });
     expect(out.model_configuration_v2_override.byok.realtime.llm).toEqual({ provider: "google" });
     expect(out).not.toHaveProperty("model_overrides");
+  });
+});
+
+describe("CY Police call script v6: money frauds older than 15 days", () => {
+  it("asks the date and time of the transaction, refers anything over 15 days to cybercrime.gov.in in the department's words, then ends the call", () => {
+    const parts = cyAgentParts(v6);
+    expect(v6.version).toBe(6);
+    expect(parts.prompt).toContain("पैसे किस तारीख को और लगभग किस समय कटे थे?");
+    expect(parts.prompt).toContain("IF THE MONEY LEFT MORE THAN 15 DAYS AGO");
+    expect(parts.prompt).toContain("Uttarakhand Police understands your concern. However, this helpline is dedicated to handling financial frauds that\n    have occurred within the last 15 days. We request you to file your complaint at cybercrime.gov.in. We are also\n    sending you a WhatsApp message with the same information.");
+    expect(parts.prompt).toContain("उत्तराखंड पुलिस आपकी चिंता समझती है।");
+    expect(parts.prompt).toContain("IF THE MONEY LEFT 3 TO 15 DAYS AGO");
+    expect(parts.prompt).toContain("right after the cybercrime.gov.in message for money lost more than 15 days ago");
+    expect(parts.extraction.extraction_variables.map((v) => v.name)).toEqual(expect.arrayContaining(["transaction_date", "transaction_time", "within_3_days", "over_15_days"]));
   });
 });

@@ -17,7 +17,7 @@ const TABS = [
   ["closed", "Closed"],
 ] as const;
 
-const FOLLOWUP: Record<string, string> = { questions: "Form on WhatsApp", form_link: "Form link sent", none: "No WhatsApp (caller said no)" };
+const FOLLOWUP: Record<string, string> = { questions: "Form on WhatsApp", form_link: "Form link sent", portal: "Referred to cybercrime.gov.in (over 15 days)", none: "No WhatsApp (caller said no)" };
 
 export default async function CasesPage({ params, searchParams }: { params: Promise<{ org: string }>; searchParams: Promise<{ status?: string; type?: string; q?: string; ok?: string; error?: string }> }) {
   const { org: slug } = await params;

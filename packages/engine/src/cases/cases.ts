@@ -19,6 +19,7 @@ import {
   isFinancial,
   joinedText,
   lateFormLinkText,
+  portalReferralText,
   missingFor,
   openerText,
   questionFor,
@@ -84,6 +85,7 @@ const CALL_KEYS = [
   "type_details",
   "complaint_type",
   "transaction_date",
+  "transaction_time",
 ] as const;
 const clean = (v: unknown) => {
   const t = v === null || v === undefined ? "" : String(v).trim();
@@ -242,8 +244,21 @@ async function sendFormLink(tx: Tx, tenantId: string, c: Case, wa: Wa) {
   await tx.update(cases).set({ fields: { ...c.fields, followup: "form_link" }, ...(url ? {} : { asking: "__form__" }) }).where(eq(cases.id, c.id));
 }
 
+/**
+ * A money fraud more than 15 days old: the helpline handles the last 15 days only, so the
+ * complainant is sent to cybercrime.gov.in, once, and the case closes as referred.
+ */
+async function referToPortal(tx: Tx, tenantId: string, c: Case, wa: Wa | null) {
+  if (wa && c.asking !== "__portal__") await send(tx, tenantId, c, wa.sender, portalReferralText(await departmentName(tx, tenantId), c.language), "__portal__");
+  await tx
+    .update(cases)
+    .set({ status: "closed", officerNote: c.officerNote ?? "Money lost more than 15 days before the call: referred to cybercrime.gov.in (the helpline handles the last 15 days only).", updatedAt: new Date() })
+    .where(eq(cases.id, c.id));
+}
+
 /** Asks for the next missing item; when there is none, sends the form link (no money lost) or closes the loop. */
 async function askNext(tx: Tx, tenantId: string, c: Case, wa: Wa, prefix?: string) {
+  if (c.fields.followup === "portal") return;
   const next = c.missing[0];
   if (!next) {
     if (c.asking === "__form__" || c.asking === "__done__") return;
@@ -296,8 +311,9 @@ export async function caseFromCall(
   if (scam === null && !incoming.how_it_happened && !FRAUDSTER_KEYS.some((k) => incoming[k])) return null; // nothing to open a case on
   const wantsWhatsApp = !noWhatsApp(call.extracted);
   const money = isFinancial(incoming, scam);
-  const late = money && reportedLate(call.extracted, call.at ?? new Date());
-  const followup = !wantsWhatsApp ? "none" : (scam && !money) || late ? "form_link" : "questions";
+  const portal = money && reportedOver15Days(call.extracted, call.at ?? new Date());
+  const late = money && !portal && reportedLate(call.extracted, call.at ?? new Date());
+  const followup = !wantsWhatsApp ? "none" : portal ? "portal" : (scam && !money) || late ? "form_link" : "questions";
   const open = await openCaseFor(tx, phone);
   const was = open && continues(open, scam) ? open : null;
   const fresh = !was;
@@ -309,6 +325,7 @@ export async function caseFromCall(
     if (wantsWhatsApp) fields.whatsapp_consent = "yes";
     if (money) fields.financial = "yes";
     if (late) fields.late_report = "yes";
+    if (portal) fields.over_15_days = "yes";
     if (phone !== call.phone && call.phone) fields.caller_number = call.phone;
     c = await newCase(tx, tenantId, { phone, contactId: call.contactId, callId: call.id, branchId: call.branchId, fields, scamType: scam, language });
   } else {
@@ -325,6 +342,12 @@ export async function caseFromCall(
     );
   }
   await tx.insert(caseCalls).values({ tenantId, callId: call.id, caseId: c.id }).onConflictDoNothing();
+  if (portal && fresh) {
+    // Older than 15 days: its own category, its own WhatsApp message, and the case closes as referred.
+    const wa = c.fields.followup === "none" || opts.message === false ? null : await whatsappFor(tx, tenantId, sender);
+    await referToPortal(tx, tenantId, c, wa);
+    return one(await tx.select().from(cases).where(eq(cases.id, c.id)));
+  }
   c = await settle(tx, tenantId, await markUrgent(tx, c, call.extracted));
   if (c.fields.followup === "none" || opts.message === false) return c;
 
@@ -354,6 +377,20 @@ export function reportedLate(x: Record<string, unknown>, at: Date): boolean {
   const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(clean(x.transaction_date));
   if (!d) return false;
   return Math.round((istDay(at) - Date.UTC(Number(d[1]), Number(d[2]) - 1, Number(d[3]))) / 86_400_000) >= 3;
+}
+
+/**
+ * A money fraud more than 15 days before the call: the helpline handles the last 15 days only and
+ * refers older ones to cybercrime.gov.in (the department's rule, 2026-10-07). The call says so
+ * ("over_15_days"); else the date the money left, against the day of the call.
+ */
+export function reportedOver15Days(x: Record<string, unknown>, at: Date): boolean {
+  const said = clean(x.over_15_days).toLowerCase();
+  if (/^yes\b/.test(said)) return true;
+  if (/^no\b/.test(said)) return false;
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(clean(x.transaction_date));
+  if (!d) return false;
+  return Math.round((istDay(at) - Date.UTC(Number(d[1]), Number(d[2]) - 1, Number(d[3]))) / 86_400_000) > 15;
 }
 
 /** A call this recent is followed on WhatsApp; one read later than this (a backlog, a re-read) only fills in its case. */

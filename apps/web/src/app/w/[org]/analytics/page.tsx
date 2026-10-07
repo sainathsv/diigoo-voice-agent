@@ -17,7 +17,7 @@ const inr = (r: number) => `₹${r.toLocaleString("en-IN")}`;
 function WhatsAppCell({ w }: { w: WhatsAppProgress | null }) {
   if (!w) return <span className="text-[12px] text-grey">None</span>;
   const state =
-    w.followup === "none" ? "Caller said no" : w.followup === "form_link" ? "Form link sent" : w.stillNeeded ? `${w.stillNeeded} still needed` : "Complete";
+    w.followup === "none" ? "Caller said no" : w.followup === "form_link" ? "Form link sent" : w.followup === "portal" ? "Referred to cybercrime.gov.in (over 15 days)" : w.stillNeeded ? `${w.stillNeeded} still needed` : "Complete";
   const tone = w.followup === "questions" && !w.stillNeeded ? "text-ok" : w.followup === "questions" ? "text-warn" : "text-grey";
   return (
     <div className="text-[12.5px]">

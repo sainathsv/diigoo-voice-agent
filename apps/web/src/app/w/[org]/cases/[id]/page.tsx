@@ -13,6 +13,7 @@ export const metadata: Metadata = { title: "Case" };
 const FOLLOWUP: Record<string, string> = {
   questions: "The complainant is asked the department's form on WhatsApp, one question at a time, and reminded every 6 hours (up to 6 times, 9 am to 9 pm) until it is complete.",
   form_link: "No money was lost, so the complainant was sent the cyber team's complaint form link on WhatsApp.",
+  portal: "The money was lost more than 15 days before the call. This helpline handles the last 15 days only, so the complainant was referred to cybercrime.gov.in on the call and on WhatsApp, and the case was closed as referred.",
   none: "The caller did not agree to WhatsApp. These are the details from the call; anything they write to the helpline later is added here.",
 };
 

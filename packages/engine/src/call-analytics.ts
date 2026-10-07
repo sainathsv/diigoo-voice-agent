@@ -9,7 +9,7 @@ import { SCAM_CATEGORIES, categoryOf, isNotCyberCrime, scamKeyFromText, type Sca
 export interface WhatsAppProgress {
   caseId: string;
   status: Case["status"];
-  /** questions: the form is being asked; form_link: the link was sent; none: the caller did not agree. */
+  /** questions: the form is being asked; form_link: the link was sent; portal: referred to cybercrime.gov.in (money lost more than 15 days ago); none: the caller did not agree. */
   followup: string;
   stillNeeded: number;
   proofs: number;

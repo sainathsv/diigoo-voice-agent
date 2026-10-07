@@ -30,7 +30,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ org: str
     // Full numbers only for the branches where this viewer may see them.
     const reveal = can(ctx.access, "contacts:reveal_phone", { branchId: c.branchId });
     const w = c.whatsapp;
-    const whatsapp = !w ? "" : w.followup === "none" ? "caller said no" : w.followup === "form_link" ? "form link sent" : w.stillNeeded ? `${w.stillNeeded} still needed` : "complete";
+    const whatsapp = !w ? "" : w.followup === "none" ? "caller said no" : w.followup === "form_link" ? "form link sent" : w.followup === "portal" ? "referred to cybercrime.gov.in (over 15 days)" : w.stillNeeded ? `${w.stillNeeded} still needed` : "complete";
     rows.push({
       id: d.call?.id ?? d.kase!.id,
       startedAt: d.call?.startedAt ?? d.kase!.createdAt,

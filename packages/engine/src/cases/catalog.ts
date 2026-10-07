@@ -243,7 +243,7 @@ function cardFraud(fields: Record<string, string>): boolean {
  */
 export function requiredFor(fields: Record<string, string>, scamType: string | null): string[] {
   const form =
-    fields.followup === "form_link" || (scamType && !isFinancial(fields, scamType)) // the form link does the rest
+    fields.followup === "form_link" || fields.followup === "portal" || (scamType && !isFinancial(fields, scamType)) // the form link or the portal does the rest
       ? []
       : !scamType
         ? [...OPENING_REQUIRED]
@@ -345,6 +345,24 @@ function lateFormLinkTextIn(department: string, caseNo: string, url: string, l: 
 
 export function lateFormLinkText(department: string, caseNo: string, url: string, language: string | null | undefined): string {
   return both((l) => lateFormLinkTextIn(department, caseNo, url, l), language);
+}
+
+/** The national cyber crime portal, where money frauds older than 15 days are filed. */
+export const CYBERCRIME_PORTAL = "https://cybercrime.gov.in";
+
+/**
+ * A money fraud more than 15 days before the call (the department's rule, 2026-10-07): this helpline
+ * handles the last 15 days only, so the complainant is sent to the national portal. Its own
+ * category (followup "portal"), so it has its own message.
+ */
+function portalReferralTextIn(department: string, l: Lang): string {
+  if (l === "en") return `Hello, this is the ${department} helpline. Uttarakhand Police understands your concern. However, this helpline is dedicated to handling financial frauds that have occurred within the last 15 days. We request you to file your complaint at ${CYBERCRIME_PORTAL}`;
+  if (l === "ne") return `नमस्ते, यो ${department} को हेल्पलाइन हो। उत्तराखण्ड प्रहरी तपाईंको चिन्ता बुझ्छ। तर यो हेल्पलाइन पछिल्लो १५ दिनभित्र भएका आर्थिक ठगीका लागि मात्र हो। कृपया आफ्नो उजुरी ${CYBERCRIME_PORTAL} मा दर्ता गर्नुहोस्।`;
+  return `नमस्ते, यह ${department} की हेल्पलाइन है। उत्तराखंड पुलिस आपकी चिंता समझती है। लेकिन यह हेल्पलाइन केवल पिछले 15 दिनों के अंदर हुए वित्तीय फ्रॉड के मामलों के लिए है। कृपया अपनी शिकायत ${CYBERCRIME_PORTAL} पर दर्ज करें।`;
+}
+
+export function portalReferralText(department: string, language: string | null | undefined): string {
+  return both((l) => portalReferralTextIn(department, l), language);
 }
 
 /** To someone who writes without having called: the department's greeting, and how to file a complaint. */

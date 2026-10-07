@@ -48,7 +48,7 @@ export function cyAgentParts(p: CyProgram) {
 
 /** When the agent moves to the End step, which hangs up once its goodbye is said. */
 const END_WHEN =
-  "END THE CALL NOW: right after you have told them what happens on WhatsApp (STEP 5), including the link for money lost 3 or more days ago; after the closing for a caller without WhatsApp; after the status of a complaint already registered when they have nothing to add (STEP 0); after telling them it is not a cyber crime; when the caller is silent, abusive, playing a prank or still not making a complaint after you asked twice; or when the caller says goodbye. Do not wait for the caller to reply first. Background noise is never a reason to end.";
+  "END THE CALL NOW: right after you have told them what happens on WhatsApp (STEP 5), including the link for money lost 3 to 15 days ago; right after the cybercrime.gov.in message for money lost more than 15 days ago; after the closing for a caller without WhatsApp; after the status of a complaint already registered when they have nothing to add (STEP 0); after telling them it is not a cyber crime; when the caller is silent, abusive, playing a prank or still not making a complaint after you asked twice; or when the caller says goodbye. Do not wait for the caller to reply first. Background noise is never a reason to end.";
 
 /**
  * The line must stay free for the next caller (people block helplines by staying on the

@@ -370,6 +370,29 @@ describe("the department's rules", () => {
     await withTenant(tenant, (tx) => tx.update(whatsappChannels).set({ formUrl: null }));
   });
 
+  it("refers a money fraud more than 15 days old to cybercrime.gov.in: its own category and message, the case closed as referred", async () => {
+    const wa = new SimulatedWhatsApp();
+    const said = await opened("+919800000081", { complaint_type: "UPI fraud", money_lost: "50000", how_it_happened: "Paid a fake investment app", over_15_days: "yes", within_3_days: "no" }, wa);
+    expect(said!.fields).toMatchObject({ followup: "portal", over_15_days: "yes", financial: "yes" });
+    expect(said!.fields.late_report).toBeUndefined();
+    expect(said!.status).toBe("closed");
+    expect(said!.officerNote).toMatch(/referred to cybercrime\.gov\.in/);
+    expect(wa.sent).toHaveLength(1);
+    expect(wa.sent[0]!.body).toContain("Uttarakhand Police understands your concern. However, this helpline is dedicated to handling financial frauds that have occurred within the last 15 days. We request you to file your complaint at https://cybercrime.gov.in");
+    expect(wa.sent[0]!.body).toContain("पिछले 15 दिनों के अंदर हुए वित्तीय फ्रॉड");
+    // Worked out from the date the money left, against the day of the call (6 October): 16 days is over, 15 is not.
+    const old = await opened("+919800000082", { complaint_type: "UPI fraud", money_lost: "900", how_it_happened: "Paid a fake seller", transaction_date: "2026-09-20", transaction_time: "19:00" }, wa);
+    expect(old!.fields).toMatchObject({ followup: "portal", over_15_days: "yes", transaction_time: "19:00" });
+    const fifteen = await opened("+919800000083", { complaint_type: "UPI fraud", money_lost: "900", how_it_happened: "Paid a fake seller", transaction_date: "2026-09-21" }, wa);
+    expect(fifteen!.fields).toMatchObject({ followup: "form_link", late_report: "yes" });
+    expect(fifteen!.fields.over_15_days).toBeUndefined();
+    // A reply later never starts the form questions for a referred complaint.
+    expect(wa.sent.filter((m) => m.body.includes("1. What is your full name?"))).toHaveLength(0);
+    // No money lost: never referred, whatever the date.
+    const harassed = await opened("+919800000084", { complaint_type: "online harassment", how_it_happened: "Threats on Instagram", transaction_date: "2026-08-01" }, wa);
+    expect(harassed!.fields.followup).not.toBe("portal");
+  });
+
   it("asks the police station and district for a PIN code outside Uttarakhand, and takes a correction of the ones it found", async () => {
     const wa = new SimulatedWhatsApp();
     const ask = (who: string) => (text: string, reader: CaseReader = new ResilientReader(null)) => handleInbound(tenant, { from: who, id: randomUUID(), at: new Date(), text }, reader, wa);

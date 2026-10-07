@@ -10,6 +10,7 @@ const clip = (v: string, n = 500) => (v.length > n ? `${v.slice(0, n)}… (full 
 const FOLLOWUP: Record<string, string> = {
   questions: "Details and proof collected on WhatsApp",
   form_link: "Complaint form link sent on WhatsApp",
+  portal: "Referred to cybercrime.gov.in: money lost more than 15 days ago",
   none: "Caller did not agree to WhatsApp; details from the call",
 };
 
