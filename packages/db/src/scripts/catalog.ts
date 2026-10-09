@@ -31,7 +31,7 @@ for (const p of PLAN_CATALOG) {
 }
 
 let templateCount = 0;
-for (const file of ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json"]) {
+for (const file of ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json", "template.clinic_outbound.v1.json"]) {
   const t = JSON.parse(readFileSync(path.resolve(here, `../../seed-data/${file}`), "utf8"));
   await db
     .insert(agentTemplates)

@@ -135,7 +135,7 @@ async function catalog() {
   // Every published template version stays installed. An agent is pinned to the
   // version it was built on and keeps working until someone republishes it, so
   // shipping v2 must never remove v1 from under the agents already using it.
-  for (const file of ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json"]) {
+  for (const file of ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json", "template.clinic_outbound.v1.json"]) {
     const t = JSON.parse(readFileSync(path.resolve(here, `../../seed-data/${file}`), "utf8"));
     await db
       .insert(agentTemplates)

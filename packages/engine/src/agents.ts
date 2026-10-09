@@ -6,6 +6,8 @@ import { requestSafetyCheck, safetyGate } from "./safety/checks";
 import { programVariables } from "./programs";
 
 export const DEFAULT_TEMPLATE = { key: "clinic_receptionist", version: 1 };
+/** Base for a clinic's outbound call programs: one job per call, short turns, Tenglish and Hinglish, no advice. */
+export const CLINIC_OUTBOUND_TEMPLATE = { key: "clinic_outbound", version: 1 };
 
 export async function templateOf(tx: Tx, a: Pick<Agent, "templateKey" | "templateVersion">): Promise<AgentTemplate> {
   const [t] = await tx.select().from(agentTemplates).where(and(eq(agentTemplates.key, a.templateKey), eq(agentTemplates.version, a.templateVersion)));

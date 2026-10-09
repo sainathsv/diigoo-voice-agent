@@ -13,7 +13,7 @@ import {
   type Tx,
 } from "@jenai/db";
 import { CYBER_INTAKE_DOMAIN, lintVersion } from "@jenai/voice";
-import { createVersion, templateOf, DEFAULT_TEMPLATE } from "./agents";
+import { createVersion, templateOf, DEFAULT_TEMPLATE, CLINIC_OUTBOUND_TEMPLATE } from "./agents";
 import { verticalOf } from "./safety/cases";
 
 /**
@@ -156,6 +156,7 @@ export async function setUpProgram(tenantId: string, input: SetUpInput, actorUse
     }
 
     let agentId = program.agentId;
+    const outboundClinic = p.direction === "outbound" && p.vertical === "health";
     if (!agentId) {
       const [agent] = await tx
         .insert(agents)
@@ -164,8 +165,10 @@ export async function setUpProgram(tenantId: string, input: SetUpInput, actorUse
           branchId,
           name,
           purpose: p.purpose === "promotional" ? "outbound_sales" : p.direction === "inbound" ? "receptionist" : "reminders",
-          templateKey: DEFAULT_TEMPLATE.key,
-          templateVersion: DEFAULT_TEMPLATE.version,
+          // An outbound clinic call does one job, so it gets the outbound base, not the
+          // inbound receptionist's "name the services and book" call order.
+          templateKey: outboundClinic ? CLINIC_OUTBOUND_TEMPLATE.key : DEFAULT_TEMPLATE.key,
+          templateVersion: outboundClinic ? CLINIC_OUTBOUND_TEMPLATE.version : DEFAULT_TEMPLATE.version,
           domain: p.key === CY_POLICE_PROGRAM ? CYBER_INTAKE_DOMAIN : p.vertical === "health" ? "clinic" : p.vertical === "government" ? "civic" : "business",
           clientProgramId: program.id,
         })

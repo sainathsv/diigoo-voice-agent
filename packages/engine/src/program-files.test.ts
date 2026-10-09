@@ -222,3 +222,43 @@ describe("course check-in program", () => {
     expect(complication.turns[0]).toMatch(/blistering and swollen/);
   });
 });
+
+describe("the outbound clinic base (template.clinic_outbound.v1)", () => {
+  // Pinned after the Zennara demo calls of 9 Oct 2026, where every call type turned into a
+  // long consultation: medical history, care tips, the caller's number asked for again.
+  const t = JSON.parse(readFileSync(new URL("../../db/seed-data/template.clinic_outbound.v1.json", import.meta.url), "utf8")) as { key: string; version: number; base_prompt: string; end_prompt: string };
+  const b = t.base_prompt;
+
+  it("is the base every outbound clinic program gets", async () => {
+    const { CLINIC_OUTBOUND_TEMPLATE } = await import("./agents");
+    expect(CLINIC_OUTBOUND_TEMPLATE).toEqual({ key: t.key, version: t.version });
+  });
+  it("keeps every reply short: one sentence, one question, then listen", () => {
+    expect(b).toMatch(/ONE short sentence, at most about 15 words, then ONE question, then STOP and listen/);
+    expect(b).toMatch(/Never two questions in one reply/);
+  });
+  it("does one job and never turns the call into a consultation or gives advice", () => {
+    expect(b).toMatch(/Never turn the call into a consultation/);
+    expect(b).toMatch(/Never give care tips, home remedies, skincare routines or any advice/);
+  });
+  it("never asks for the number it is calling", () => {
+    expect(b).toMatch(/NEVER ask for their number/);
+  });
+  it("sends any side effect to the doctor without advice", () => {
+    expect(b).toMatch(/I will ask the doctor to\s+call you today/);
+    expect(b).toMatch(/never suggest a cream, compress or remedy/);
+  });
+  it("speaks Tenglish and Hinglish, with days, dates and times in English", () => {
+    expect(b).toMatch(/A Telugu turn gets TENGLISH/);
+    expect(b).toMatch(/A Hindi turn gets HINGLISH/);
+    expect(b).toMatch(/Days, dates and times ALWAYS in English/);
+    expect(b).toMatch(/If most of their words are Hindi, even with some\s+garbled ones, it IS a Hindi turn/);
+  });
+  it("never claims a booking, a price or a confirmation message it cannot stand behind", () => {
+    expect(b).toMatch(/Say "booked" ONLY after a clear yes/);
+    expect(b).toMatch(/Never invent a price, a doctor's name, an address, a timing or a WhatsApp or SMS confirmation/);
+  });
+  it("has no em dashes", () => {
+    expect(`${b}${t.end_prompt}`).not.toMatch(/—/);
+  });
+});
