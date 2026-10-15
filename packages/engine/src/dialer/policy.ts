@@ -66,7 +66,19 @@ export type Decision =
 
 const live = (expiresAt: Date | null, now: Date) => !expiresAt || expiresAt.getTime() > now.getTime();
 
+export type SuppressionEntry = PolicyInput["suppressions"][number];
 
+/**
+ * Whether one do-not-call entry stops a call made for this purpose: the
+ * national DND register stops promotional calls only, an entry with a scope
+ * stops calls of that purpose only, and one without a scope stops them all.
+ * The call plan asks the same question, so it keeps out whom the dialer would.
+ */
+export function suppressionStops(s: SuppressionEntry, purpose: Purpose, now: Date): boolean {
+  if (!live(s.expiresAt, now)) return false;
+  if (s.reason === "dnd_registry") return purpose === "promotional";
+  return s.scope === null || s.scope === purpose;
+}
 
 export function decide(i: PolicyInput): Decision {
   const { now, campaign: c } = i;
@@ -89,12 +101,9 @@ export function decide(i: PolicyInput): Decision {
   if (i.target.attemptNo >= c.maxAttempts) return { action: "skip", code: "max_attempts", reason: `Reached ${c.maxAttempts} attempts` };
 
   for (const s of i.suppressions) {
-    if (!live(s.expiresAt, now)) continue;
-    if (s.reason === "dnd_registry") {
-      if (c.purpose === "promotional") return { action: "skip", code: "dnd_registry", reason: "Number is on the DND (NCPR) registry; promotional calls are not allowed" };
-      continue;
-    }
-    if (s.scope === null || s.scope === c.purpose) return { action: "skip", code: "opted_out", reason: `Do-not-call: ${s.reason.replace("_", " ")}` };
+    if (!suppressionStops(s, c.purpose, now)) continue;
+    if (s.reason === "dnd_registry") return { action: "skip", code: "dnd_registry", reason: "Number is on the DND (NCPR) registry; promotional calls are not allowed" };
+    return { action: "skip", code: "opted_out", reason: `Do-not-call: ${s.reason.replace("_", " ")}` };
   }
 
   const n = i.number;

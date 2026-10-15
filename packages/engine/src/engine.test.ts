@@ -189,6 +189,18 @@ describe("call programs", () => {
     expect(await withTenant(tenant, (tx) => tx.select().from(agents).where(eq(agents.clientProgramId, r.program.id)))).toHaveLength(1);
   });
 
+  it("sets up the course check-in from the catalogue with nothing left unfilled", async () => {
+    const values = { clinic_name: "Test Clinic", clinic_number: "89777 59580", complaint_route: "the branch manager will call you back today" };
+    const r = await setUpProgram(tenant, { programKey: "clinic.course_checkin", values }, actor);
+    expect(r.issues).toEqual([]);
+    const [v] = await withTenant(tenant, (tx) => tx.select().from(agentVersions).where(eq(agentVersions.id, r.versionId)));
+    expect(v!.taskPrompt).toContain("89777 59580"); // the clinic's answers once
+    expect(v!.taskPrompt).toContain("{{treatment}}"); // the patient's on each call
+    expect(v!.outboundOpening).not.toContain("{{treatment}}");
+    const [agent] = await withTenant(tenant, (tx) => tx.select().from(agents).where(eq(agents.id, r.program.agentId!)));
+    expect(agent!.domain).toBe("clinic");
+  });
+
   it("refuses to start before the client has filled in what the call needs", async () => {
     await expect(setUpProgram(tenant, { programKey: "clinic.revisit_recall", values: { clinic_name: "Test Clinic" } }, actor)).rejects.toThrow(/Fill in:/);
   });

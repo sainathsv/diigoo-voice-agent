@@ -9,7 +9,7 @@
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
-import { agents, calls, leads, suppressions, withTenant } from "@jenai/db";
+import { agents, calls, suppressions, withTenant } from "@jenai/db";
 import { deriveLead, parsePreferredTime } from "./leads";
 import { isOnOwnNetwork } from "./own-network";
 import { CY_POLICE_PROGRAM, latestProgramVersion, programExtraction } from "./programs";
@@ -43,6 +43,8 @@ export interface ProgramAsk {
   key: string;
   extraction: Array<{ name: string; type: string; prompt: string }>;
   outcomes: Array<{ key: string; label: string; stage?: string }>;
+  /** What the program's calls are for (consent purpose): an opt-out heard only as its own answer covers calls of that kind. */
+  purpose?: string;
 }
 
 export interface Extractor {
@@ -105,7 +107,7 @@ function prompt(input: { transcript: string; startedAt: Date; domain: string; di
 Return ONLY a JSON object with exactly these keys, null when not said. Every value must be in ENGLISH: translate Telugu or Hindi, never copy the caller's words.
 {"caller_name": string|null (in English letters), "concern": string|null (what they asked about, 3 to 8 English words, e.g. "hair fall treatment"),
  "preferred_time": string|null (the agreed appointment, written like "20 Sep 2026, 11:00 AM" or "20 Sep 2026" if no time; resolve words like today, tomorrow, repu, kal, next Monday against the call date),
- "interest_level": "hot"|"warm"|"cold"|null, "next_step": "booked"|"callback"|"whatsapp"|"none"|null ("booked" only if a day AND exact time were confirmed),
+ "interest_level": "hot"|"warm"|"cold"|null, "next_step": "booked"|"callback"|"whatsapp"|"none"|null ("booked" only if a day AND exact time were confirmed for an appointment made on this call; one they say was booked before the call is not "booked"),
  "do_not_call": true|false|null (true only if they asked not to be called again), "summary": string|null (one sentence),
  "duration": string|null (how long they have had the problem, as they said it, e.g. "6 months", "since last winter"),
  "tried_before": string|null (what they already tried: home remedies, shampoos, creams, other doctors or clinics; up to 15 words),
@@ -222,6 +224,38 @@ function cleanProgramFields(raw: unknown, p: ProgramAsk): Record<string, string>
 }
 
 /**
+ * The appointment made on this call, as the analysis wrote it ("20 Oct 2026,
+ * 2:00 PM"), or null: none was agreed, or the program's outcome says the
+ * one they spoke of was booked before the call, so it goes in no calendar
+ * and to no CRM a second time.
+ */
+export function bookedOnCall(merged: Record<string, unknown>): string | null {
+  return merged.next_step === "booked" && typeof merged.preferred_time === "string" && merged.outcome !== "already_booked" ? merged.preferred_time : null;
+}
+
+/**
+ * Whether the call heard "do not call me again", from any of the ways it is
+ * recorded: the standard answer, a program's own do_not_call or
+ * asked_to_stop_calling answer, or a program outcome of do_not_call. The
+ * standard answer means every call. One heard only through the program, on a
+ * promotional program, is taken as about that kind of call ("stop calling me
+ * with offers") and leaves their appointment reminders alone; on any other
+ * program it means every call, the safe reading.
+ */
+export function heardOptOut(
+  x: Extraction | null,
+  merged: Record<string, unknown>,
+  extra: Record<string, string>,
+  program: ProgramAsk | null,
+): { scope: "promotional" | null } | null {
+  if (x?.do_not_call === true || merged.do_not_call === true) return { scope: null };
+  const yes = (v: unknown) => typeof v === "string" && /^(yes|true)$/i.test(v.trim());
+  const heard = yes(extra.do_not_call) || yes(extra.asked_to_stop_calling) || extra.outcome === "do_not_call";
+  if (!heard) return null;
+  return { scope: program?.purpose === "promotional" ? "promotional" : null };
+}
+
+/**
  * Analyse finished calls that have a transcript and have not been analysed yet. `signal`
  * stops the batch: the call being read is left for the next round.
  */
@@ -244,7 +278,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
       if (c.agentId) {
         if (!programs.has(c.agentId)) {
           const row = await withTenant(tenantId, (tx) => programExtraction(tx, tenantId, c.agentId!));
-          programs.set(c.agentId, row ? { key: row.key, extraction: row.extraction, outcomes: row.outcomes } : null);
+          programs.set(c.agentId, row ? { key: row.key, extraction: row.extraction, outcomes: row.outcomes, purpose: row.purpose } : null);
         }
         program = programs.get(c.agentId) ?? null;
       }
@@ -253,7 +287,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
       if (!program && cyber) {
         if (!programs.has(CY_POLICE_PROGRAM)) {
           const p = await withTenant(tenantId, (tx) => latestProgramVersion(tx, CY_POLICE_PROGRAM).catch(() => null));
-          programs.set(CY_POLICE_PROGRAM, p ? { key: p.key, extraction: p.extraction, outcomes: p.outcomes } : null);
+          programs.set(CY_POLICE_PROGRAM, p ? { key: p.key, extraction: p.extraction, outcomes: p.outcomes, purpose: p.purpose } : null);
         }
         program = programs.get(CY_POLICE_PROGRAM) ?? null;
       }
@@ -271,13 +305,14 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
           .update(calls)
           .set({ extracted: merged, summary: x?.summary ?? c.summary, disposition: cyber ? c.disposition : ((x?.next_step as string) ?? c.disposition), analyzedAt: new Date(), analysisModel: extractor.model })
           .where(eq(calls.id, c.id));
-        if (x?.do_not_call && c.contactId) {
-          const phone = c.direction === "inbound" ? c.fromE164 : c.toE164;
-          if (phone) {
-            await tx.insert(suppressions).values({ tenantId, phoneE164: phone, reason: "opt_out", scope: null, source: `said on call ${c.externalRunId}` }).onConflictDoNothing();
-            await emitDoNotCall(tx, tenantId, phone, `said so on call ${c.id}`);
-            stats.optOuts++;
-          }
+        const stop = heardOptOut(x, merged, extra, program);
+        const phone = c.direction === "inbound" ? c.fromE164 : c.toE164;
+        if (stop && phone) {
+          // From the number, whether or not the caller is a contact here: it is the number that is not to be called.
+          await tx.insert(suppressions).values({ tenantId, phoneE164: phone, reason: "opt_out", scope: stop.scope, source: `said on call ${c.externalRunId}` }).onConflictDoNothing();
+          // Handing it on runs in its own savepoint, so a queue error cannot undo the opt-out above.
+          await emitDoNotCall(tx, tenantId, phone, c.contactId, `said so on call ${c.id}`);
+          stats.optOuts++;
         }
         // A complaint is not a sales lead: it opens (or adds to) the complainant's case, and
         // WhatsApp collects what the call did not. A call that was not a cyber crime opens nothing.
@@ -287,10 +322,16 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
             await caseFromCall(tx, tenantId, { id: c.id, phone: c.direction === "inbound" ? c.fromE164 : c.toE164, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }, opts.whatsapp, {
               message: Date.now() - c.startedAt.getTime() < FOLLOWUP_WINDOW_MS,
             });
-        } else if (c.contactId && (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt }))) stats.leads++;
+        } else if (c.contactId) {
+          // A program says what its own outcomes mean for the lead (paid, disputed, booked).
+          // Set before the call is handed on below, so their CRM gets the stage this call left.
+          const programStage = program && typeof extra.outcome === "string" ? (program.outcomes.find((o) => o.key === extra.outcome)?.stage ?? null) : null;
+          if (await deriveLead(tx, tenantId, { callId: c.id, contactId: c.contactId, branchId: c.branchId, extracted: merged, at: c.startedAt, programStage })) stats.leads++;
+        }
         // A booking goes straight into the calendar, so the front desk sees it without asking.
-        if (merged.next_step === "booked" && typeof merged.preferred_time === "string") {
-          const when = parsePreferredTime(merged.preferred_time);
+        const booked = bookedOnCall(merged);
+        if (booked) {
+          const when = parsePreferredTime(booked);
           if (when) {
             await appointmentFromCall(tx, tenantId, {
               callId: c.id,
@@ -305,17 +346,7 @@ export async function analyzeCalls(tenantId: string, extractor: Extractor, opts:
         }
         // Hand the result back to the client's own system (their CRM stays the record of truth).
         await emitCallCompleted(tx, tenantId, c.id);
-        if (merged.next_step === "booked" && typeof merged.preferred_time === "string") await emitAppointmentBooked(tx, tenantId, c.id, merged.preferred_time);
-        // A program says what its own outcomes mean for the lead (paid, disputed, booked).
-        if (c.contactId && program && typeof extra.outcome === "string") {
-          const stage = program.outcomes.find((o) => o.key === extra.outcome)?.stage;
-          if (stage) {
-            await tx
-              .update(leads)
-              .set({ stage: stage as never, updatedAt: new Date() })
-              .where(and(eq(leads.tenantId, tenantId), eq(leads.contactId, c.contactId)));
-          }
-        }
+        if (booked) await emitAppointmentBooked(tx, tenantId, c.id, booked);
       });
       stats.analyzed++;
     } catch {

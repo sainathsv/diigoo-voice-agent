@@ -43,7 +43,7 @@ export const CLIENT_ROLE_TEMPLATES: readonly RoleTemplate<ClientPermission>[] = 
     defaultScope: "branch",
     permissions: [
       "calls:view", "recordings:play", "qa:score",
-      "contacts:view", "contacts:edit", "contacts:reveal_phone",
+      "contacts:view", "contacts:edit", "contacts:reveal_phone", "visits:import",
       "campaigns:view", "campaigns:create",
       "agents:view", "agents:edit", "knowledge:edit", "schedule:edit",
       "numbers:view",

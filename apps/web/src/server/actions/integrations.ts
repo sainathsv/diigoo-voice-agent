@@ -5,7 +5,7 @@ import { redirect } from "next/navigation";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { apiKeys, audit, integrationEvents, integrations, withTenant } from "@jenai/db";
-import { CONNECTORS, credentialsOf, sealCredentials } from "@jenai/engine";
+import { checkZenotiConnection, credentialsOf, dropOrphanedPlanRows, releaseHeld, saveZohoConnection, sealCredentials, testConnection } from "@jenai/engine";
 import { actorFields, requireWorkspace, workspaceAction } from "../access";
 import { requestMeta } from "../session";
 import { SCOPES, newApiKey } from "../api/key";
@@ -20,7 +20,7 @@ async function meta(ctx: Awaited<ReturnType<typeof requireWorkspace>>) {
   return { ...actorFields(ctx), tenantId: ctx.org.id, ...(await requestMeta()) };
 }
 
-const EVENTS = ["call.completed", "appointment.booked", "do_not_call.added"] as const;
+const EVENTS = ["call.completed", "appointment.booked", "do_not_call.added", "lead.updated"] as const;
 
 /** Connect the client's own system: a webhook they own, their API, or Zoho CRM. */
 export async function connectSystem(fd: FormData) {
@@ -60,14 +60,36 @@ export async function connectSystem(fd: FormData) {
   }
 
   const row = await withTenant(ctx.org.id, async (tx) => {
+    // Zoho is one CRM per client, so connecting it again is a reconnect,
+    // usually to re-grant a scope: it lands on the same connection and takes
+    // only the new credentials. The name, records and events in this form are
+    // its blank defaults, not choices about a connection it does not show, so
+    // they apply to a new connection only. A pasted refresh token does not say
+    // what it grants, so no scopes are recorded from here.
+    if (d.kind === "zoho_crm") {
+      const { integration: i, reconnected } = await saveZohoConnection(tx, ctx.org.id, {
+        dc: String(config.dc),
+        credentials,
+        scopes: null,
+        setup: { name: d.name, module: String(config.module), events },
+        createdBy: ctx.user.userId,
+      });
+      await audit(tx, { ...(await meta(ctx)), action: reconnected ? "integration.reconnected" : "integration.connected", targetType: "integration", targetId: i.id, summary: `${reconnected ? "Reconnected" : "Connected"} ${i.name} (zoho crm)`, diff: { kind: d.kind, events: i.events } });
+      // Tested now, as the script does, so a reconnected connection is live
+      // again at once rather than holding every event until someone presses Test.
+      const test = await testConnection(tx, ctx.org.id, i);
+      return { ...i, reconnected, test };
+    }
     const [i] = await tx
       .insert(integrations)
       .values({ tenantId: ctx.org.id, kind: d.kind, name: d.name, config, credentials: sealCredentials(ctx.org.id, credentials), events, status: "draft", createdBy: ctx.user.userId })
       .returning();
     await audit(tx, { ...(await meta(ctx)), action: "integration.connected", targetType: "integration", targetId: i!.id, summary: `Connected ${d.name} (${d.kind.replace("_", " ")})`, diff: { kind: d.kind, events } });
-    return i!;
+    return { ...i!, reconnected: false, test: null };
   });
-  go(slug, { ok: `${row.name} added. Test it to make sure JENAI can reach it.` });
+  const done = `${row.name} ${row.reconnected ? "reconnected, with its settings kept" : "added"}.`;
+  if (!row.test) go(slug, { ok: `${done} Test it to make sure JENAI can reach it.` });
+  go(slug, row.test!.ok ? { ok: `${done} ${row.test!.message}` } : { error: `${done} It does not work yet: ${row.test!.message}` });
 }
 
 /** Ask their system whether it is reachable, and say so in one line. */
@@ -75,26 +97,19 @@ export async function testSystem(fd: FormData) {
   const slug = String(fd.get("slug"));
   const id = String(fd.get("id"));
   const ctx = await workspaceAction(slug, "integrations:manage");
+  const [kind] = await withTenant(ctx.org.id, (tx) => tx.select({ kind: integrations.kind }).from(integrations).where(eq(integrations.id, id)));
+  if (!kind) go(slug, { error: "That connection is gone." });
+  if (kind!.kind === "zenoti") {
+    // Zenoti is asked with no transaction open, since its waits can take minutes; a paused connection
+    // stays paused, the branch map is kept current, and the test is audited.
+    const { tenantId: _, ...actor } = await meta(ctx);
+    const check = await checkZenotiConnection(ctx.org.id, id, { actor });
+    go(slug, check.ok ? { ok: check.test.message } : { error: check.test.message });
+  }
   const r = await withTenant(ctx.org.id, async (tx) => {
     const [i] = await tx.select().from(integrations).where(eq(integrations.id, id));
     if (!i) return { error: "That connection is gone." };
-    const connector = CONNECTORS[i.kind];
-    if (!connector) return { error: "That kind of system is not ready yet." };
-    const res = await connector.test({
-      integration: i,
-      credentials: credentialsOf(i),
-      fetch,
-      async save(patch) {
-        await tx
-          .update(integrations)
-          .set({ ...(patch.credentials ? { credentials: sealCredentials(ctx.org.id, patch.credentials) } : {}), ...(patch.config ? { config: { ...i.config, ...patch.config } } : {}), updatedAt: new Date() })
-          .where(eq(integrations.id, i.id));
-      },
-    });
-    await tx
-      .update(integrations)
-      .set({ status: res.ok ? "connected" : "error", lastOkAt: res.ok ? new Date() : i.lastOkAt, lastError: res.ok ? null : res.message, lastErrorAt: res.ok ? i.lastErrorAt : new Date(), updatedAt: new Date() })
-      .where(eq(integrations.id, i.id));
+    const res = await testConnection(tx, ctx.org.id, i);
     return res.ok ? { ok: res.message } : { error: res.message };
   });
   go(slug, r);
@@ -109,14 +124,25 @@ export async function setSystemStatus(fd: FormData) {
   await withTenant(ctx.org.id, async (tx) => {
     const [i] = await tx.select().from(integrations).where(eq(integrations.id, id));
     if (!i) return;
-    if (to === "removed") await tx.delete(integrations).where(eq(integrations.id, id));
+    if (to === "removed") {
+      // Its CRM copy goes with it (crm_records cascade), and so, at once, do the planned calls made from that copy.
+      await tx.delete(integrations).where(eq(integrations.id, id));
+      await dropOrphanedPlanRows(tx);
+    }
     else await tx.update(integrations).set({ status: to as "paused" | "connected", updatedAt: new Date() }).where(eq(integrations.id, id));
+    // Resumed: what waited while it was paused goes now.
+    if (to === "connected") await releaseHeld(tx, id);
     await audit(tx, { ...(await meta(ctx)), action: `integration.${to}`, targetType: "integration", targetId: id, summary: `${to === "removed" ? "Removed" : to === "paused" ? "Paused" : "Resumed"} ${i.name}` });
   });
   go(slug, { ok: to === "removed" ? "Connection removed." : to === "paused" ? "Paused. Nothing will be sent until you resume." : "Resumed." });
 }
 
-/** Send the deliveries that failed again, now. */
+/**
+ * Send again what did not go: deliveries that failed, and ones skipped
+ * because their system refused them (a caller they have since added, a field
+ * they have since made optional). What already landed is kept, so a call is
+ * not logged twice.
+ */
 export async function retryDeliveries(fd: FormData) {
   const slug = String(fd.get("slug"));
   const id = String(fd.get("id"));
@@ -125,11 +151,11 @@ export async function retryDeliveries(fd: FormData) {
     const rows = await tx
       .update(integrationEvents)
       .set({ status: "queued", attempts: 0, nextAttemptAt: new Date(), error: null, updatedAt: new Date() })
-      .where(and(eq(integrationEvents.integrationId, id), inArray(integrationEvents.status, ["failed"])))
+      .where(and(eq(integrationEvents.integrationId, id), eq(integrationEvents.direction, "out"), inArray(integrationEvents.status, ["failed", "skipped"])))
       .returning({ id: integrationEvents.id });
     return rows.length;
   });
-  go(slug, { ok: n ? `${n} put back in the queue. The worker sends them within a minute.` : "Nothing was waiting." });
+  go(slug, { ok: n ? `${n} put back in the queue. The worker sends them within a minute while the connection works, or as soon as it does.` : "Nothing was waiting." });
 }
 
 /** A key for the client's own systems. Shown once. */

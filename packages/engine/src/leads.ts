@@ -1,6 +1,7 @@
 import { and, eq, notInArray } from "drizzle-orm";
 import { leads, type Tx } from "@jenai/db";
 import { zoned } from "./dialer/time";
+import { emitLeadUpdated } from "./integrations/events";
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
@@ -35,14 +36,22 @@ export function stageFrom(extracted: Record<string, unknown>): Stage | null {
 /**
  * Create or advance the contact's open lead from a finished call. Stages only
  * move forward automatically; people move them back by hand.
+ *
+ * A call program says what its own outcomes mean for the lead (paid is won, a
+ * dispute goes back to callback), and that stage is set as it says, on the
+ * open lead only: a lead closed before stays closed. Done here, in the same
+ * update, so a call hands on one change, in the right order, before its
+ * call.completed is queued.
  */
 export async function deriveLead(
   tx: Tx,
   tenantId: string,
-  input: { callId: string; contactId: string; branchId: string | null; extracted: Record<string, unknown>; at: Date },
+  input: { callId: string; contactId: string; branchId: string | null; extracted: Record<string, unknown>; at: Date; programStage?: string | null },
 ): Promise<boolean> {
-  const stage = stageFrom(input.extracted);
-  if (!stage) return false;
+  const auto = stageFrom(input.extracted);
+  // Checked, not cast: a stage the database does not know would fail the whole analysis.
+  const said = input.programStage && Object.hasOwn(RANK, input.programStage) ? (input.programStage as Stage) : null;
+  if (!auto && !said) return false;
   const x = input.extracted;
   const temp = ["hot", "warm", "cold"].includes(String(x.interest_level)) ? String(x.interest_level) : null;
   const [open] = await tx
@@ -51,6 +60,9 @@ export async function deriveLead(
     .where(and(eq(leads.contactId, input.contactId), notInArray(leads.stage, ["won", "lost"])));
   const preferredAt = parsePreferredTime(x.preferred_time);
   if (!open) {
+    // A program's outcome moves a lead; on its own it does not open one.
+    if (!auto) return false;
+    const stage = said ?? auto;
     await tx.insert(leads).values({
       tenantId,
       contactId: input.contactId,
@@ -67,11 +79,12 @@ export async function deriveLead(
     });
     return true;
   }
+  const stage = said ?? (auto && RANK[auto] > RANK[open.stage as Stage] ? auto : (open.stage as Stage));
   await tx
     .update(leads)
     .set({
       lastCallId: input.callId,
-      stage: RANK[stage] > RANK[open.stage as Stage] ? stage : open.stage,
+      stage,
       interest: open.interest ?? (x.concern as string) ?? null,
       preferredTimeText: (x.preferred_time as string) ?? open.preferredTimeText,
       preferredAt: preferredAt ?? open.preferredAt,
@@ -79,5 +92,6 @@ export async function deriveLead(
       updatedAt: new Date(),
     })
     .where(eq(leads.id, open.id));
+  if (stage !== open.stage) await emitLeadUpdated(tx, tenantId, open.id, ["stage"], input.callId);
   return true;
 }

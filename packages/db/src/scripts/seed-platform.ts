@@ -65,7 +65,7 @@ for (const p of PLAN_CATALOG) {
 // 3. The shared agent behaviour and the call programs on offer.
 // Every published template version stays installed: agents are pinned to the
 // version they were built on, so shipping v2 must not remove v1 under them.
-const TEMPLATE_FILES = ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json"];
+const TEMPLATE_FILES = ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json", "template.clinic_outbound.v1.json"];
 const templates = TEMPLATE_FILES.map((f) => JSON.parse(readFileSync(path.resolve(here, `../../seed-data/${f}`), "utf8")));
 const tpl = templates[templates.length - 1];
 await db

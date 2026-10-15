@@ -28,16 +28,16 @@
     { "name": "problem_reported", "type": "string", "prompt": "In ENGLISH, 3 to 12 words, any symptom, side effect or problem they described (itching after the cream, swelling, vomiting, pain at night). Null if none." },
     { "name": "urgent_flag", "type": "string", "prompt": "yes if what they described sounded like an emergency and the agent told them to get immediate care, else null" },
     { "name": "following_treatment", "type": "string", "prompt": "yes if they are taking or applying it as told, no if they stopped, partly if they are irregular. Null if it was not discussed." },
-    { "name": "wants_doctor_callback", "type": "string", "prompt": "yes if they asked for the doctor or the clinic to call them back, else null" },
-    { "name": "preferred_time", "type": "string", "prompt": "The review visit date and time if one was agreed, exactly like '20 Aug 2026, 2:00 PM'. Null if nothing was agreed." }
+    { "name": "wants_doctor_callback", "type": "string", "prompt": "yes if they asked for the doctor or the clinic to call them back, else null", "shareable": true },
+    { "name": "preferred_time", "type": "string", "prompt": "The review visit date and time if one was agreed, exactly like '20 Aug 2026, 2:00 PM'. Null if nothing was agreed.", "shareable": true }
   ],
   "outcomes": [
     { "key": "doing_well", "label": "Doing well, nothing needed", "stage": "won" },
-    { "key": "review_booked", "label": "Review visit booked", "stage": "booked" },
+    { "key": "review_booked", "label": "Review visit booked", "stage": "booked", "shareable": true },
     { "key": "problem_reported", "label": "Problem reported, clinic to call back", "stage": "callback" },
     { "key": "urgent", "label": "Sent for immediate care", "stage": "callback" },
     { "key": "stopped_treatment", "label": "Stopped the treatment", "stage": "callback" },
-    { "key": "wrong_number", "label": "Wrong number", "stage": "lost" }
+    { "key": "wrong_number", "label": "Wrong number", "stage": "lost", "shareable": true }
   ],
   "defaults": {
     "windows": { "days": [1, 2, 3, 4, 5, 6], "start": "10:00", "end": "19:00" },

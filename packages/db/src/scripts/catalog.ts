@@ -1,5 +1,6 @@
 /**
- * Install or refresh the catalogue: plans, agent templates and call programs.
+ * Install or refresh the catalogue: plans, agent templates and call programs,
+ * and bring the built-in roles in line with the code.
  *
  *   pnpm --filter @jenai/db catalog
  *
@@ -18,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { PLAN_CATALOG } from "../catalog";
 import { agentTemplates, plans, programTemplates } from "../schema";
 import { platformDb } from "../client";
+import { syncSystemRoles } from "./system-roles";
 
 const db = platformDb();
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -29,7 +31,7 @@ for (const p of PLAN_CATALOG) {
 }
 
 let templateCount = 0;
-for (const file of ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json"]) {
+for (const file of ["template.clinic_receptionist.v1.json", "template.clinic_receptionist.v2.json", "template.clinic_outbound.v1.json"]) {
   const t = JSON.parse(readFileSync(path.resolve(here, `../../seed-data/${file}`), "utf8"));
   await db
     .insert(agentTemplates)
@@ -51,6 +53,10 @@ for (const f of files) {
   };
   await db.insert(programTemplates).values(row).onConflictDoUpdate({ target: [programTemplates.key, programTemplates.version], set: { ...row, updatedAt: new Date() } });
 }
+
+// A permission added in code reaches the built-in roles on every deploy, not only when someone seeds.
+const roleChanges = await syncSystemRoles(db);
+for (const r of roleChanges) console.log(`catalogue: built-in role ${r} brought in line with the code`);
 
 console.log(`catalogue ready: ${planCount} plans, ${templateCount} agent template version(s), ${files.length} call programs`);
 process.exit(0);

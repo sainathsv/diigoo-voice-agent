@@ -20,5 +20,11 @@ export * from "./telephone-line";
 export * from "./cy-agent";
 export * from "./voice-status";
 export * from "./sip-bridge";
+export * from "./care-plan";
+export * from "./visits-import";
+export * from "./plan-refresh";
+export * from "./plan-view";
+export * from "./plan-settings";
+export * from "./errors";
 // For the command-line tools in @jenai/db, which do not depend on @jenai/voice directly.
 export { DograhClient } from "@jenai/voice";

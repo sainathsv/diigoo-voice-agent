@@ -11,6 +11,7 @@ const NAV: Array<{ href: string; label: string; perm?: Permission; group?: strin
   { href: "", label: "Overview" },
   { href: "/calls", label: "Calls", perm: "calls:view" },
   { href: "/leads", label: "Leads", perm: "contacts:view", group: "sales" },
+  { href: "/call-plan", label: "Call plan", perm: "contacts:view", group: "sales" },
   { href: "/analytics", label: "Analytics", perm: "calls:view", group: "cases" },
   { href: "/cases", label: "Cases", perm: "calls:view", group: "cases" },
   { href: "/calendar", label: "Calendar", perm: "calendar:view", group: "sales" },

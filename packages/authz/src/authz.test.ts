@@ -79,6 +79,16 @@ describe("can()", () => {
     expect(can(c, "contacts:reveal_phone")).toBe(false);
   });
 
+  it("lets admins and managers upload the visit list, a branch manager for their branch only", () => {
+    const org = (key: string) => ctx([{ roleKey: key, permissions: role("client", key), scope: { type: "org" } }]);
+    for (const key of ["owner", "admin"]) expect(can(org(key), "visits:import"), key).toBe(true);
+    for (const key of ["front_desk", "marketing", "qa_supervisor", "practitioner", "analyst", "billing_contact"]) expect(can(org(key), "visits:import"), key).toBe(false);
+    const manager = ctx([{ roleKey: "branch_manager", permissions: role("client", "branch_manager"), scope: { type: "branch", branchId: hyd } }]);
+    expect(can(manager, "visits:import", { branchId: hyd })).toBe(true);
+    expect(can(manager, "visits:import", { branchId: vzg })).toBe(false);
+    expect(branchesFor(manager, "visits:import")).toEqual([hyd]);
+  });
+
   it("read-only support sessions never play recordings or reveal numbers", () => {
     const support = { staffUserId: "s1", grantId: "g1", mode: "read" as const, expiresAt: new Date(Date.now() + 60_000) };
     const c = ctx([], { support });

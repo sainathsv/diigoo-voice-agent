@@ -23,20 +23,20 @@
     { "name": "review_ask", "label": "Review request line, exactly as approved", "help": "Optional. Spoken only to a happy patient, and only once. Leave blank if the clinic does not want it asked.", "required": false, "example": "if you have a minute, kindly leave us a review on Google, it helps us a lot" }
   ],
   "extraction": [
-    { "name": "rating", "type": "string", "prompt": "The number out of 5 they gave, as a digit. Null if they did not give a number." },
+    { "name": "rating", "type": "string", "prompt": "The number out of 5 they gave, as a digit. Null if they did not give a number.", "shareable": true },
     { "name": "what_went_well", "type": "string", "prompt": "In ENGLISH, 3 to 12 words, what they liked (doctor explained well, no waiting, clean, staff polite). Null if they said nothing good." },
     { "name": "what_went_wrong", "type": "string", "prompt": "In ENGLISH, 3 to 15 words, what they complained about (waited one hour, staff rude, billing wrong, no parking, doctor rushed). Null if there was no complaint." },
     { "name": "complication_reported", "type": "string", "prompt": "In ENGLISH, 3 to 12 words, any medical problem after the visit (swelling, pus, fever, heavy bleeding, burning). Null if none." },
-    { "name": "wants_callback", "type": "string", "prompt": "yes if they asked someone from the clinic to call them back, else null" },
-    { "name": "review_agreed", "type": "string", "prompt": "yes if they agreed to leave a public review, else null" }
+    { "name": "wants_callback", "type": "string", "prompt": "yes if they asked someone from the clinic to call them back, else null", "shareable": true },
+    { "name": "review_agreed", "type": "string", "prompt": "yes if they agreed to leave a public review, else null", "shareable": true }
   ],
   "outcomes": [
-    { "key": "feedback_given", "label": "Feedback given", "stage": "won" },
-    { "key": "complaint", "label": "Complaint to handle", "stage": "callback" },
+    { "key": "feedback_given", "label": "Feedback given", "stage": "won", "shareable": true },
+    { "key": "complaint", "label": "Complaint to handle", "stage": "callback", "shareable": true },
     { "key": "medical_issue", "label": "Medical problem, sent for care", "stage": "callback" },
-    { "key": "refused", "label": "Did not want to give feedback", "stage": "contacted" },
-    { "key": "do_not_call", "label": "Asked not to be called", "stage": "lost" },
-    { "key": "wrong_number", "label": "Wrong number", "stage": "lost" }
+    { "key": "refused", "label": "Did not want to give feedback", "stage": "contacted", "shareable": true },
+    { "key": "do_not_call", "label": "Asked not to be called", "stage": "lost", "shareable": true },
+    { "key": "wrong_number", "label": "Wrong number", "stage": "lost", "shareable": true }
   ],
   "defaults": {
     "windows": { "days": [1, 2, 3, 4, 5, 6], "start": "11:00", "end": "20:00" },

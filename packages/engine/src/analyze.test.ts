@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cleanExtraction } from "./analyze";
+import { bookedOnCall, cleanExtraction } from "./analyze";
 
 describe("cleanExtraction", () => {
   it("accepts a well-formed answer, even wrapped in prose", () => {
@@ -17,5 +17,17 @@ describe("cleanExtraction", () => {
   });
   it("returns null for non-JSON output", () => {
     expect(cleanExtraction("I could not understand the call.")).toBeNull();
+  });
+});
+
+describe("bookedOnCall", () => {
+  it("takes an appointment agreed on the call, and never one the patient says was booked before it", () => {
+    const x = { next_step: "booked", preferred_time: "22 Oct 2026, 4:00 PM" };
+    expect(bookedOnCall(x)).toBe("22 Oct 2026, 4:00 PM");
+    expect(bookedOnCall({ ...x, outcome: "next_booked" })).toBe("22 Oct 2026, 4:00 PM");
+    // Already booked at the front desk: no second appointment in the calendar, none handed to the CRM.
+    expect(bookedOnCall({ ...x, outcome: "already_booked" })).toBeNull();
+    expect(bookedOnCall({ ...x, next_step: "callback" })).toBeNull();
+    expect(bookedOnCall({ next_step: "booked", preferred_time: null })).toBeNull();
   });
 });

@@ -23,20 +23,20 @@
     { "name": "booking_number", "label": "Number to give if they want to call back", "required": true, "example": "89777 59580" }
   ],
   "extraction": [
-    { "name": "interested", "type": "string", "prompt": "yes if they want the offer, no if they refused, null if it stayed unclear" },
-    { "name": "preferred_time", "type": "string", "prompt": "The agreed appointment date and time, exactly like '20 Aug 2026, 2:00 PM'. Null if nothing was agreed." },
+    { "name": "interested", "type": "string", "prompt": "yes if they want the offer, no if they refused, null if it stayed unclear", "shareable": true },
+    { "name": "preferred_time", "type": "string", "prompt": "The agreed appointment date and time, exactly like '20 Aug 2026, 2:00 PM'. Null if nothing was agreed.", "shareable": true },
     { "name": "objection", "type": "string", "prompt": "In ENGLISH, 3 to 8 words, why they said no (too costly, no time, already done, not needed now). Null if they did not refuse." },
-    { "name": "wants_details_sent", "type": "string", "prompt": "yes if they asked for the offer details to be sent to them, else null" },
+    { "name": "wants_details_sent", "type": "string", "prompt": "yes if they asked for the offer details to be sent to them, else null", "shareable": true },
     { "name": "health_issue_raised", "type": "string", "prompt": "In ENGLISH, 3 to 10 words, any health problem they brought up during the call. Null if none." },
-    { "name": "do_not_call", "type": "string", "prompt": "yes if they asked not to be called with offers again, else null" }
+    { "name": "do_not_call", "type": "string", "prompt": "yes if they asked not to be called with offers again, else null", "shareable": true }
   ],
   "outcomes": [
-    { "key": "booked", "label": "Booked the offer", "stage": "booked" },
-    { "key": "interested", "label": "Interested, call again", "stage": "callback" },
-    { "key": "details_requested", "label": "Asked for the details to be sent", "stage": "contacted" },
-    { "key": "not_interested", "label": "Not interested", "stage": "lost" },
-    { "key": "do_not_call", "label": "Asked not to be called with offers", "stage": "lost" },
-    { "key": "wrong_number", "label": "Wrong number", "stage": "lost" }
+    { "key": "booked", "label": "Booked the offer", "stage": "booked", "shareable": true },
+    { "key": "interested", "label": "Interested, call again", "stage": "callback", "shareable": true },
+    { "key": "details_requested", "label": "Asked for the details to be sent", "stage": "contacted", "shareable": true },
+    { "key": "not_interested", "label": "Not interested", "stage": "lost", "shareable": true },
+    { "key": "do_not_call", "label": "Asked not to be called with offers", "stage": "lost", "shareable": true },
+    { "key": "wrong_number", "label": "Wrong number", "stage": "lost", "shareable": true }
   ],
   "defaults": {
     "windows": { "days": [1, 2, 3, 4, 5, 6], "start": "11:00", "end": "19:00" },

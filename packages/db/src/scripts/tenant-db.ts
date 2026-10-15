@@ -4,6 +4,7 @@
  *   pnpm --filter @jenai/db tenant-db provision --tenant blue-cloud --host 1.2.3.4 --label "Blue Cloud"
  *   pnpm --filter @jenai/db tenant-db check     --tenant blue-cloud
  *   pnpm --filter @jenai/db tenant-db disable   --tenant blue-cloud
+ *   pnpm --filter @jenai/db tenant-db migrate   --tenant blue-cloud
  *
  * The client's admin connection comes from TENANT_DB_ADMIN_URL in the
  * environment, never from an argument, so it stays out of shell history and
@@ -45,8 +46,19 @@ async function org(slug: string) {
   return row;
 }
 
-/** Applies every migration to a database that has none of them. */
-async function migrate(sql: postgres.Sql): Promise<number> {
+/**
+ * The highest migration applied, by its number (0034_... is 34), as
+ * tenant_databases.schema_version keeps it. Not a count of the files: the
+ * numbers skip 0028 and 0029, and the worker compares this with the
+ * migration the call plan needs (PLAN_SCHEMA_VERSION).
+ */
+async function schemaVersion(): Promise<number> {
+  const files = (await readdir(migrationsDir)).filter((f) => f.endsWith(".sql"));
+  return Math.max(0, ...files.map((f) => Number.parseInt(f, 10)).filter(Number.isFinite));
+}
+
+/** Applies every migration a database has not had yet, as `role` when given (so what they create is that role's). */
+async function migrate(sql: postgres.Sql, role?: string): Promise<number> {
   await sql`create table if not exists schema_migrations (version text primary key, applied_at timestamptz not null default now())`;
   const done = new Set((await sql<{ version: string }[]>`select version from schema_migrations`).map((r) => r.version));
   const files = (await readdir(migrationsDir)).filter((f) => f.endsWith(".sql")).sort();
@@ -56,6 +68,7 @@ async function migrate(sql: postgres.Sql): Promise<number> {
     const body = await readFile(path.join(migrationsDir, f), "utf8");
     await sql.begin(async (tx) => {
       await tx.unsafe("set local lock_timeout = '5s'");
+      if (role) await tx.unsafe(`set local role "${role}"`);
       await tx.unsafe(body);
       await tx`insert into schema_migrations (version) values (${f})`;
     });
@@ -113,8 +126,7 @@ async function provision() {
   let version = 0;
   try {
     const applied = await migrate(owner);
-    const files = (await readdir(migrationsDir)).filter((f) => f.endsWith(".sql")).sort();
-    version = files.length;
+    version = await schemaVersion();
     console.log(`  schema: ${applied} migration(s) applied, now at ${version}`);
 
     // Their tables key off organizations and the shared catalogues, so those
@@ -190,6 +202,9 @@ const TENANT_TABLES = [
   "contacts", "consents", "suppressions", "client_programs", "campaigns", "campaign_targets",
   "calls", "dial_attempts", "leads", "resources", "appointments",
   "integrations", "integration_events", "external_links",
+  // After integrations and contacts, which they point at.
+  "crm_records", "visits", "treatment_rules", "call_plan_settings", "planned_calls",
+  "external_people", "clinic_appointments", "package_balances",
   "security_events", "security_alerts", "agent_safety_checks",
 ] as const;
 
@@ -265,6 +280,31 @@ async function check() {
   }
 }
 
+/**
+ * Brings one client's own database up to the migrations this code needs,
+ * without touching any password: the admin connection (TENANT_DB_ADMIN_URL,
+ * as for provision) opens their database and acts as its owner, as provision
+ * set it up to. The worker leaves a database behind the call plan's schema
+ * alone until this has run.
+ */
+async function migrateOwn() {
+  const client = await org(arg("tenant"));
+  const [row] = await platformDb().select().from(tenantDatabases).where(eq(tenantDatabases.tenantId, client.id));
+  if (!row || row.status === "disabled") throw new Error(`${client.name} keeps their records on the shared database, which pnpm db:migrate covers.`);
+  const u = new URL(env("TENANT_DB_ADMIN_URL"));
+  u.pathname = `/${row.database}`;
+  const db = postgres(u.toString(), { max: 1, onnotice: () => {} });
+  try {
+    const applied = await migrate(db, "jenai_owner");
+    const version = await schemaVersion();
+    await platformDb().update(tenantDatabases).set({ schemaVersion: version, updatedAt: new Date() }).where(eq(tenantDatabases.tenantId, client.id));
+    console.log(`${row.label}: ${applied} migration(s) applied, now at ${version}. No password was changed.`);
+  } finally {
+    await db.end();
+  }
+  await forgetTenantDb(client.id);
+}
+
 async function disable() {
   const client = await org(arg("tenant"));
   await platformDb().update(tenantDatabases).set({ status: "disabled", updatedAt: new Date() }).where(eq(tenantDatabases.tenantId, client.id));
@@ -272,9 +312,9 @@ async function disable() {
   console.log(`${client.name} is back on the shared database. Their own server still holds the rows; nothing was deleted.`);
 }
 
-const run = { provision, check, disable, move }[command as "provision" | "check" | "disable" | "move"];
+const run = { provision, check, disable, move, migrate: migrateOwn }[command as "provision" | "check" | "disable" | "move" | "migrate"];
 if (!run) {
-  console.log("usage: tenant-db <provision|check|disable|move> --tenant <address> [--host <server>] [--port 5432] [--database <name>] [--label <name>]");
+  console.log("usage: tenant-db <provision|check|disable|move|migrate> --tenant <address> [--host <server>] [--port 5432] [--database <name>] [--label <name>]");
   process.exit(1);
 }
 await run();
